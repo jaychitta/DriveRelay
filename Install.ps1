@@ -144,9 +144,17 @@ foreach ($tname in @('DriveRelay', 'SyncOrchestrator')) {
 }
 
 Write-Host ''
-Write-Host "Installed. A pass runs every $IntervalMinutes minute(s) while you are signed in."
-Write-Host 'The first pass waits 90 seconds after logon, so the machine can finish'
+# Report the interval actually in effect, not the parameter default. -IntervalMinutes
+# is only written to settings when it was explicitly passed, so someone who set 30
+# minutes earlier and reinstalls keeps 30 -- and used to be told it was 10.
+Write-Host ("Installed. A pass runs every {0} minute(s) while you are signed in." -f $appSettings.IntervalMinutes)
+Write-Host ("The first pass waits {0} seconds after logon, so the machine can finish" -f $appSettings.StartDelaySeconds)
 Write-Host 'starting and your cloud client can mount its folders first.'
+if ($appSettings.Paused) {
+    Write-Host ''
+    Write-Host 'Note: syncing is currently PAUSED in settings. The tray will start paused;'
+    Write-Host 'use "Resume syncing" from its menu when you want passes to run.'
+}
 Write-Host ''
 Write-Host 'Start it now with:'
 Write-Host ("  wscript.exe `"{0}`"" -f $launcher)

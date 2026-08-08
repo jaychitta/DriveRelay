@@ -12,9 +12,53 @@
 $script:DefaultRoot = if ($PSScriptRoot) { Split-Path -Parent $PSScriptRoot } else { (Get-Location).Path }
 $script:ConfigPath  = Join-Path $script:DefaultRoot 'config\links.json'
 
+# Every change to the registry is read-modify-write, and three processes make them:
+# the CLI, the tray's child pass, and the dashboard. The individual writes are
+# atomic, so the file is never left corrupt -- but without a lock a dashboard
+# Pause landing between a pass's read and its write is simply lost. This mutex
+# makes each read-modify-write cycle exclusive.
+$script:RegistryMutexName = 'Global\DriveRelayRegistry'
+
 function Set-RegistryPath {
     param([Parameter(Mandatory)][string] $Path)
     $script:ConfigPath = $Path
+}
+
+function Invoke-RegistryTransaction {
+    <#
+        Run $Body holding the registry lock.
+
+        Windows mutexes are re-entrant for the owning thread, so a transaction
+        nested inside another (Add-Link calling Get-LinkRegistry, say) does not
+        deadlock.
+
+        A timeout throws rather than proceeding unlocked: losing a link's
+        identity is worse than failing an edit the user can retry.
+    #>
+    param(
+        [Parameter(Mandatory)][scriptblock] $Body,
+        [int] $TimeoutMs = 5000
+    )
+
+    $mutex = $null
+    $held  = $false
+    try {
+        try   { $mutex = New-Object System.Threading.Mutex($false, $script:RegistryMutexName) }
+        catch { return (& $Body) }   # no mutex available; better to proceed than to fail closed
+
+        try   { $held = $mutex.WaitOne($TimeoutMs) }
+        catch [System.Threading.AbandonedMutexException] {
+            # A holder died without releasing. We own it now.
+            $held = $true
+        }
+
+        if (-not $held) { throw 'Timed out waiting for the link registry lock; nothing was changed.' }
+        return (& $Body)
+    }
+    finally {
+        if ($held -and $mutex) { try { $mutex.ReleaseMutex() } catch { } }
+        if ($mutex) { $mutex.Dispose() }
+    }
 }
 
 function Get-LinkRegistry {
@@ -130,13 +174,37 @@ function Add-Link {
         throw 'The two sides of a link must not contain one another.'
     }
 
+    return Invoke-RegistryTransaction {
+
     $links = @(Get-LinkRegistry)
 
+    # Both sides of the new link are checked against *both* sides of every
+    # existing link -- all four combinations.
+    #
+    # Checking local-against-local and remote-against-remote only, as this
+    # used to, lets a chain through: register A <-> B, then B <-> C, and folder
+    # B is now the remote side of one link and the local side of another. Two
+    # links then drive the same tree from two separate manifests, each seeing
+    # the other's writes as changes it did not make.
+    $newSides = @(
+        [pscustomobject]@{ Name = 'local';  Path = $Local }
+        [pscustomobject]@{ Name = 'remote'; Path = $Remote }
+    )
+
     foreach ($l in $links) {
-        $existingRemote = Get-RemotePath -Link $l
-        if ((Test-PathOverlap -A $Local -B $l.LocalPath) -or
-            ($existingRemote -and (Test-PathOverlap -A $Remote -B $existingRemote))) {
-            throw ("Overlaps existing link '{0}' ({1} <-> {2})." -f $l.Id, $l.LocalPath, $existingRemote)
+        $existingSides = @(
+            [pscustomobject]@{ Name = 'local';  Path = $l.LocalPath }
+            [pscustomobject]@{ Name = 'remote'; Path = (Get-RemotePath -Link $l) }
+        )
+
+        foreach ($new in $newSides) {
+            foreach ($old in $existingSides) {
+                if (-not $old.Path -or -not $new.Path) { continue }
+                if (Test-PathOverlap -A $new.Path -B $old.Path) {
+                    throw ("The {0} side ({1}) overlaps the {2} side of existing link '{3}' ({4}). Two links sharing a folder would each drive it from a different manifest." -f
+                           $new.Name, $new.Path, $old.Name, $l.Id, $old.Path)
+                }
+            }
         }
     }
 
@@ -161,6 +229,8 @@ function Add-Link {
     }
 
     return $link
+
+    }   # end Invoke-RegistryTransaction
 }
 
 function Remove-Link {
@@ -171,13 +241,15 @@ function Remove-Link {
     [CmdletBinding(SupportsShouldProcess)]
     param([Parameter(Mandatory)][string] $Id)
 
-    $links = @(Get-LinkRegistry)
-    if (@($links | Where-Object { $_.Id -eq $Id }).Count -eq 0) {
-        throw ("No link with id '{0}'." -f $Id)
-    }
+    Invoke-RegistryTransaction {
+        $links = @(Get-LinkRegistry)
+        if (@($links | Where-Object { $_.Id -eq $Id }).Count -eq 0) {
+            throw ("No link with id '{0}'." -f $Id)
+        }
 
-    if ($PSCmdlet.ShouldProcess($Id, 'unregister link (files untouched)')) {
-        Save-LinkRegistry -Links @($links | Where-Object { $_.Id -ne $Id })
+        if ($PSCmdlet.ShouldProcess($Id, 'unregister link (files untouched)')) {
+            Save-LinkRegistry -Links @($links | Where-Object { $_.Id -ne $Id })
+        }
     }
 }
 
@@ -188,13 +260,15 @@ function Set-LinkEnabled {
         [Parameter(Mandatory)][bool] $Enabled
     )
 
-    $links = @(Get-LinkRegistry)
-    $target = $links | Where-Object { $_.Id -eq $Id }
-    if (-not $target) { throw ("No link with id '{0}'." -f $Id) }
+    Invoke-RegistryTransaction {
+        $links = @(Get-LinkRegistry)
+        $target = $links | Where-Object { $_.Id -eq $Id }
+        if (-not $target) { throw ("No link with id '{0}'." -f $Id) }
 
-    if ($PSCmdlet.ShouldProcess($Id, "set enabled=$Enabled")) {
-        $target.Enabled = $Enabled
-        Save-LinkRegistry -Links $links
+        if ($PSCmdlet.ShouldProcess($Id, "set enabled=$Enabled")) {
+            $target.Enabled = $Enabled
+            Save-LinkRegistry -Links $links
+        }
     }
 }
 
@@ -208,19 +282,21 @@ function Set-LinkSettings {
         [object] $HydrateBeforeDelete = $null
     )
 
-    $links = @(Get-LinkRegistry)
-    $target = $links | Where-Object { $_.Id -eq $Id }
-    if (-not $target) { throw ("No link with id '{0}'." -f $Id) }
+    return Invoke-RegistryTransaction {
+        $links = @(Get-LinkRegistry)
+        $target = $links | Where-Object { $_.Id -eq $Id }
+        if (-not $target) { throw ("No link with id '{0}'." -f $Id) }
 
-    if ($SettleMinutes -ge 0) { $target.SettleMinutes = $SettleMinutes }
-    if ($MaxDelete -ge 0) { $target.MaxDelete = $MaxDelete }
-    if ($Dehydrate -ne $null) { $target.Dehydrate = [bool]$Dehydrate }
-    if ($HydrateBeforeDelete -ne $null) { $target.HydrateBeforeDelete = [bool]$HydrateBeforeDelete }
+        if ($SettleMinutes -ge 0) { $target.SettleMinutes = $SettleMinutes }
+        if ($MaxDelete -ge 0) { $target.MaxDelete = $MaxDelete }
+        if ($null -ne $Dehydrate) { $target.Dehydrate = [bool]$Dehydrate }
+        if ($null -ne $HydrateBeforeDelete) { $target.HydrateBeforeDelete = [bool]$HydrateBeforeDelete }
 
-    if ($PSCmdlet.ShouldProcess($Id, "update link settings")) {
-        Save-LinkRegistry -Links $links
+        if ($PSCmdlet.ShouldProcess($Id, "update link settings")) {
+            Save-LinkRegistry -Links $links
+        }
+        return $target
     }
-    return $target
 }
 
 function Update-LinkState {
@@ -234,15 +310,17 @@ function Update-LinkState {
         [switch] $MarkSeeded
     )
 
-    $links  = @(Get-LinkRegistry)
-    $target = $links | Where-Object { $_.Id -eq $Id }
-    if (-not $target) { return }
+    Invoke-RegistryTransaction {
+        $links  = @(Get-LinkRegistry)
+        $target = $links | Where-Object { $_.Id -eq $Id }
+        if (-not $target) { return }
 
-    $target.LastRun    = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-    $target.LastResult = $Result
-    if ($MarkSeeded) { $target.Seeded = $true }
+        $target.LastRun    = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        $target.LastResult = $Result
+        if ($MarkSeeded) { $target.Seeded = $true }
 
-    Save-LinkRegistry -Links $links
+        Save-LinkRegistry -Links $links
+    }
 }
 
 function Test-LinkPaths {

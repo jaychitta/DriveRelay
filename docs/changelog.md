@@ -2,6 +2,54 @@
 
 All notable changes to DriveRelay (formerly SyncOrchestrator) will be documented in this file.
 
+## [Unreleased] - 2026-08-08 (b) — audit findings fixed
+
+All twelve audit findings resolved. Detail and reproduction steps in `docs/06-audit.md`.
+
+### Fixed
+- **Cross-side link overlap (finding 2).** `Add-Link` now checks both sides of the new link
+  against both sides of every existing link — all four combinations — instead of only
+  local-vs-local and remote-vs-remote. Registering `A ↔ B` and then `B ↔ C` was accepted,
+  leaving two links driving folder `B` from two separate manifests. The error now names
+  which side collided with which.
+- **Registry write races (finding 5).** New `Invoke-RegistryTransaction` holds a named mutex
+  (`Global\DriveRelayRegistry`) around every read-modify-write of `links.json`. A dashboard
+  Pause landing between a pass's read and its write is no longer lost.
+- **Dashboard double-click (finding 3).** The card double-click handlers captured `$Link`
+  from a scope that no longer existed when the handler ran. Now snapshotted with
+  `.GetNewClosure()`, and the folder is checked before Explorer is launched.
+- **Global settings wiping per-link overrides (finding 4).** Propagating settle time and
+  max-delete to existing links is now opt-in behind an unticked checkbox, rather than
+  silently overwriting exactly the links that had been customised.
+- **Persisted pause (finding 7).** `Paused` is now a setting. The tray restores it at
+  startup, the dashboard shows it in the status bar, `DriveRelay config` reports it, and
+  unattended `run` passes honour it — while an explicit `sync` still works, because pausing
+  means "stop doing this on your own", not "refuse when I ask".
+- **Dropped log lines (finding 8).** `Write-Log` retries up to four times with a short
+  backoff instead of silently swallowing the first write collision. Rotation is separately
+  guarded. It still never throws.
+- **Installer interval message (finding 6).** Reports the interval and start delay actually
+  in effect rather than the parameter defaults, and warns when syncing is paused.
+- **`Get-LinkCount` (finding 9).** Empty, null and malformed registries report 0, not 1.
+- **`OneDriveGate` daily rollover (finding 11).** The gate re-arms at midnight; each day
+  gets its own blocked phase. Previously `$resumed` latched true permanently, so a machine
+  left running resumed once and never blocked again — silently.
+
+### Added
+- **Engine test coverage (finding 10)** — the suite goes from 17 assertions to 51, covering
+  the full `Compare-LinkState` classification table (all eight outcomes), the `MaxDelete`
+  abort including the exactly-at-the-limit boundary, conflict forking, manifest
+  round-tripping and exclude handling. Finding 1 now has a direct regression test.
+- Tests redirect logging to `tests/test-run.log`. They had been writing scratch link ids
+  into the production `driverelay.log` — a defect introduced and fixed within this change,
+  verified by asserting the production log's byte size is unchanged across a full run.
+
+### Verified
+- 51 passed, 0 failed.
+- Parse check across all 18 `.ps1` files: clean.
+- Pause guard exercised in an isolated copy with an empty registry, so no live link was
+  reachable: `run` skips when paused and proceeds when not.
+
 ## [Unreleased] - 2026-08-08
 
 Audit, installer and first publication to git.

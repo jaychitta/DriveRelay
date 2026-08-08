@@ -7,8 +7,11 @@
       2. BLOCKED -- after that, OneDrive is shut down, and shut down again if it relaunches.
       3. RESUMED -- at $ResumeTime, OneDrive is started and left alone for the rest of the run.
 
-    Once resumed it stays resumed. Restarting the script (i.e. restarting your machine)
-    begins the cycle again.
+    Once resumed it stays resumed for the rest of that day. At midnight the gate
+    re-arms: the new day gets its own blocked phase, ending at that day's $ResumeTime.
+    The grace period applies only at startup and is not reapplied daily.
+
+    Restarting the script begins the cycle again, grace period included.
 
     OneDrive exposes no real "pause" to scripts -- only /shutdown and /background --
     so this stops and starts the process rather than pausing it.
@@ -140,7 +143,14 @@ $graceEnds   = $scriptStart.AddMinutes($GraceMinutes)
 
 # The resume moment is today's $ResumeTime -- unless we started after it, in which
 # case resume is already due and the grace period is the only delay.
-$resumeAt = $scriptStart.Date.Add($resumeSpan)
+#
+# Recomputed at each midnight in the loop below. Pinning it to the start date
+# meant that on a machine left running for days, the gate resumed once on day one
+# and then never blocked again: $resumed latched true permanently and every
+# subsequent working day ran with OneDrive untouched. The failure was silent,
+# which is the worst kind for something whose whole job is to be in the way.
+$resumeAt   = $scriptStart.Date.Add($resumeSpan)
+$currentDay = $scriptStart.Date
 
 Write-Log '---------------------------------------------'
 Write-Log ('Started. exe={0}' -f $exe)
@@ -160,7 +170,18 @@ while ($true) {
         $procs   = Get-OneDriveProcesses
         $running = ($procs.Count -gt 0)
 
-        # Once resumed, stay resumed for the rest of this run.
+        # A new day re-arms the gate. The grace period belongs to startup only,
+        # so it is not reapplied -- from midnight the day's blocked phase runs
+        # until that day's resume time.
+        if ($now.Date -ne $currentDay) {
+            $currentDay = $now.Date
+            $resumeAt   = $currentDay.Add($resumeSpan)
+            $resumed    = $false
+            $phase      = 'rollover'
+            Write-Log ('New day. Gate re-armed; resume at {0:HH:mm}.' -f $resumeAt) 'INFO'
+        }
+
+        # Once resumed, stay resumed for the rest of the day.
         if (-not $resumed -and $now -ge $resumeAt -and $now -ge $graceEnds) {
             $resumed = $true
             Write-Log 'Resume time reached. OneDrive stays on from here.' 'INFO'

@@ -47,7 +47,9 @@ $script:StateRoot = Join-Path $root 'state'
 $script:Cli       = Join-Path $root 'DriveRelay.ps1'
 $script:Ui        = Join-Path $root 'DriveRelayUI.ps1'
 $script:Child     = $null
-$script:Paused    = $false
+# Restored from settings rather than defaulting to false: a pause the user set
+# before a reboot must still be in force afterwards.
+$script:Paused    = [bool]$script:AppSettings.Paused
 $script:LastSeen  = $null
 
 # --------------------------------------------------------- single instance ---
@@ -96,7 +98,12 @@ function Get-LinkCount {
     if (-not (Test-Path $cf)) { return 0 }
     try {
         $raw = Get-Content -LiteralPath $cf -Raw -Encoding UTF8
+        # An empty or whitespace file is zero links, not one. Returning 1
+        # unconditionally for anything non-array made a malformed registry
+        # display as "1 link(s) ready".
+        if ([string]::IsNullOrWhiteSpace($raw)) { return 0 }
         $parsed = ConvertFrom-Json -InputObject $raw
+        if ($null -eq $parsed) { return 0 }
         if ($parsed -is [System.Array]) { return $parsed.Count }
         return 1
     } catch { return 0 }
@@ -236,17 +243,38 @@ function Complete-Pass {
 
 $miSync.Add_Click({ Start-Pass })
 
-$miPause.Add_Click({
-    $script:Paused = -not $script:Paused
-    if ($script:Paused) {
+function Set-PausedState {
+    <#
+        Apply a pause state to the menu and the icon, and persist it.
+
+        Persisting matters: this control means "stop touching my files", and a
+        setting with that meaning surviving a reboot is the reasonable
+        expectation. Failing to write it must not leave the UI lying about the
+        in-memory state, so the write is attempted and any failure is logged.
+    #>
+    param([Parameter(Mandatory)][bool] $Paused)
+
+    $script:Paused = $Paused
+
+    if ($Paused) {
         $miPause.Text  = 'Resume syncing'
         $miStatus.Text = 'Paused'
         Set-TrayState -State 'warn' -Tip 'DriveRelay - paused'
-        Write-Log 'tray: syncing paused'
     }
     else {
         $miPause.Text = 'Pause syncing'
         Set-TrayState -State 'idle' -Tip 'DriveRelay'
+    }
+
+    try   { $null = Set-AppSetting -Key 'Paused' -Value $Paused }
+    catch { Write-Log ("could not persist paused={0}: {1}" -f $Paused, $_.Exception.Message) 'WARN' }
+}
+
+$miPause.Add_Click({
+    $now = -not $script:Paused
+    Set-PausedState -Paused $now
+    if ($now) { Write-Log 'tray: syncing paused (persisted)' }
+    else {
         Write-Log 'tray: syncing resumed'
         Start-Pass
     }
@@ -308,6 +336,14 @@ $cycle.Start()
 
 Write-Log ("tray started, pass every {0} minute(s)" -f $script:CurrentInterval)
 Update-StatusLine
+
+# A pause restored from settings has to be reflected in the menu and the icon,
+# or the tray would show "Pause syncing" and an idle icon while silently
+# refusing to run passes.
+if ($script:Paused) {
+    Set-PausedState -Paused $true
+    Write-Log 'tray: starting paused (restored from settings)'
+}
 
 $delaySeconds = if ($script:AppSettings.StartDelaySeconds -gt 0) { $script:AppSettings.StartDelaySeconds } else { 90 }
 $firstRun = New-Object System.Windows.Forms.Timer

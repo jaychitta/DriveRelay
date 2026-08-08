@@ -264,7 +264,7 @@ function Show-SettingsDialog {
 
     $f = New-Object System.Windows.Forms.Form
     $f.Text            = 'DriveRelay Settings'
-    $f.Size            = New-Object System.Drawing.Size -ArgumentList 540, 440
+    $f.Size            = New-Object System.Drawing.Size -ArgumentList 540, 478
     $f.StartPosition   = 'CenterParent'
     $f.FormBorderStyle = 'FixedDialog'
     $f.MaximizeBox     = $false; $f.MinimizeBox = $false
@@ -347,14 +347,29 @@ function Show-SettingsDialog {
     $cbStartup.Checked = [bool]$current.StartWithWindows
     $f.Controls.Add($cbStartup)
 
+    # Apply-to-all, opt in.
+    #
+    # Saving here used to force the global settle time and max-delete onto every
+    # link, which silently destroyed exactly the per-link overrides the Edit
+    # dialog exists to set. Now it only happens if asked for, and the label says
+    # what it will do.
+    $cbApplyAll = New-Object System.Windows.Forms.CheckBox
+    $cbApplyAll.Text = 'Also apply settle time and max deletions to all existing folder pairs'
+    $cbApplyAll.ForeColor = $script:TextPrimary; $cbApplyAll.BackColor = [System.Drawing.Color]::Transparent
+    $cbApplyAll.Location = New-Object System.Drawing.Point -ArgumentList 24, 320; $cbApplyAll.Size = New-Object System.Drawing.Size -ArgumentList 480, 22
+    $cbApplyAll.Checked = $false
+    $f.Controls.Add($cbApplyAll)
+
+    $f.Controls.Add((New-DarkSubLabel 'Leave unticked to keep any per-pair values set with Edit.' 44 342 460))
+
     # Buttons
-    $ok = New-DarkBtn 'Save settings' 290 348 120
+    $ok = New-DarkBtn 'Save settings' 290 372 120
     $ok.BackColor = $script:AccentBlue
     $ok.FlatAppearance.BorderColor = $script:AccentBlue
     $ok.Add_MouseEnter({ $this.BackColor = [System.Drawing.Color]::FromArgb(255, 70, 155, 245) })
     $ok.Add_MouseLeave({ $this.BackColor = $script:AccentBlue })
 
-    $cancel = New-DarkBtn 'Cancel' 420 348 90
+    $cancel = New-DarkBtn 'Cancel' 420 372 90
     $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
     $f.Controls.AddRange(@($ok, $cancel))
     $f.CancelButton = $cancel
@@ -367,18 +382,24 @@ function Show-SettingsDialog {
             HydrateBeforeDelete = [bool]$cbSafe.Checked
             StartWithWindows    = [bool]$cbStartup.Checked
             StartDelaySeconds   = [int]$current.StartDelaySeconds
+            Paused              = [bool]$current.Paused
         }
         Save-AppSettings -Settings $newSettings
 
-        # Propagate default settle time and maxdelete to existing links if desired
-        $links = @(Get-LinkRegistry)
-        foreach ($l in $links) {
-            if ($l.SettleMinutes -ne $newSettings.SettleMinutes -or $l.MaxDelete -ne $newSettings.MaxDelete) {
-                Set-LinkSettings -Id $l.Id -SettleMinutes $newSettings.SettleMinutes -MaxDelete $newSettings.MaxDelete
+        # Only on request -- see the note by the checkbox.
+        $applied = 0
+        if ($cbApplyAll.Checked) {
+            foreach ($l in @(Get-LinkRegistry)) {
+                if ($l.SettleMinutes -ne $newSettings.SettleMinutes -or $l.MaxDelete -ne $newSettings.MaxDelete) {
+                    $null = Set-LinkSettings -Id $l.Id -SettleMinutes $newSettings.SettleMinutes -MaxDelete $newSettings.MaxDelete
+                    $applied++
+                }
             }
         }
 
-        Write-Log ("settings saved via UI: Interval={0}m Settle={1}m MaxDelete={2}" -f $newSettings.IntervalMinutes, $newSettings.SettleMinutes, $newSettings.MaxDelete)
+        Write-Log ("settings saved via UI: Interval={0}m Settle={1}m MaxDelete={2}; per-link overrides {3}" -f
+                   $newSettings.IntervalMinutes, $newSettings.SettleMinutes, $newSettings.MaxDelete,
+                   $(if ($cbApplyAll.Checked) { "overwritten on $applied link(s)" } else { 'preserved' }))
         $f.DialogResult = [System.Windows.Forms.DialogResult]::OK
         $f.Close()
     })
@@ -735,9 +756,28 @@ function New-LinkCard {
     $card.Controls.Add($btnToggle)
 
     # Double-click card to open local folder.
-    $card.Add_DoubleClick({ Start-Process explorer.exe $Link.LocalPath })
-    $lblName.Add_DoubleClick({ Start-Process explorer.exe $Link.LocalPath })
-    $lblPaths.Add_DoubleClick({ Start-Process explorer.exe $Link.LocalPath })
+    #
+    # .GetNewClosure() is required, not decorative. A plain scriptblock is not a
+    # closure in PowerShell: it resolves its variables when it runs, and by then
+    # New-LinkCard has long since returned, so $Link would be $null and the
+    # handler would open nothing (or the wrong folder). GetNewClosure snapshots
+    # $Link now. The Edit and Pause buttons above solve the same problem the
+    # other way, by stashing the id in .Tag and re-reading the registry.
+    $openLocal = {
+        $target = $Link.LocalPath
+        if ($target -and (Test-Path -LiteralPath $target)) {
+            Start-Process -FilePath 'explorer.exe' -ArgumentList ('"{0}"' -f $target)
+        }
+        else {
+            [System.Windows.Forms.MessageBox]::Show(
+                ("That folder is not there any more:`r`n{0}" -f $target),
+                'Open folder', 'OK', 'Warning') | Out-Null
+        }
+    }.GetNewClosure()
+
+    $card.Add_DoubleClick($openLocal)
+    $lblName.Add_DoubleClick($openLocal)
+    $lblPaths.Add_DoubleClick($openLocal)
 
     return $card
 }
@@ -769,8 +809,22 @@ function Update-Cards {
     }
 
     $sum = Read-PassSummarySafe
-    $statusLabel.Text = if ($sum) { "Last sync {0} - {1} change(s), {2} conflict(s)" -f $sum.When, $sum.Applied, $sum.Conflicts }
-                        else      { "{0} folder pair(s) linked" -f $links.Count }
+    $base = if ($sum) { "Last sync {0} - {1} change(s), {2} conflict(s)" -f $sum.When, $sum.Applied, $sum.Conflicts }
+            else      { "{0} folder pair(s) linked" -f $links.Count }
+
+    # A global pause set from the tray used to be invisible here: every link
+    # showed as active while nothing was actually running. Say so plainly.
+    $paused = $false
+    try { $paused = [bool](Get-AppSettings).Paused } catch { }
+
+    if ($paused) {
+        $statusLabel.ForeColor = $script:StatusAmber
+        $statusLabel.Text = "Background syncing is PAUSED (resume from the tray menu)  -  $base"
+    }
+    else {
+        $statusLabel.ForeColor = $script:TextMuted
+        $statusLabel.Text = $base
+    }
 }
 
 # ------------------------------------------------------------ button wiring ---

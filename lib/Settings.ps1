@@ -25,6 +25,11 @@ function Get-DefaultSettings {
         HydrateBeforeDelete = $true
         StartWithWindows    = $true
         StartDelaySeconds   = 90
+
+        # Global "stop touching my files for a bit", set from the tray menu.
+        # Persisted rather than held in the tray process, so a reboot or a tray
+        # restart does not silently resume syncing behind the user's back.
+        Paused              = $false
     }
 }
 
@@ -70,6 +75,12 @@ function Get-AppSettings {
             [int]$parsed.StartDelaySeconds
         } else { $defaults.StartDelaySeconds }
 
+        # Absent in settings files written before pausing was persisted, which
+        # must read as "not paused" rather than as missing.
+        $paused = if ($null -ne $parsed.PSObject.Properties['Paused']) {
+            [bool]$parsed.Paused
+        } else { $defaults.Paused }
+
         return [pscustomobject]@{
             IntervalMinutes     = $intervalMinutes
             SettleMinutes       = $settleMinutes
@@ -77,6 +88,7 @@ function Get-AppSettings {
             HydrateBeforeDelete = $hydrateBeforeDelete
             StartWithWindows    = $startWithWindows
             StartDelaySeconds   = $startDelaySeconds
+            Paused              = $paused
         }
     }
     catch {

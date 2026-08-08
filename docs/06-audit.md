@@ -297,26 +297,73 @@ files are recreated automatically on first run, so nothing breaks by their absen
 
 ## Summary
 
-| # | Finding | Severity | Verified how |
-| --- | --- | --- | --- |
-| 1 | `DeleteRemote` empty-path failure | resolved (24 deletes now pending) | reproduction |
-| 2 | Cross-side link overlap accepted | medium | reproduction |
-| 3 | Dashboard double-click reads dead scope | medium | source |
-| 4 | Global save wipes per-link overrides | medium | source |
-| 5 | Unsynchronised `links.json` writes | medium-low | source |
-| 6 | Installer misreports interval | low | source |
-| 7 | Tray pause not persisted | low | source |
-| 8 | Log lines dropped under contention | low | source |
-| 9 | `Get-LinkCount` returns 1 on garbage | low | source |
-| 10 | No engine test coverage | low, highest leverage | test run |
-| 11 | `OneDriveGate` single-day resume | low | source |
-| 12 | Personal data in working folder | high for publication | file review |
+| # | Finding | Severity | Verified how | Status |
+| --- | --- | --- | --- | --- |
+| 1 | `DeleteRemote` empty-path failure | resolved | reproduction | fixed before audit; regression test added |
+| 2 | Cross-side link overlap accepted | medium | reproduction | **fixed** |
+| 3 | Dashboard double-click reads dead scope | medium | source | **fixed** |
+| 4 | Global save wipes per-link overrides | medium | source | **fixed** |
+| 5 | Unsynchronised `links.json` writes | medium-low | source | **fixed** |
+| 6 | Installer misreports interval | low | source | **fixed** |
+| 7 | Tray pause not persisted | low | source | **fixed** |
+| 8 | Log lines dropped under contention | low | source | **fixed** |
+| 9 | `Get-LinkCount` returns 1 on garbage | low | source | **fixed** |
+| 10 | No engine test coverage | low, highest leverage | test run | **fixed** (17 → 51 assertions) |
+| 11 | `OneDriveGate` single-day resume | low | source | **fixed** |
+| 12 | Personal data in working folder | high for publication | file review | **fixed** |
 
-**Nothing in findings 2–11 was changed by this audit.** They are reported for the owner to
-triage. Only finding 12 was acted on, because it blocked the requested publication.
+---
+
+## Resolutions
+
+All twelve are now addressed. What changed, and how each was confirmed:
+
+- **2 — overlap.** `Add-Link` now tests both sides of the new link against both sides of
+  every existing link, all four combinations, and names which side collided with which.
+  Covered by four assertions including the `A↔B` then `B↔C` chain that reproduced it.
+- **3 — dead scope.** The three double-click handlers now use `.GetNewClosure()` to
+  snapshot `$Link`, and check the folder still exists before launching Explorer.
+- **4 — override wipe.** Propagating global settle time and max-delete to existing links
+  is now opt-in, behind an unticked "also apply to all existing folder pairs" checkbox,
+  with a sub-label saying what leaving it unticked preserves.
+- **5 — registry races.** `Invoke-RegistryTransaction` holds a named mutex
+  (`Global\DriveRelayRegistry`) around every read-modify-write: `Add-Link`, `Remove-Link`,
+  `Set-LinkEnabled`, `Set-LinkSettings`, `Update-LinkState`. Windows mutexes are re-entrant
+  for the owning thread, so nesting is safe. A timeout throws rather than proceeding
+  unlocked.
+- **6 — installer message.** Reports `$appSettings.IntervalMinutes` and
+  `StartDelaySeconds`, the values actually in effect, and warns if syncing is paused.
+- **7 — pause.** Now a persisted setting (`Paused`), restored by the tray at startup,
+  surfaced in the dashboard status bar and in `DriveRelay config`. Unattended passes
+  (`run`) honour it; an explicit `sync` typed by a person still works, because pausing
+  means "stop doing this on your own", not "refuse when I ask".
+- **8 — log contention.** `Write-Log` retries up to four times with a short backoff, and
+  rotation is separately guarded. It still never throws.
+- **9 — link count.** Empty, null and malformed registries all report 0.
+- **10 — coverage.** The suite went from 17 assertions to 51, adding the classification
+  table (all eight outcomes), the `MaxDelete` abort including the exactly-at-the-limit
+  boundary, conflict forking, manifest round-tripping, and exclude handling. Finding 1 now
+  has a direct regression test: `DeleteRemote applies without a parameter-binding failure`.
+- **11 — gate rollover.** The gate re-arms at midnight: each day gets its own blocked
+  phase ending at that day's resume time. The grace period stays a startup-only concept.
+- **12 — publication.** `.gitignore` plus sanitised deployment docs; see the entry above.
+
+One defect was introduced and fixed during this work: the new engine tests initially wrote
+into the repository-root `driverelay.log` — the production log of a live install —
+interleaving scratch link ids into the operator's real sync history. The harness now
+redirects logging to `tests/test-run.log` before anything else runs, verified by asserting
+the production log's byte size is unchanged across a full run.
+
+---
+
+## Assessment
 
 The engine's safety design is genuinely careful — the manifest-gated deletion, the
 pre-apply delete cap and the never-hash-a-placeholder rule are the three decisions that
-matter most, and all three are right. The weakest point is not the design but the absence
-of tests around it (finding 10): the one bug that did reach a live link, finding 1, was a
-mechanical rename error of exactly the kind a classification test catches instantly.
+matter most, and all three were right before this audit began.
+
+The weakest point was never the design but the absence of tests around it. Finding 1, the
+only bug that reached a live link, was a mechanical rename error of exactly the kind a
+classification test catches in milliseconds. That gap is now closed, which matters more
+than any individual fix above: the safety properties are no longer just documented, they
+are asserted on every run.

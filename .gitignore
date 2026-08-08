@@ -19,8 +19,13 @@ state/
 # Scratch files written by the test harness.
 tests/test-settings.json
 tests/test-links.json
+tests/test-overlap.json
+tests/test-manifest.json
+tests/test-run.log
 tests/scratch_local/
 tests/scratch_remote/
+tests/scratch_overlap/
+tests/scratch_engine/
 
 # --- Windows -----------------------------------------------------------------
 

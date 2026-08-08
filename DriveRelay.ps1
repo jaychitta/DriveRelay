@@ -286,6 +286,19 @@ function Invoke-SyncCommand {
 
     $linkId = if ($Target) { $Target } elseif ($Id) { $Id } else { $null }
 
+    # An unattended pass honours the global pause; an explicit `sync` typed by a
+    # person does not. Pausing means "stop doing this on your own", not "refuse
+    # when I ask". Checked here so the pause holds whichever scheduler is
+    # driving -- the tray, the scheduled task, or neither.
+    if ($Silent) {
+        $paused = $false
+        try { $paused = [bool](Get-AppSettings).Paused } catch { }
+        if ($paused) {
+            Write-Log 'pass skipped: syncing is paused'
+            return
+        }
+    }
+
     $patterns = Get-ExcludePatterns
     $outcome  = Invoke-SyncPass -LinkId $linkId -ExcludePatterns $patterns -StateRoot $script:StateRoot -Quiet:$Silent
 
@@ -405,6 +418,12 @@ function Invoke-SettingsCommand {
     "  HydrateBeforeDelete : {0}" -f $current.HydrateBeforeDelete
     "  StartWithWindows    : {0}" -f $current.StartWithWindows
     "  StartDelaySeconds   : {0}" -f $current.StartDelaySeconds
+    "  Paused              : {0}" -f $current.Paused
+    if ($current.Paused) {
+        ''
+        "Syncing is paused: unattended passes are skipped. 'sync' still works when"
+        "you run it yourself. Resume from the tray menu."
+    }
 }
 
 # ----------------------------------------------------------------- status ---

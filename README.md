@@ -157,20 +157,34 @@ LICENSE               MIT
 powershell -ExecutionPolicy Bypass -File .\tests\Test-DriveRelay.ps1
 ```
 
-17 assertions covering settings persistence, the link registry and icon
-generation. Coverage of the sync engine itself is the main known gap — see
-finding 10 in [docs/06-audit.md](docs/06-audit.md).
+51 assertions. Alongside settings persistence, the link registry and icon
+generation, the suite covers the parts that can lose data:
 
-## Known issues
+- the full `Compare-LinkState` classification table — all eight outcomes,
+  including the deleted-here-but-edited-there cases where guessing wrong either
+  resurrects deleted files or destroys new ones
+- the `MaxDelete` abort, including the exactly-at-the-limit boundary, asserting
+  that an aborted pass leaves every file on disk
+- conflict forking — that both versions survive and which one ends up where
+- manifest round-tripping, including the empty-array and single-entry JSON
+  shapes the code carries explicit workarounds for
 
-A full audit is in [docs/06-audit.md](docs/06-audit.md), including two findings
-reproduced against live code. The ones worth knowing before you use this:
+Tests log to `tests/test-run.log` and never to the production log. They do use
+the real Recycle Bin, since that is the delete path under test.
 
-- Registering a chain (`A ↔ B`, then `B ↔ C`) is wrongly accepted, and the two
-  links will fight over folder `B`. Don't do that until it is fixed.
-- Saving global Settings from the dashboard overwrites any per-link settle time
-  or max-delete you set in the per-link Edit dialog.
-- Double-clicking a card in the dashboard does not reliably open the folder.
+## Audit
+
+A full audit is in [docs/06-audit.md](docs/06-audit.md): twelve findings, each
+labelled with how it was established — reproduced against running code, or read
+from source. All twelve are now fixed, and the ones that could be pinned to a
+behaviour have regression tests.
+
+The audit is kept in the repository rather than quietly folded into the history
+because the reasoning is worth more than the diffs. It records what was wrong,
+how it was proven wrong, and what the safety properties actually rest on.
+
+No known outstanding defects. That is not the same as "no bugs" — see the
+authorship note below for how much weight to put on it.
 
 ## Authorship
 
