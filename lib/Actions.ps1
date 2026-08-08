@@ -363,14 +363,28 @@ function Invoke-LinkSync {
         CloudOnlyDeletes = 0
         Aborted          = $false
         Message          = ''
+        # Ready | DriveOffline | FolderMissing | ClientNotRunning | NoRemote
+        State            = 'Ready'
+        Detail           = ''
     }
 
-    $paths = Test-LinkPaths -Link $Link
-    if (-not $paths.Ok) {
+    # Availability first, and specifically: an unmounted drive, a deleted folder
+    # and a stopped cloud client all look like "path missing" to Test-Path but
+    # need different things done about them.
+    $avail = Get-LinkAvailability -Link $Link
+    if ($avail.Blocking) {
         $result.Aborted = $true
-        $result.Message = ($paths.Problems -join '; ')
-        Write-Log ("link {0} skipped: {1}" -f $Link.Id, $result.Message) 'WARN'
+        $result.State   = $avail.State
+        $result.Message = $avail.Summary
+        $result.Detail  = $avail.Detail
+        Write-Log ("link {0} skipped [{1}]: {2}" -f $Link.Id, $avail.State, $avail.Detail) 'WARN'
         return $result
+    }
+    if ($avail.State -ne 'Ready') {
+        # Not blocking, but the operator should know the pass is running degraded.
+        $result.State  = $avail.State
+        $result.Detail = $avail.Detail
+        Write-Log ("link {0} degraded [{1}]: {2}" -f $Link.Id, $avail.State, $avail.Detail) 'WARN'
     }
 
     # Placeholder handling only applies where the remote side actually has

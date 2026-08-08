@@ -2,6 +2,51 @@
 
 All notable changes to DriveRelay (formerly SyncOrchestrator) will be documented in this file.
 
+## [Unreleased] - 2026-08-08 (c) — report unavailable drives and stopped cloud clients
+
+Requested by Jayadheer Chitta: "if OneDrive or that particular drive is not turned on we
+have to inform the same."
+
+### Added
+- **`lib/Availability.ps1`** — distinguishes three conditions that are identical to
+  `Test-Path` but need different responses:
+  - `DriveOffline` — the volume is not mounted (external disk unplugged, share
+    disconnected, laptop undocked). Blocking. Names the drive letter.
+  - `FolderMissing` — the drive is mounted but the folder is gone. Blocking.
+  - `ClientNotRunning` — both folders exist but the cloud client is stopped. **Not**
+    blocking: local changes still copy across and upload when it returns.
+  - `NoRemote` — the link has no remote path configured.
+  Detects OneDrive, Google Drive, Dropbox, Box, iCloud and Nextcloud by process name.
+  Returns `$null` rather than `$false` for providers it cannot check, because "I cannot
+  tell" and "it is not running" are different answers.
+- Availability reported in `check`, `status`, `sync`, the tray tooltip and balloon, and
+  the dashboard card badges.
+
+### Changed
+- **Hydration fails fast when the cloud client is not running.** `Wait-Hydrated` used to
+  spend its full timeout — up to 30 minutes per file — waiting for a client that was not
+  there. It now checks first and defers immediately.
+- **Tray balloons fire on state change, not per pass.** A disconnected drive raised a
+  warning every ten minutes all day; it now notifies once when the state changes.
+- **Dashboard cards distinguish blocked from degraded** — red for "cannot sync at all",
+  amber for "running but degraded", with the full explanation and remedy in a tooltip.
+  The status line is re-evaluated live when the window opens and when the tray menu opens,
+  rather than reflecting the last pass.
+- Availability is reported separately from failure in the pass summary. A drive that is
+  not plugged in is not a sync error, and calling it one trains people to ignore the
+  warning that matters.
+- `Invoke-LinkSync` results carry `State` and `Detail` alongside `Message`.
+
+### Verified
+- 67 assertions passed, 0 failed (was 51). New coverage: `DriveOffline` vs `FolderMissing`
+  on a real unmounted drive letter, `NoRemote`, that an unavailable link aborts without
+  touching either side, and that an unknown provider reports `$null` rather than "stopped".
+- Parse check across all 19 `.ps1` files: clean.
+- End-to-end `status` output confirmed against a three-link scenario in an isolated copy
+  (healthy / unmounted drive / deleted folder), so no live link was involved.
+- The new dependency (`Actions.ps1` → `Availability.ps1`) was caught by the test suite
+  before it could reach a caller.
+
 ## [Unreleased] - 2026-08-08 (b) — audit findings fixed
 
 All twelve audit findings resolved. Detail and reproduction steps in `docs/06-audit.md`.

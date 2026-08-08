@@ -32,9 +32,13 @@ Add-Type -AssemblyName System.Drawing
 . (Join-Path $root 'lib\Logging.ps1')
 . (Join-Path $root 'lib\Icons.ps1')
 . (Join-Path $root 'lib\Settings.ps1')
+. (Join-Path $root 'lib\Provider.ps1')
+. (Join-Path $root 'lib\Registry.ps1')
+. (Join-Path $root 'lib\Availability.ps1')
 
 Set-LogPath      (Join-Path $root 'driverelay.log')
 Set-SettingsPath (Join-Path $root 'config\settings.json')
+Set-RegistryPath (Join-Path $root 'config\links.json')
 
 $script:AppSettings = Get-AppSettings
 if ($PSBoundParameters.ContainsKey('IntervalMinutes')) {
@@ -168,6 +172,21 @@ $notify.ContextMenuStrip = $menu
 # ----------------------------------------------------------------- actions ---
 
 function Update-StatusLine {
+    # Checked live rather than read from the last pass summary, so an unplugged
+    # drive shows immediately -- including before the first pass of a session,
+    # when there is no summary to read at all.
+    $unavailable = @()
+    try { $unavailable = @(Get-UnavailableLinks) } catch { }
+
+    if ($unavailable.Count -gt 0) {
+        $miStatus.Text = if ($unavailable.Count -eq 1) { $unavailable[0].Summary }
+                         else { "{0} folder pair(s) unavailable" -f $unavailable.Count }
+        if (-not $script:Paused) {
+            Set-TrayState -State 'warn' -Tip ("DriveRelay - {0}" -f $unavailable[0].Summary)
+        }
+        return
+    }
+
     $s = Read-Summary
     $lc = Get-LinkCount
     if (-not $s) {
@@ -205,6 +224,33 @@ function Complete-Pass {
     if (-not $s) {
         Set-TrayState -State 'idle' -Tip 'DriveRelay'
         Update-StatusLine
+        return
+    }
+
+    # Availability is its own category, reported before conflicts and failures.
+    # A drive that is not plugged in is not a sync error, and a tray that says
+    # "needs attention" for both teaches people to ignore it.
+    $unavailable = @()
+    if ($s.PSObject.Properties['Unavailable']) { $unavailable = @($s.Unavailable) }
+
+    if ($unavailable.Count -gt 0) {
+        $first = $unavailable[0]
+        $tip   = "DriveRelay - {0}" -f $first.Summary
+        Set-TrayState -State 'warn' -Tip $tip
+        $miStatus.Text = if ($unavailable.Count -eq 1) { $first.Summary }
+                         else { "{0} folder pair(s) unavailable" -f $unavailable.Count }
+
+        # Notify on change of state, not once per pass: a disconnected drive
+        # would otherwise pop a balloon every ten minutes all day.
+        $stamp = 'UNAVAIL|' + (($unavailable | ForEach-Object { "$($_.LinkId)=$($_.State)" }) -join ',')
+        if ($stamp -ne $script:LastSeen) {
+            $script:LastSeen = $stamp
+            $notify.BalloonTipTitle = 'DriveRelay - not syncing'
+            $notify.BalloonTipText  = (@($unavailable | ForEach-Object { "$($_.LinkId): $($_.Summary)" }) -join "`r`n")
+            $notify.BalloonTipIcon  = 'Warning'
+            $notify.ShowBalloonTip(10000)
+            foreach ($u in $unavailable) { Write-Log ("tray: {0} unavailable -- {1}" -f $u.LinkId, $u.Detail) 'WARN' }
+        }
         return
     }
 
@@ -303,6 +349,12 @@ $miExit.Add_Click({
     $notify.Visible = $false
     Write-Log 'tray: exit requested'
     [System.Windows.Forms.Application]::Exit()
+})
+
+# Refresh on open, so the status line is current when someone actually looks at
+# it rather than as of the last pass.
+$menu.Add_Opening({
+    if (-not ($script:Child -and -not $script:Child.HasExited)) { Update-StatusLine }
 })
 
 $notify.Add_MouseDoubleClick({ $miFolders.PerformClick() })

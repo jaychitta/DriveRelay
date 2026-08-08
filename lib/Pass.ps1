@@ -42,6 +42,18 @@ function Write-PassSummary {
             Deleted    = [int](($r | Measure-Object -Property Deleted   -Sum).Sum)
             Failed     = [int](($r | Measure-Object -Property Failed    -Sum).Sum)
             Aborted    = @($r | Where-Object { $_.Aborted } | ForEach-Object { "$($_.LinkId): $($_.Message)" })
+
+            # Availability is reported separately from failure. A drive that is
+            # not plugged in is not a sync error, and calling it one trains
+            # people to ignore the warning that matters.
+            Unavailable = @($r |
+                Where-Object { $_.PSObject.Properties['State'] -and $_.State -and $_.State -ne 'Ready' } |
+                ForEach-Object {
+                    [pscustomobject]@{
+                        LinkId = $_.LinkId; State = $_.State
+                        Summary = $_.Message; Detail = $_.Detail
+                    }
+                })
         }
 
         if (-not (Test-Path $StateRoot)) { New-Item -ItemType Directory -Path $StateRoot -Force | Out-Null }
@@ -153,6 +165,7 @@ function Invoke-SyncPass {
                     LinkId = $link.Id; Applied = 0; Deferred = 0; Failed = 1
                     Conflicts = 0; Deleted = 0; CloudOnlyDeletes = 0
                     Aborted = $true; Message = $_.Exception.Message
+                    State = 'Ready'; Detail = ''
                 })
             }
         }

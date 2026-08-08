@@ -49,6 +49,31 @@ This tool moves and deletes real files, so the rules are worth stating plainly.
   application, is deferred to a later pass — it is never copied mid-write.
 - **`check` writes nothing.** Run it before `sync`, and `sync -WhatIf` before
   anything you care about.
+- **An unavailable folder is reported, never guessed at.** If a drive is not
+  mounted, a folder has been deleted, or the cloud client is not running,
+  DriveRelay says which of those it is and skips the link rather than treating
+  an absent folder as "everything was deleted".
+
+### When something is not available
+
+These three look identical to the filesystem and mean very different things, so
+they are reported separately:
+
+| What you see | What it means | What to do |
+| --- | --- | --- |
+| **Drive X: is not available** | The volume is not mounted — an external disk unplugged, a share disconnected, a laptop undocked | Reconnect it; the next pass carries on where it left off |
+| **Remote folder is missing** | The drive is there but the folder is not — deleted, renamed, or not yet recreated by the cloud client | Restore the folder, or `rm <id>` if the link is no longer wanted |
+| **OneDrive is not running** | Both folders exist but the client is stopped | Start it. Local changes are still copied across and upload when it returns; cloud-only files are deferred rather than waited on |
+
+The first two block the link and nothing is copied or deleted. The third does
+not block: it degrades. Without the client running, a cloud-only file cannot be
+fetched, so those are deferred immediately instead of burning a 30-minute
+hydration timeout each.
+
+The tray shows the specific cause in its tooltip and raises one balloon when the
+state changes — not once per pass, so a disconnected drive does not nag you all
+day. The dashboard colours the pair red when it cannot sync at all and amber when
+it is merely degraded, with the full explanation in the tooltip.
 
 ## Requirements
 

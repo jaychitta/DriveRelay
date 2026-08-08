@@ -170,6 +170,7 @@ if (Test-Path $ovRegistry) { Remove-Item -LiteralPath $ovRegistry -Force }
 # the DeleteRemote regression of 2026-08-07 would have been caught here.
 Write-Host "6. Testing sync engine classification (lib/Manifest.ps1)" -ForegroundColor Yellow
 
+. (Join-Path $root 'lib\Availability.ps1')   # Actions.ps1 calls Get-LinkAvailability
 . (Join-Path $root 'lib\Hydration.ps1')
 . (Join-Path $root 'lib\Settle.ps1')
 . (Join-Path $root 'lib\Manifest.ps1')
@@ -405,6 +406,68 @@ Assert-Equal $back2.Count 2 "Two-entry manifest reads back as two entries"
 Assert-True ($null -ne $back2['sub\two.txt']) "Manifest keys are lower-cased for lookup"
 
 if (Test-Path $mfPath) { Remove-Item -LiteralPath $mfPath -Force }
+
+# ------------------------------------------------------- 10. Availability ---
+# An unmounted drive, a deleted folder and a stopped cloud client all look like
+# "path missing" to Test-Path, but need different things done about them.
+Write-Host "10. Testing availability reporting (lib/Availability.ps1)" -ForegroundColor Yellow
+
+# Pick a drive letter that definitely is not mounted.
+# 90..82 is 'Z' down to 'R'. A string range ('Z'..'R') is an integer range in
+# PowerShell and throws on the cast.
+$freeLetter = $null
+foreach ($code in 90..82) {
+    $c = [char]$code
+    if (-not (Test-Path -LiteralPath ("{0}:\" -f $c))) { $freeLetter = $c; break }
+}
+
+$ctx = New-TestLink
+Assert-Equal (Get-LinkAvailability -Link $ctx.Link).State 'Ready' "Both folders present reports Ready"
+Assert-True (Get-LinkAvailability -Link $ctx.Link).Ok "Ready link is Ok to sync"
+
+if ($freeLetter) {
+    $offline = $ctx.Link.PSObject.Copy()
+    $offline.RemotePath = "{0}:\SomeFolder" -f $freeLetter
+    $a = Get-LinkAvailability -Link $offline
+    Assert-Equal $a.State 'DriveOffline' "Unmounted drive reports DriveOffline, not FolderMissing"
+    Assert-True $a.Blocking "DriveOffline blocks the pass"
+    Assert-True ($a.Summary -match [regex]::Escape("$freeLetter" + ':')) "DriveOffline summary names the drive"
+}
+else {
+    Write-Host "  [SKIP] no unmounted drive letter available to test DriveOffline" -ForegroundColor DarkYellow
+}
+
+# Drive mounted, folder gone -- a different diagnosis from the same Test-Path result.
+$gone = $ctx.Link.PSObject.Copy()
+$gone.RemotePath = Join-Path $ctx.Remote 'no-such-subfolder'
+$a2 = Get-LinkAvailability -Link $gone
+Assert-Equal $a2.State 'FolderMissing' "Missing folder on a mounted drive reports FolderMissing"
+Assert-True $a2.Blocking "FolderMissing blocks the pass"
+
+# No remote configured at all.
+$noRemote = $ctx.Link.PSObject.Copy()
+$noRemote.RemotePath = $null
+Assert-Equal (Get-LinkAvailability -Link $noRemote).State 'NoRemote' "Link with no remote path reports NoRemote"
+
+# A blocked link must abort cleanly rather than throwing, and touch nothing.
+$null = Set-TestFile (Join-Path $ctx.Local 'keepme.txt') 'data'
+$blockedRes = Invoke-LinkSync -Link $gone -ExcludePatterns @() -StateRoot $ctx.State
+Assert-True $blockedRes.Aborted "Unavailable link aborts the pass"
+Assert-Equal $blockedRes.State 'FolderMissing' "Abort result carries the availability state"
+Assert-Equal $blockedRes.Deleted 0 "Unavailable link deletes nothing"
+Assert-True (Test-Path -LiteralPath (Join-Path $ctx.Local 'keepme.txt')) "Local file untouched when the link is unavailable"
+
+# Drive detection itself.
+Assert-True (Test-DriveMounted -Path $ctx.Local) "Test-DriveMounted true for a real path"
+if ($freeLetter) {
+    Assert-True (-not (Test-DriveMounted -Path ("{0}:\anything" -f $freeLetter))) "Test-DriveMounted false for an unmounted letter"
+}
+
+# "I cannot tell" must not be reported as "not running".
+Assert-True ($null -eq (Test-CloudClientRunning -ProviderLabel 'Folder')) "Unknown provider returns null, not false"
+$odState = Test-CloudClientRunning -ProviderLabel 'OneDrive'
+Assert-True (($odState -eq $true) -or ($odState -eq $false)) "Known provider returns a definite true/false"
+
 if (Test-Path $engineRoot) { Remove-Item -LiteralPath $engineRoot -Recurse -Force -ErrorAction SilentlyContinue }
 
 # Summary

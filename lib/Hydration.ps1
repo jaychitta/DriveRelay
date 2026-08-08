@@ -159,6 +159,18 @@ function Wait-Hydrated {
 
     if (-not (Test-Offline -Path $Path)) { return $true }
 
+    # Nothing will hydrate this file if the client that owns it is not running,
+    # so waiting the full timeout only delays the inevitable -- at up to 30
+    # minutes per file, a pass over a handful of placeholders could sit for
+    # hours achieving nothing. Fail fast and let the next pass retry.
+    if (Get-Command Test-CloudClientRunning -ErrorAction SilentlyContinue) {
+        $label = Get-ProviderLabel -Path $Path
+        if ((Test-CloudClientRunning -ProviderLabel $label) -eq $false) {
+            Write-Log ("{0} is not running; cannot hydrate {1} -- deferring to a later pass" -f $label, $Path) 'WARN'
+            return $false
+        }
+    }
+
     Set-Hydrated -Path $Path -Confirm:$false
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)

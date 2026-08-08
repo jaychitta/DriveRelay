@@ -70,6 +70,7 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $root 'lib\Logging.ps1')
 . (Join-Path $root 'lib\Settings.ps1')
 . (Join-Path $root 'lib\Provider.ps1')
+. (Join-Path $root 'lib\Availability.ps1')
 . (Join-Path $root 'lib\Hydration.ps1')
 . (Join-Path $root 'lib\Settle.ps1')
 . (Join-Path $root 'lib\Registry.ps1')
@@ -237,11 +238,16 @@ function Invoke-CheckCommand {
             "    not yet seeded -- first run would seed from: {0}" -f $link.Seed
         }
 
-        $paths = Test-LinkPaths -Link $link
-        if (-not $paths.Ok) {
-            foreach ($p in $paths.Problems) { "    SKIPPED: $p" }
-            "    A missing folder is never read as 'everything was deleted'."
+        $avail = Get-LinkAvailability -Link $link
+        if ($avail.Blocking) {
+            "    SKIPPED -- {0}" -f $avail.Summary
+            "    {0}" -f $avail.Detail
             continue
+        }
+        if ($avail.State -ne 'Ready') {
+            "    WARNING -- {0}" -f $avail.Summary
+            "    {0}" -f $avail.Detail
+            ''
         }
 
         $items = Compare-LinkState -Link $link -ExcludePatterns $patterns -StateRoot $script:StateRoot
@@ -312,7 +318,14 @@ function Invoke-SyncCommand {
         ''
         "=== {0}   {1}  <->  {2}" -f $r.LinkId, $link.LocalPath, (Get-RemotePath -Link $link)
 
-        if ($r.Aborted) { "    ABORTED: {0}" -f $r.Message; continue }
+        if ($r.Aborted) {
+            "    SKIPPED: {0}" -f $r.Message
+            if ($r.PSObject.Properties['Detail'] -and $r.Detail) { "    {0}" -f $r.Detail }
+            continue
+        }
+        if ($r.PSObject.Properties['State'] -and $r.State -and $r.State -ne 'Ready') {
+            "    WARNING: {0}" -f $r.Detail
+        }
 
         "    applied {0}, deferred {1}, conflicts {2}, deleted {3}, failed {4}" -f `
             $r.Applied, $r.Deferred, $r.Conflicts, $r.Deleted, $r.Failed
@@ -447,10 +460,11 @@ function Invoke-StatusCommand {
         "    seeded    {0}    settle {1}m    maxdelete {2}" -f $link.Seeded, $link.SettleMinutes, $link.MaxDelete
         "    last run  {0}" -f $(if ($link.LastRun) { "$($link.LastRun)  --  $($link.LastResult)" } else { 'never' })
 
-        $paths = Test-LinkPaths -Link $link
-        if (-not $paths.Ok) {
-            foreach ($p in $paths.Problems) { "    PROBLEM: $p" }
-            continue
+        $avail = Get-LinkAvailability -Link $link
+        if ($avail.State -ne 'Ready') {
+            "    {0}: {1}" -f $(if ($avail.Blocking) { 'UNAVAILABLE' } else { 'WARNING' }), $avail.Summary
+            "    {0}" -f $avail.Detail
+            if ($avail.Blocking) { continue }
         }
 
         $items = Compare-LinkState -Link $link -ExcludePatterns $patterns -StateRoot $script:StateRoot

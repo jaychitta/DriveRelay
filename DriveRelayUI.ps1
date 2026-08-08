@@ -22,6 +22,7 @@ Add-Type -AssemblyName System.Drawing
 
 . (Join-Path $root 'lib\Logging.ps1')
 . (Join-Path $root 'lib\Provider.ps1')
+. (Join-Path $root 'lib\Availability.ps1')
 . (Join-Path $root 'lib\Icons.ps1')
 . (Join-Path $root 'lib\Registry.ps1')
 . (Join-Path $root 'lib\Settings.ps1')
@@ -59,6 +60,9 @@ $script:TextMuted    = [System.Drawing.Color]::FromArgb(255, 140, 140, 150)
 $script:AccentBlue   = [System.Drawing.Color]::FromArgb(255, 56, 142, 240)
 $script:StatusGreen  = [System.Drawing.Color]::FromArgb(255, 50, 190, 90)
 $script:StatusAmber  = [System.Drawing.Color]::FromArgb(255, 240, 170, 30)
+# Red is reserved for "this pair cannot sync at all right now" -- a drive that is
+# not mounted, a folder that is gone. Amber stays for degraded-but-running.
+$script:StatusRed    = [System.Drawing.Color]::FromArgb(255, 240, 90, 90)
 $script:StatusGray   = [System.Drawing.Color]::FromArgb(255, 110, 110, 120)
 $script:BtnBg        = [System.Drawing.Color]::FromArgb(255, 55, 55, 62)
 $script:BtnHover     = [System.Drawing.Color]::FromArgb(255, 70, 70, 78)
@@ -97,15 +101,28 @@ function Select-FolderDialog {
 function Get-StatusInfo {
     param([object] $Link)
     if (-not $Link.Enabled) {
-        return @{ Text = 'Paused'; Color = $script:StatusGray }
+        return @{ Text = 'Paused'; Color = $script:StatusGray; Detail = '' }
     }
+
+    # Availability outranks everything else: if the drive is not there, saying
+    # "up to date" is worse than saying nothing. Checked live, so the card is
+    # right the moment the window opens rather than as of the last pass.
+    try {
+        $a = Get-LinkAvailability -Link $Link
+        if ($a.State -ne 'Ready') {
+            $colour = if ($a.Blocking) { $script:StatusRed } else { $script:StatusAmber }
+            return @{ Text = $a.Summary; Color = $colour; Detail = $a.Detail }
+        }
+    }
+    catch { }
+
     if (-not $Link.Seeded) {
-        return @{ Text = 'Not synced yet'; Color = $script:StatusAmber }
+        return @{ Text = 'Not synced yet'; Color = $script:StatusAmber; Detail = '' }
     }
     if ($Link.LastResult -like 'aborted*') {
-        return @{ Text = 'Needs attention'; Color = $script:StatusAmber }
+        return @{ Text = 'Needs attention'; Color = $script:StatusAmber; Detail = [string]$Link.LastResult }
     }
-    return @{ Text = 'Up to date'; Color = $script:StatusGreen }
+    return @{ Text = 'Up to date'; Color = $script:StatusGreen; Detail = '' }
 }
 
 # Resolve application icon.
@@ -676,10 +693,20 @@ function New-LinkCard {
     $lblStatus.ForeColor = $si.Color
     $lblStatus.BackColor = [System.Drawing.Color]::Transparent
     $lblStatus.TextAlign = 'TopRight'
-    $lblStatus.Location = New-Object System.Drawing.Point -ArgumentList 440, 12
-    $lblStatus.Size = New-Object System.Drawing.Size -ArgumentList 160, 20
+    $lblStatus.Location = New-Object System.Drawing.Point -ArgumentList 400, 12
+    $lblStatus.Size = New-Object System.Drawing.Size -ArgumentList 200, 20
     $lblStatus.Anchor = 'Top,Right'
     $card.Controls.Add($lblStatus)
+
+    # The badge has room for a few words; the explanation of what to do about it
+    # lives in the tooltip.
+    if ($si.Detail) {
+        $tip = New-Object System.Windows.Forms.ToolTip
+        $tip.AutoPopDelay = 20000
+        $tip.InitialDelay = 300
+        $tip.SetToolTip($lblStatus, $si.Detail)
+        $tip.SetToolTip($card, $si.Detail)
+    }
 
     # Paths.
     $remote = Get-RemotePath -Link $Link

@@ -17,7 +17,8 @@ DriveRelay relays files between a high-speed local NTFS working folder and a clo
 - `.gitignore`: Keeps runtime state and personal data (`config/links.json`, `config/settings.json`, `state/`, `*.log`) out of version control.
 - `OneDriveGate.ps1`: Process lifecycle controller for the OneDrive desktop client (Grace -> Blocked -> Resumed).
 - `lib/`: Modular PowerShell helper scripts:
-  - `Actions.ps1`: Sync action execution, file copying, deletion with safety thresholds.
+  - `Actions.ps1`: Sync action execution, file copying, deletion with safety thresholds. Depends on `Availability.ps1`.
+  - `Availability.ps1`: Distinguishes an unmounted drive from a deleted folder from a stopped cloud client, and reports what to do about each. Must be dot-sourced before `Actions.ps1`.
   - `Hydration.ps1`: OneDrive file hydration and cloud dehydration handlers.
   - `Icons.ps1`: GDI+ programmatic icon drawing for tray and fallback icon generation.
   - `Logging.ps1`: Structured console and file logging.
