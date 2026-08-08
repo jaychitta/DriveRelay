@@ -1,0 +1,17 @@
+[
+    {
+        "Id":  "Documents",
+        "LocalPath":  "D:\\Documents",
+        "RemotePath":  "C:\\Users\\you\\OneDrive\\Documents",
+        "Provider":  "Auto",
+        "Seed":  "Local",
+        "SettleMinutes":  3,
+        "MaxDelete":  50,
+        "Dehydrate":  true,
+        "HydrateBeforeDelete":  false,
+        "Enabled":  true,
+        "Seeded":  false,
+        "LastRun":  null,
+        "LastResult":  null
+    }
+]

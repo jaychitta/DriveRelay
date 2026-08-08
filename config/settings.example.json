@@ -1,0 +1,8 @@
+{
+    "IntervalMinutes":  10,
+    "SettleMinutes":  3,
+    "MaxDelete":  50,
+    "HydrateBeforeDelete":  true,
+    "StartWithWindows":  true,
+    "StartDelaySeconds":  90
+}

@@ -1,0 +1,28 @@
+# --- personal data -----------------------------------------------------------
+# These are generated at runtime and describe the owner's actual folders and
+# files. They must never be published. Everything here is recreated
+# automatically on first run; see config/*.example.json for the shapes.
+
+config/links.json
+config/settings.json
+state/
+
+# Logs record real filenames from every linked folder.
+*.log
+
+# --- runtime artefacts -------------------------------------------------------
+
+*.tmp
+*.superseded-*
+*.driverelay.tmp
+
+# Scratch files written by the test harness.
+tests/test-settings.json
+tests/test-links.json
+tests/scratch_local/
+tests/scratch_remote/
+
+# --- Windows -----------------------------------------------------------------
+
+Thumbs.db
+desktop.ini
