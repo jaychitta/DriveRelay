@@ -17,13 +17,17 @@ DriveRelay relays files between a high-speed local NTFS working folder and a clo
 - `.gitignore`: Keeps runtime state and personal data (`config/links.json`, `config/settings.json`, `state/`, `*.log`) out of version control.
 - `OneDriveGate.ps1`: Process lifecycle controller for the OneDrive desktop client (Grace -> Blocked -> Resumed).
 - `lib/`: Modular PowerShell helper scripts:
-  - `Actions.ps1`: Sync action execution, file copying, deletion with safety thresholds. Depends on `Availability.ps1`.
+  - `Actions.ps1`: Sync action execution, file copying, deletion with safety thresholds, and removal of folders a pass empties. Depends on `Availability.ps1`.
   - `Availability.ps1`: Distinguishes an unmounted drive from a deleted folder from a stopped cloud client, and reports what to do about each. Must be dot-sourced before `Actions.ps1`.
   - `Hydration.ps1`: OneDrive file hydration and cloud dehydration handlers.
   - `Icons.ps1`: GDI+ programmatic icon drawing for tray and fallback icon generation.
-  - `Logging.ps1`: Structured console and file logging.
+  - `Logging.ps1`: Structured console and file logging. Severity threshold (`DEBUG`/`INFO`/
+    `WARN`/`ERROR`, default `INFO`) plus generational rotation to `driverelay.<n>.log`.
+    Dot-sourced into the entry scripts, so its state variables are deliberately named to
+    avoid colliding with their parameters (`$script:LogThreshold`, not `$script:LogLevel`).
   - `Manifest.ps1`: State manifests, file checksums, and change tracking.
-  - `Pass.ps1`: Sync pass orchestration logic.
+  - `Pass.ps1`: Sync pass orchestration logic. Collapses runs of no-op passes into one
+    hourly heartbeat line, tracking the streak in `state/lastpass.json`.
   - `Provider.ps1`: Cloud provider detection and label resolution.
   - `Registry.ps1`: Link registration and persistence.
   - `Settle.ps1`: Settle time detection for in-flight file writes.
@@ -59,6 +63,15 @@ DriveRelay start                      Install scheduled background task
 DriveRelay stop                       Remove scheduled task
 DriveRelay config                     View or update global settings
 ```
+
+Global settings live in `config/settings.json`. Log verbosity and retention are
+`LogLevel` (`DEBUG`/`INFO`/`WARN`/`ERROR`), `LogMaxSizeMB` and `LogKeepFiles`; at `INFO` the
+log records what changed, and `DriveRelay config -LogLevel DEBUG` restores the per-file and
+per-pass detail for diagnosis.
+
+Note that the entry scripts capture `$PSBoundParameters` once as `$script:Typed`. Command
+functions must use that: inside a function `$PSBoundParameters` is the function's own and is
+always empty, which silently discards every caller override.
 
 ## Workflow Rules
 

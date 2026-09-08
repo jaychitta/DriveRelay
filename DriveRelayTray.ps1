@@ -39,6 +39,7 @@ Add-Type -AssemblyName System.Drawing
 Set-LogPath      (Join-Path $root 'driverelay.log')
 Set-SettingsPath (Join-Path $root 'config\settings.json')
 Set-RegistryPath (Join-Path $root 'config\links.json')
+Initialize-LoggingFromSettings
 
 $script:AppSettings = Get-AppSettings
 if ($PSBoundParameters.ContainsKey('IntervalMinutes')) {

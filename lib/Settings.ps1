@@ -26,6 +26,16 @@ function Get-DefaultSettings {
         StartWithWindows    = $true
         StartDelaySeconds   = 90
 
+        # What reaches driverelay.log, and how much of it is kept.
+        #
+        # A pass every ten minutes over three links wrote five lines whether or
+        # not anything moved, which buried the lines that mattered. At INFO the
+        # log records changes; DEBUG restores the per-file and per-pass detail
+        # when something needs diagnosing.
+        LogLevel            = 'INFO'
+        LogMaxSizeMB        = 1
+        LogKeepFiles        = 3
+
         # Global "stop touching my files for a bit", set from the tray menu.
         # Persisted rather than held in the tray process, so a reboot or a tray
         # restart does not silently resume syncing behind the user's back.
@@ -75,6 +85,21 @@ function Get-AppSettings {
             [int]$parsed.StartDelaySeconds
         } else { $defaults.StartDelaySeconds }
 
+        # An unrecognised level falls back to the default rather than being
+        # passed through: a typo must not silently switch the log off.
+        $logLevel = if ($parsed.PSObject.Properties['LogLevel'] -and
+                        @('DEBUG', 'INFO', 'WARN', 'ERROR') -contains ([string]$parsed.LogLevel).Trim().ToUpperInvariant()) {
+            ([string]$parsed.LogLevel).Trim().ToUpperInvariant()
+        } else { $defaults.LogLevel }
+
+        $logMaxSizeMB = if ($parsed.PSObject.Properties['LogMaxSizeMB'] -and $parsed.LogMaxSizeMB -gt 0) {
+            [double]$parsed.LogMaxSizeMB
+        } else { $defaults.LogMaxSizeMB }
+
+        $logKeepFiles = if ($parsed.PSObject.Properties['LogKeepFiles'] -and $parsed.LogKeepFiles -ge 0) {
+            [int]$parsed.LogKeepFiles
+        } else { $defaults.LogKeepFiles }
+
         # Absent in settings files written before pausing was persisted, which
         # must read as "not paused" rather than as missing.
         $paused = if ($null -ne $parsed.PSObject.Properties['Paused']) {
@@ -88,12 +113,32 @@ function Get-AppSettings {
             HydrateBeforeDelete = $hydrateBeforeDelete
             StartWithWindows    = $startWithWindows
             StartDelaySeconds   = $startDelaySeconds
+            LogLevel            = $logLevel
+            LogMaxSizeMB        = $logMaxSizeMB
+            LogKeepFiles        = $logKeepFiles
             Paused              = $paused
         }
     }
     catch {
         return $defaults
     }
+}
+
+function Initialize-LoggingFromSettings {
+    <#
+        Apply the persisted log level and rotation policy to Logging.ps1.
+
+        Called by every entry point after Set-SettingsPath, so the CLI, the tray
+        and the dashboard -- which all append to the same file -- agree on what
+        goes into it. Best-effort: a settings file that cannot be read must not
+        stop the process from starting.
+    #>
+    try {
+        $s = Get-AppSettings
+        Set-LogLevel    $s.LogLevel
+        Set-LogRotation -MaxSizeMB $s.LogMaxSizeMB -Keep $s.LogKeepFiles
+    }
+    catch { }
 }
 
 function Save-AppSettings {

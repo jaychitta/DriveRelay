@@ -23,6 +23,11 @@
       * A pass proposing more deletions than the link's MaxDelete aborts
         entirely rather than partially applying.
 
+      * A folder the pass empties is removed with its files. The snapshot is
+        files-only, so nothing else would ever clean it up. Scoped to folders
+        this pass emptied -- an empty folder the user made by hand is left
+        alone, and the link root is never removed.
+
       * Manifest entries are written only for paths whose action actually
         succeeded. A deferred or failed file keeps its previous entry, so the
         next pass re-evaluates it from the same baseline rather than mistaking
@@ -131,6 +136,75 @@ function Remove-FileSafely {
         Write-Log ("delete failed for {0}: {1}" -f $Path, $_.Exception.Message) 'WARN'
         return $false
     }
+}
+
+function Remove-EmptiedDirectory {
+    <#
+        Remove directories that this pass emptied, walking upward.
+
+        The engine tracks files, not folders -- the snapshot is -File only, and
+        nothing in the manifest describes a directory. Left alone that means a
+        deleted folder's files vanish and the folder itself stays behind as an
+        empty shell on the other side.
+
+        Scoped deliberately to the parents of files deleted in this pass rather
+        than "every empty folder under the root". An empty folder the user made
+        by hand is invisible to the sync model, and deleting it would be a
+        change nobody asked for. Only folders this pass emptied are removed.
+
+        Deepest-first, so a folder whose only child is a subfolder emptied by
+        the same pass is itself removed on the same run. The walk stops at the
+        link root, which is never removed even if it ends up empty.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [string[]] $Paths,
+        [Parameter(Mandatory)][string] $StopAt
+    )
+
+    $removed = 0
+    if (-not $Paths -or $Paths.Count -eq 0) { return $removed }
+
+    $root = try { [IO.Path]::GetFullPath($StopAt).TrimEnd('\') } catch { $StopAt.TrimEnd('\') }
+
+    # Deepest first: an emptied child must go before its parent is judged.
+    $ordered = $Paths |
+        Where-Object { $_ } |
+        Sort-Object -Unique |
+        Sort-Object -Property { ($_ -split '\\').Count } -Descending
+
+    foreach ($start in $ordered) {
+        $dir = try { [IO.Path]::GetFullPath($start).TrimEnd('\') } catch { $start.TrimEnd('\') }
+
+        while ($dir -and $dir.Length -gt $root.Length -and $dir.StartsWith($root, 'OrdinalIgnoreCase')) {
+            if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+                $dir = Split-Path -Parent $dir
+                continue
+            }
+
+            # Any child at all -- file, placeholder, or subfolder -- means this
+            # folder is still carrying something and must stay.
+            $children = @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue)
+            if ($children.Count -gt 0) { break }
+
+            $parent = Split-Path -Parent $dir
+            if (-not $PSCmdlet.ShouldProcess($dir, 'remove emptied folder')) { break }
+
+            try {
+                Remove-Item -LiteralPath $dir -Force -ErrorAction Stop
+                Write-Log ("removed emptied folder {0}" -f $dir)
+                $removed++
+            }
+            catch {
+                Write-Log ("could not remove emptied folder {0}: {1}" -f $dir, $_.Exception.Message) 'WARN'
+                break
+            }
+
+            $dir = $parent
+        }
+    }
+
+    return $removed
 }
 
 function Request-Dehydration {
@@ -421,6 +495,8 @@ function Invoke-LinkSync {
     $manifest = Read-Manifest -Path $manifestPath
     $succeeded = @{}   # relpath key -> $true, for entries to refresh
     $forgotten = @{}   # relpath key -> $true, for entries to drop
+    $emptiedLocal  = @()   # parents of deleted local files, pruned after the loop
+    $emptiedRemote = @()   # same on the remote side
 
     foreach ($item in $items) {
         $key = $item.RelPath.ToLowerInvariant()
@@ -442,7 +518,13 @@ function Invoke-LinkSync {
         $ready = Test-ActionReady -Item $item -SettleMinutes $settleMinutes
         if (-not $ready.Ready) {
             $result.Deferred++
-            Write-Log ("deferred ({0}): {1}" -f $ready.Reason, $item.RelPath)
+            # DEBUG: a file held open by Tally or Excel is deferred again on
+            # every pass for as long as it stays open, so at INFO one open
+            # workbook writes a line every ten minutes all day. The deferred
+            # count on the link summary and `DriveRelay status` both report the
+            # backlog; naming each file every pass only crowds out the copies
+            # and deletes the log exists to record.
+            Write-Log ("deferred ({0}): {1}" -f $ready.Reason, $item.RelPath) 'DEBUG'
             continue
         }
 
@@ -458,13 +540,18 @@ function Invoke-LinkSync {
                 'DeleteLocal'    {
                     # Always a real file with content, so the Recycle Bin holds it.
                     $ok = Remove-FileSafely -Path $item.Local.FullPath
-                    if ($ok) { $result.Deleted++; $forgotten[$key] = $true }
+                    if ($ok) {
+                        $result.Deleted++
+                        $forgotten[$key] = $true
+                        $emptiedLocal += (Split-Path -Parent $item.Local.FullPath)
+                    }
                 }
                 'DeleteRemote' {
                     $ok = Remove-FileSafely -Path $item.Remote.FullPath -HydrateFirst:$hydrateBeforeDelete
                     if ($ok) {
                         $result.Deleted++
                         $forgotten[$key] = $true
+                        $emptiedRemote += (Split-Path -Parent $item.Remote.FullPath)
                         if ($item.Remote.IsOffline -and -not $hydrateBeforeDelete) {
                             $result.CloudOnlyDeletes++
                         }
@@ -485,6 +572,22 @@ function Invoke-LinkSync {
             $result.Failed++
             Write-Log ("action {0} failed for {1}: {2}" -f $item.Action, $item.RelPath, $_.Exception.Message) 'ERROR'
         }
+    }
+
+    # --- remove folders this pass emptied ---
+    # After the deletes, not during: a folder is only judged once every file
+    # the pass was going to remove from it is gone. Deferred files still sit
+    # on disk, so a folder that is not finished emptying is simply left for a
+    # later pass to revisit.
+    $prunedDirs = 0
+    if ($emptiedLocal.Count -gt 0) {
+        $prunedDirs += Remove-EmptiedDirectory -Paths $emptiedLocal -StopAt $Link.LocalPath
+    }
+    if ($emptiedRemote.Count -gt 0) {
+        $prunedDirs += Remove-EmptiedDirectory -Paths $emptiedRemote -StopAt $remotePath
+    }
+    if ($prunedDirs -gt 0) {
+        Write-Log ("link {0}: removed {1} emptied folder(s)" -f $Link.Id, $prunedDirs)
     }
 
     # --- reclaim space on the OneDrive side, once for the whole tree ---
@@ -523,6 +626,11 @@ function Invoke-LinkSync {
         $result.Message = ("applied {0}, deferred {1}, conflicts {2}, deleted {3}, failed {4}" -f `
                             $result.Applied, $result.Deferred, $result.Conflicts, $result.Deleted, $result.Failed)
     }
-    Write-Log ("link {0}: {1}" -f $Link.Id, $result.Message)
+    # A link that moved nothing is reported at DEBUG. With three links and a ten
+    # minute interval these were three lines of zeroes every pass -- more than
+    # half the log -- and the pass-level summary already covers a quiet run.
+    $quiet = ($result.Applied -eq 0 -and $result.Conflicts -eq 0 -and
+              $result.Deleted -eq 0 -and $result.Failed -eq 0 -and -not $result.Aborted)
+    Write-Log ("link {0}: {1}" -f $Link.Id, $result.Message) $(if ($quiet) { 'DEBUG' } else { 'INFO' })
     return $result
 }

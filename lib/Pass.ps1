@@ -14,6 +14,13 @@
 $script:PassMutexName = 'Global\DriveRelayPass'
 $script:DefaultStateRoot = if ($PSScriptRoot) { Join-Path (Split-Path -Parent $PSScriptRoot) 'state' } else { 'state' }
 
+# How long a run of idle passes may go unmentioned before one heartbeat line is
+# written. Idle passes are the overwhelming majority -- at a ten minute interval
+# they are six lines an hour that say nothing happened -- but writing none at all
+# would make an unattended run that is working indistinguishable from one that
+# stopped firing. One line an hour keeps the proof without the volume.
+$script:IdleHeartbeatMinutes = 60
+
 function Get-PassSummaryPath {
     param([string] $StateRoot = $script:DefaultStateRoot)
     return (Join-Path $StateRoot 'lastpass.json')
@@ -28,7 +35,13 @@ function Write-PassSummary {
     #>
     param(
         [Parameter(Mandatory)][object] $Outcome,
-        [string] $StateRoot = $script:DefaultStateRoot
+        [string] $StateRoot = $script:DefaultStateRoot,
+
+        # Idle-run bookkeeping, carried here rather than in a file of its own so
+        # the streak survives across the separate processes a pass can run in.
+        [int]    $IdleCount = 0,
+        [string] $IdleSince = '',
+        [string] $LastHeartbeat = ''
     )
 
     try {
@@ -36,6 +49,9 @@ function Write-PassSummary {
         $summary = [pscustomobject]@{
             When       = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
             Links      = $r.Count
+            IdleCount     = $IdleCount
+            IdleSince     = $IdleSince
+            LastHeartbeat = $LastHeartbeat
             Applied    = [int](($r | Measure-Object -Property Applied   -Sum).Sum)
             Deferred   = [int](($r | Measure-Object -Property Deferred  -Sum).Sum)
             Conflicts  = [int](($r | Measure-Object -Property Conflicts -Sum).Sum)
@@ -138,7 +154,10 @@ function Invoke-SyncPass {
             return $outcome
         }
 
-        Write-Log ("pass starting over {0} link(s)" -f $links.Count)
+        # DEBUG: on a healthy system this line is followed within seconds by a
+        # "pass finished: applied 0 ..." that says nothing happened. The pair is
+        # only worth keeping when a pass hangs, which is when DEBUG is on.
+        Write-Log ("pass starting over {0} link(s)" -f $links.Count) 'DEBUG'
         $results = New-Object System.Collections.ArrayList
 
         foreach ($link in $links) {
@@ -173,12 +192,67 @@ function Invoke-SyncPass {
         $outcome.Ran     = $true
         $outcome.Results = @($results)
 
-        $applied   = ($results | Measure-Object -Property Applied   -Sum).Sum
-        $conflicts = ($results | Measure-Object -Property Conflicts -Sum).Sum
-        $deleted   = ($results | Measure-Object -Property Deleted   -Sum).Sum
-        Write-Log ("pass finished: applied {0}, conflicts {1}, deleted {2}" -f $applied, $conflicts, $deleted)
+        $applied   = [int](($results | Measure-Object -Property Applied   -Sum).Sum)
+        $conflicts = [int](($results | Measure-Object -Property Conflicts -Sum).Sum)
+        $deleted   = [int](($results | Measure-Object -Property Deleted   -Sum).Sum)
+        $failed    = [int](($results | Measure-Object -Property Failed    -Sum).Sum)
 
-        Write-PassSummary -Outcome $outcome -StateRoot $StateRoot
+        # A pass is idle when it changed nothing and nothing went wrong.
+        # Deferrals do not count as news: a file held open by Tally or Excel is
+        # deferred on every pass for as long as it stays open, and reporting
+        # that hourly is the same information as reporting it six times an hour.
+        $degraded = @($results | Where-Object {
+            $_.Aborted -or
+            ($_.PSObject.Properties['State'] -and $_.State -and $_.State -ne 'Ready')
+        }).Count
+        $idle = ($applied -eq 0 -and $conflicts -eq 0 -and $deleted -eq 0 -and
+                 $failed -eq 0 -and $degraded -eq 0)
+
+        $now       = Get-Date
+        $prev      = Read-PassSummary -StateRoot $StateRoot
+        $idleCount = 0
+        $idleSince = ''
+        $heartbeat = ''
+        if ($prev) {
+            if ($prev.PSObject.Properties['IdleCount'])     { $idleCount = [int]$prev.IdleCount }
+            if ($prev.PSObject.Properties['IdleSince'])     { $idleSince = [string]$prev.IdleSince }
+            if ($prev.PSObject.Properties['LastHeartbeat']) { $heartbeat = [string]$prev.LastHeartbeat }
+        }
+
+        $line = "pass finished: applied {0}, conflicts {1}, deleted {2}" -f $applied, $conflicts, $deleted
+
+        if (-not $idle) {
+            # Something happened. Report it, and close out any idle run that
+            # preceded it so the quiet stretch is still accounted for.
+            if ($idleCount -gt 0) {
+                $line += " (after {0} idle pass(es) since {1})" -f $idleCount, $idleSince
+            }
+            Write-Log $line
+            $idleCount = 0
+            $idleSince = ''
+            $heartbeat = $now.ToString('yyyy-MM-dd HH:mm:ss')
+        }
+        else {
+            $idleCount++
+            if (-not $idleSince) { $idleSince = $now.ToString('yyyy-MM-dd HH:mm:ss') }
+
+            $due = $true
+            if ($heartbeat) {
+                try   { $due = ($now - [datetime]::Parse($heartbeat)).TotalMinutes -ge $script:IdleHeartbeatMinutes }
+                catch { $due = $true }
+            }
+
+            if ($due) {
+                Write-Log ("idle: {0} pass(es) since {1}, nothing to relay" -f $idleCount, $idleSince)
+                $heartbeat = $now.ToString('yyyy-MM-dd HH:mm:ss')
+            }
+            else {
+                Write-Log $line 'DEBUG'
+            }
+        }
+
+        Write-PassSummary -Outcome $outcome -StateRoot $StateRoot `
+                          -IdleCount $idleCount -IdleSince $idleSince -LastHeartbeat $heartbeat
         return $outcome
     }
     finally {

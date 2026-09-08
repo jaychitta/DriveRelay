@@ -61,11 +61,26 @@ param(
     [switch] $Detailed,
     [switch] $NoDehydrate,
     [switch] $HydrateBeforeDelete,
-    [int]    $IntervalMinutes
+    [int]    $IntervalMinutes,
+
+    [ValidateSet('DEBUG','INFO','WARN','ERROR')]
+    [string] $LogLevel,
+    [double] $LogMaxSizeMB,
+    [int]    $LogKeepFiles
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# Which switches the caller actually typed, captured here because the command
+# functions below cannot see it themselves.
+#
+# Inside a function, $PSBoundParameters is that function's own -- and these take
+# no parameters, so it is always empty. Every "did the caller override this?"
+# test read as no, which silently ignored -SettleMinutes and -MaxDelete on add,
+# -IntervalMinutes on start, and every override on config: the command printed
+# the unchanged settings and reported nothing wrong.
+$script:Typed = $PSBoundParameters
 
 . (Join-Path $root 'lib\Logging.ps1')
 . (Join-Path $root 'lib\Settings.ps1')
@@ -81,6 +96,7 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-LogPath      (Join-Path $root 'driverelay.log')
 Set-RegistryPath (Join-Path $root 'config\links.json')
 Set-SettingsPath (Join-Path $root 'config\settings.json')
+Initialize-LoggingFromSettings
 $script:StateRoot    = Join-Path $root 'state'
 $script:ExcludesFile = Join-Path $root 'config\excludes.txt'
 
@@ -126,6 +142,18 @@ DriveRelay -- relay files between a local folder and a cloud drive.
 
   stop                   Remove the scheduled task.
 
+  config                 Show global settings, or change them.
+                         [-IntervalMinutes 10] [-SettleMinutes 3] [-MaxDelete 50]
+                         [-HydrateBeforeDelete]
+                         [-LogLevel DEBUG|INFO|WARN|ERROR]
+                         [-LogMaxSizeMB 1] [-LogKeepFiles 3]
+
+                         At INFO the log records what changed. DEBUG adds the
+                         per-file and per-pass detail for diagnosing a problem;
+                         it is verbose, so turn it back down afterwards. The log
+                         rotates to driverelay.1.log .. driverelay.<Keep>.log at
+                         the size cap.
+
 Seed decides which side is authoritative the first time a link runs.
 After that the pair is two-way.
 '@
@@ -149,9 +177,9 @@ function Invoke-AddCommand {
     $seedSide = if ($Seed -eq 'OneDrive') { 'Remote' } else { $Seed }
 
     $globalSettings = Get-AppSettings
-    $actualSettle = if ($PSBoundParameters.ContainsKey('SettleMinutes')) { $SettleMinutes } else { $globalSettings.SettleMinutes }
-    $actualMaxDel = if ($PSBoundParameters.ContainsKey('MaxDelete')) { $MaxDelete } else { $globalSettings.MaxDelete }
-    $actualHydrate = if ($PSBoundParameters.ContainsKey('HydrateBeforeDelete')) { [bool]$HydrateBeforeDelete } else { [bool]$globalSettings.HydrateBeforeDelete }
+    $actualSettle = if ($script:Typed.ContainsKey('SettleMinutes')) { $SettleMinutes } else { $globalSettings.SettleMinutes }
+    $actualMaxDel = if ($script:Typed.ContainsKey('MaxDelete')) { $MaxDelete } else { $globalSettings.MaxDelete }
+    $actualHydrate = if ($script:Typed.ContainsKey('HydrateBeforeDelete')) { [bool]$HydrateBeforeDelete } else { [bool]$globalSettings.HydrateBeforeDelete }
 
     $l = Add-Link -Local $localPath -Remote $remotePath -Seed $seedSide -Provider $Provider `
                   -SettleMinutes $actualSettle -MaxDelete $actualMaxDel `
@@ -357,7 +385,7 @@ $script:TaskName = 'DriveRelay'
 
 function Invoke-StartCommand {
     $globalSettings = Get-AppSettings
-    $minutes = if ($PSBoundParameters.ContainsKey('IntervalMinutes') -and $IntervalMinutes -gt 0) { $IntervalMinutes }
+    $minutes = if ($script:Typed.ContainsKey('IntervalMinutes') -and $IntervalMinutes -gt 0) { $IntervalMinutes }
                elseif ($globalSettings.IntervalMinutes -gt 0) { $globalSettings.IntervalMinutes }
                else { 10 }
     $script  = Join-Path $root 'DriveRelay.ps1'
@@ -400,20 +428,32 @@ function Invoke-SettingsCommand {
     $current = Get-AppSettings
     $changed = $false
 
-    if ($PSBoundParameters.ContainsKey('IntervalMinutes')) {
+    if ($script:Typed.ContainsKey('IntervalMinutes')) {
         $current.IntervalMinutes = [int]$IntervalMinutes
         $changed = $true
     }
-    if ($PSBoundParameters.ContainsKey('SettleMinutes')) {
+    if ($script:Typed.ContainsKey('SettleMinutes')) {
         $current.SettleMinutes = [int]$SettleMinutes
         $changed = $true
     }
-    if ($PSBoundParameters.ContainsKey('MaxDelete')) {
+    if ($script:Typed.ContainsKey('MaxDelete')) {
         $current.MaxDelete = [int]$MaxDelete
         $changed = $true
     }
-    if ($PSBoundParameters.ContainsKey('HydrateBeforeDelete')) {
+    if ($script:Typed.ContainsKey('HydrateBeforeDelete')) {
         $current.HydrateBeforeDelete = [bool]$HydrateBeforeDelete
+        $changed = $true
+    }
+    if ($script:Typed.ContainsKey('LogLevel')) {
+        $current.LogLevel = $LogLevel.ToUpperInvariant()
+        $changed = $true
+    }
+    if ($script:Typed.ContainsKey('LogMaxSizeMB')) {
+        $current.LogMaxSizeMB = [double]$LogMaxSizeMB
+        $changed = $true
+    }
+    if ($script:Typed.ContainsKey('LogKeepFiles')) {
+        $current.LogKeepFiles = [int]$LogKeepFiles
         $changed = $true
     }
 
@@ -431,6 +471,9 @@ function Invoke-SettingsCommand {
     "  HydrateBeforeDelete : {0}" -f $current.HydrateBeforeDelete
     "  StartWithWindows    : {0}" -f $current.StartWithWindows
     "  StartDelaySeconds   : {0}" -f $current.StartDelaySeconds
+    "  LogLevel            : {0}" -f $current.LogLevel
+    "  LogMaxSizeMB        : {0}" -f $current.LogMaxSizeMB
+    "  LogKeepFiles        : {0}" -f $current.LogKeepFiles
     "  Paused              : {0}" -f $current.Paused
     if ($current.Paused) {
         ''

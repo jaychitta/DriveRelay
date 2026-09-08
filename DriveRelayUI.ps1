@@ -30,6 +30,7 @@ Add-Type -AssemblyName System.Drawing
 Set-LogPath      (Join-Path $root 'driverelay.log')
 Set-RegistryPath (Join-Path $root 'config\links.json')
 Set-SettingsPath (Join-Path $root 'config\settings.json')
+Initialize-LoggingFromSettings
 $script:StateRoot = Join-Path $root 'state'
 $script:Cli       = Join-Path $root 'DriveRelay.ps1'
 $script:Child     = $null

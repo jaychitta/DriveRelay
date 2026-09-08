@@ -50,14 +50,24 @@ DriveRelay.ps1 sync    [-Id <id>] [-WhatIf]       applies
 DriveRelay.ps1 run                                quiet pass, for automation
 DriveRelay.ps1 status  [-Id <id>]
 
-DriveRelay.ps1 start                              launches tray agent
-DriveRelay.ps1 stop                               stops running tray agent
-DriveRelay.ps1 ui                                 opens dashboard UI
-DriveRelay.ps1 log                                opens log file
+DriveRelay.ps1 start   [-IntervalMinutes 10]      installs the scheduled background task
+DriveRelay.ps1 stop                               removes the scheduled background task
 
-DriveRelay.ps1 install   [-IntervalMinutes 10]    registers startup & shortcuts
-DriveRelay.ps1 uninstall [-AlsoRemoveSettings]    removes shortcuts & tasks
+DriveRelay.ps1 config  [-LogLevel DEBUG]          shows or changes global settings
 ```
+
+`start` and `stop` register and unregister a Windows scheduled task named `DriveRelay`, which
+runs `DriveRelay.ps1 run` every `IntervalMinutes` while you are logged in. Neither one starts
+or stops the tray agent — that is the tray's own **Exit** menu item and the Startup shortcut
+`Install.ps1` creates.
+
+Three things are not CLI commands, and are reached elsewhere:
+
+| Want | Where it is |
+|---|---|
+| The dashboard | `DriveRelayUI.ps1`, or **Open Dashboard...** on the tray menu |
+| The log | Open `driverelay.log`, or **View Log** on the tray menu |
+| Install / uninstall | `Install.ps1` and `Uninstall.ps1` — see below |
 
 `-Remote` is any folder — OneDrive, Google Drive, Dropbox, a network share, another disk.
 `-OneDrive` still works as an alias.
@@ -71,9 +81,9 @@ DriveRelay.ps1 uninstall [-AlsoRemoveSettings]    removes shortcuts & tasks
 .\DriveRelay.ps1 sync  -Id Foo
 ```
 
-`check` (or `compare`) and `-WhatIf` both write nothing. Use them on anything you care about.
+`check` and `-WhatIf` both write nothing. Use them on anything you care about.
 
-## Reading a compare report
+## Reading a check report
 
 ```
     ~ CopyToRemote     sub\fresh.txt
@@ -106,6 +116,11 @@ DriveRelay.ps1 uninstall [-AlsoRemoveSettings]    removes shortcuts & tasks
 `MaxDelete` in `config\links.json`. If they are not, something is wrong with the remote folder
 — check it is fully mounted before letting a pass run.
 
+**An empty folder is left behind.** It should not be — a pass removes the folders it empties,
+up to but never including the link root. Two cases are left alone on purpose: a folder that
+still holds a deferred file (it is revisited next pass, once the file is eligible), and an
+empty folder you made by hand, which the sync model never tracked in the first place.
+
 **A file never syncs.** Run `status`. If it says *held open*, close the application. Tally holds
 company files for as long as a company is open; that is intended and protects the data.
 
@@ -113,8 +128,32 @@ company files for as long as a company is open; that is intended and protects th
 not want. The next pass propagates the deletion.
 
 **Nothing is syncing at all.** Check the tray is running and not paused, then check
-`driverelay.log`. A pass with nothing to do still logs `pass ran with no enabled links` or
-`pass finished`, so silence means it is not running.
+`driverelay.log`. A run of passes with nothing to do logs one line an hour —
+`idle: 6 pass(es) since 09:10:00, nothing to relay` — so more than an hour of complete
+silence means it is not running.
+
+## The log
+
+At the default `INFO` level the log records what **changed**: copies, deletions, conflicts,
+aborts, and links that came back unavailable. Bookkeeping that repeats every pass regardless
+of whether anything happened is written at `DEBUG` and suppressed.
+
+That includes the per-file `deferred` lines. A workbook held open by Excel or Tally is
+deferred again on every pass for as long as it stays open, so naming it every ten minutes
+crowds out the copies and deletes the log exists to record. The count still appears on the
+link summary, and `DriveRelay status` names the individual files.
+
+When something needs diagnosing, turn the detail back on — and back down afterwards, because
+it is verbose:
+
+```powershell
+.\DriveRelay.ps1 config -LogLevel DEBUG
+.\DriveRelay.ps1 config -LogLevel INFO
+```
+
+The log rotates at `LogMaxSizeMB` (default 1 MB) to `driverelay.1.log`, `driverelay.2.log`
+and so on, keeping `LogKeepFiles` generations (default 3). Older history is moved aside
+rather than truncated away, so roughly the last 4 MB is always available.
 
 ## Files
 
@@ -124,7 +163,7 @@ not want. The next pass propagates the deletion.
 | `config\excludes.txt` | Never-sync patterns, one per line |
 | `state\<id>\manifest.json` | Sync baseline. **Deleting this loses history** and the next pass treats everything as new. |
 | `state\lastpass.json` | Last pass summary, read by the tray |
-| `driverelay.log` | Trimmed to the last 2000 lines at 1 MB |
+| `driverelay.log` | Active log. Rotates to `driverelay.1.log` .. `.3.log` at 1 MB |
 
 ## Install and uninstall
 

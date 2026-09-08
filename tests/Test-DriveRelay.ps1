@@ -125,9 +125,42 @@ if ($icoWarn) { $icoWarn.Dispose() }
 # ------------------------------------------------------------- 4. CLI Config ---
 Write-Host "4. Testing DriveRelay CLI config command" -ForegroundColor Yellow
 $cliPath = Join-Path $root 'DriveRelay.ps1'
-$cliOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cliPath config -SettleMinutes 3
+$cliOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cliPath config
 $cliOutStr = $cliOut -join "`n"
 Assert-True ($cliOutStr -match 'DriveRelay Configuration') "CLI config command displays configuration output"
+Assert-True ($cliOutStr -match 'LogLevel') "CLI config reports the log level"
+
+# `config -X <value>` must actually persist.
+#
+# It did not: the command functions read $PSBoundParameters, which inside a
+# function is that function's own and therefore empty, so every override was
+# dropped and the command printed the unchanged settings without complaint.
+# Separately, Logging.ps1's own $script:LogLevel shared a scope with the CLI's
+# -LogLevel parameter and overwrote it. Both were invisible from output alone,
+# so this test reads the file back.
+#
+# This exercises the real CLI, which hardcodes config\settings.json -- so it
+# moves a value away from whatever the operator has set and puts it back.
+$liveSettings = Join-Path $root 'config\settings.json'
+if (Test-Path -LiteralPath $liveSettings) {
+    $original = Get-Content -LiteralPath $liveSettings -Raw -Encoding UTF8 | ConvertFrom-Json
+    $origSettle = [int]$original.SettleMinutes
+    $origLevel  = if ($original.PSObject.Properties['LogLevel']) { [string]$original.LogLevel } else { 'INFO' }
+    try {
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cliPath config `
+            -SettleMinutes ($origSettle + 1) -LogLevel DEBUG | Out-Null
+        $after = Get-Content -LiteralPath $liveSettings -Raw -Encoding UTF8 | ConvertFrom-Json
+        Assert-Equal ([int]$after.SettleMinutes) ($origSettle + 1) "config -SettleMinutes is persisted, not silently dropped"
+        Assert-Equal ([string]$after.LogLevel) 'DEBUG' "config -LogLevel is persisted, not shadowed by Logging.ps1"
+    }
+    finally {
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cliPath config `
+            -SettleMinutes $origSettle -LogLevel $origLevel | Out-Null
+    }
+    $restored = Get-Content -LiteralPath $liveSettings -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-Equal ([int]$restored.SettleMinutes) $origSettle "The operator's SettleMinutes is restored after the test"
+    Assert-Equal ([string]$restored.LogLevel) $origLevel "The operator's LogLevel is restored after the test"
+}
 
 # ------------------------------------------------------- 5. Overlap guard ---
 # Regression test for the chain case: registering A <-> B and then B <-> C used
@@ -373,6 +406,58 @@ if ($forks.Count -eq 1) {
 Assert-Equal (Get-Content -LiteralPath (Join-Path $ctx.Local 'doc.txt') -Raw) 'LOCAL VERSION' "Local file still holds the local version"
 Assert-Equal (Get-Content -LiteralPath (Join-Path $ctx.Remote 'doc.txt') -Raw) 'LOCAL VERSION' "Remote side now carries the local version"
 
+# ----------------------------------------- 8b. Emptied folders are removed ---
+# The snapshot is files-only, so without an explicit prune a deleted folder's
+# files vanish and the folder itself stays behind as an empty shell.
+Write-Host "8b. Testing emptied-folder cleanup (lib/Actions.ps1)" -ForegroundColor Yellow
+
+function New-RemoteFolderDeletion {
+    <#
+        Remote-only tree with a manifest saying every file was in sync, so the
+        next pass classifies all of them as DeleteRemote.
+    #>
+    param([string[]] $RelPaths)
+
+    $c = New-TestLink
+    $ents = @()
+    foreach ($rel in $RelPaths) {
+        $f = Set-TestFile (Join-Path $c.Remote $rel) "x" $when
+        $ents += [pscustomobject]@{
+            RelPath = $rel
+            LocalLength = $f.Length; LocalWriteUtc = $f.LastWriteTimeUtc
+            OdLength    = $f.Length; OdWriteUtc    = $f.LastWriteTimeUtc
+        }
+    }
+    Write-TestManifest $c $ents
+    return $c
+}
+
+$ctx = New-RemoteFolderDeletion @('company\a.txt', 'company\b.txt')
+$res = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+Assert-Equal $res.Deleted 2 "Both files in the folder were deleted"
+Assert-True (-not (Test-Path -LiteralPath (Join-Path $ctx.Remote 'company'))) "The emptied folder is removed, not left behind"
+Assert-True (Test-Path -LiteralPath $ctx.Remote) "The link root survives even when it ends up empty"
+
+# Nested: a parent whose only remaining child is a folder emptied by the same
+# pass must also go, which is why the prune runs deepest-first.
+$ctx = New-RemoteFolderDeletion @('2023\company\a.txt')
+$res = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+Assert-True (-not (Test-Path -LiteralPath (Join-Path $ctx.Remote '2023\company'))) "Emptied leaf folder is removed"
+Assert-True (-not (Test-Path -LiteralPath (Join-Path $ctx.Remote '2023'))) "Parent left empty by the same pass is removed too"
+
+# A folder still holding a file the pass did not delete must stay.
+$ctx = New-RemoteFolderDeletion @('company\a.txt')
+$null = Set-TestFile (Join-Path $ctx.Remote 'company\keep.txt') 'untracked'
+$res = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+Assert-True (Test-Path -LiteralPath (Join-Path $ctx.Remote 'company')) "Folder with a surviving file is kept"
+
+# An empty folder the user made by hand is not this pass's business.
+$ctx = New-RemoteFolderDeletion @('company\a.txt')
+$byHand = Join-Path $ctx.Remote 'made-by-hand'
+New-Item -ItemType Directory -Path $byHand -Force | Out-Null
+$res = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+Assert-True (Test-Path -LiteralPath $byHand) "A pre-existing empty folder is left alone"
+
 # --------------------------------------------------- 9. Manifest round-trip ---
 Write-Host "9. Testing manifest serialisation (lib/Manifest.ps1)" -ForegroundColor Yellow
 
@@ -469,6 +554,107 @@ $odState = Test-CloudClientRunning -ProviderLabel 'OneDrive'
 Assert-True (($odState -eq $true) -or ($odState -eq $false)) "Known provider returns a definite true/false"
 
 if (Test-Path $engineRoot) { Remove-Item -LiteralPath $engineRoot -Recurse -Force -ErrorAction SilentlyContinue }
+
+# ------------------------------------------------- 11. Log level + rotation ---
+Write-Host ''
+Write-Host "11. Testing log level and rotation (lib/Logging.ps1)" -ForegroundColor Yellow
+
+# A scratch log of its own: this section counts lines, and the sections above
+# have been writing to $script:TestLog throughout.
+$logDir  = Join-Path $testDir 'logscratch'
+if (Test-Path $logDir) { Remove-Item -LiteralPath $logDir -Recurse -Force -ErrorAction SilentlyContinue }
+New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+$levelLog = Join-Path $logDir 'level.log'
+Set-LogPath $levelLog
+
+function Get-LogLines { param($Path) if (Test-Path -LiteralPath $Path) { @(Get-Content -LiteralPath $Path) } else { @() } }
+
+Set-LogLevel 'INFO'
+Assert-Equal (Get-LogLevel) 'INFO' "Set-LogLevel accepts INFO"
+
+Write-Log 'debug line' 'DEBUG'
+Assert-Equal (Get-LogLines $levelLog).Count 0 "DEBUG is dropped at INFO threshold"
+
+Write-Log 'info line'
+Write-Log 'warn line' 'WARN'
+Write-Log 'error line' 'ERROR'
+Assert-Equal (Get-LogLines $levelLog).Count 3 "INFO, WARN and ERROR all pass the INFO threshold"
+
+Set-LogLevel 'DEBUG'
+Write-Log 'debug line' 'DEBUG'
+Assert-Equal (Get-LogLines $levelLog).Count 4 "DEBUG is written once the threshold is lowered"
+
+Set-LogLevel 'ERROR'
+Write-Log 'info line'
+Write-Log 'warn line' 'WARN'
+Assert-Equal (Get-LogLines $levelLog).Count 4 "INFO and WARN are dropped at ERROR threshold"
+Write-Log 'error line' 'ERROR'
+Assert-Equal (Get-LogLines $levelLog).Count 5 "ERROR still passes at ERROR threshold"
+
+# A typo in settings.json must not silently switch the log off.
+Set-LogLevel 'NONSENSE'
+Assert-Equal (Get-LogLevel) 'ERROR' "An unrecognised level leaves the threshold alone"
+
+# Rotation moves history aside rather than truncating it away.
+Set-LogLevel 'INFO'
+$rotLog = Join-Path $logDir 'rot.log'
+Set-LogPath $rotLog
+Set-LogRotation -MaxSizeMB 0.001 -Keep 2   # ~1 KB
+
+for ($i = 1; $i -le 400; $i++) { Write-Log ("filler line {0}" -f $i) }
+
+Assert-True (Test-Path -LiteralPath (Join-Path $logDir 'rot.1.log')) "Rotation created generation 1"
+Assert-True (Test-Path -LiteralPath (Join-Path $logDir 'rot.2.log')) "Rotation created generation 2"
+Assert-True (-not (Test-Path -LiteralPath (Join-Path $logDir 'rot.3.log'))) "Rotation keeps no more than Keep generations"
+Assert-True ((Get-Item -LiteralPath $rotLog).Length -le 2KB) "Active log stays near the size cap"
+
+# The oldest surviving generation must hold older lines than the active log:
+# rotation shifts history down, it does not overwrite generation 1 in place.
+$gen1First   = (Get-Content -LiteralPath (Join-Path $logDir 'rot.1.log') -TotalCount 1)
+$activeFirst = (Get-Content -LiteralPath $rotLog -TotalCount 1)
+$gen1Num     = [int]([regex]::Match($gen1First,   'filler line (\d+)').Groups[1].Value)
+$activeNum   = [int]([regex]::Match($activeFirst, 'filler line (\d+)').Groups[1].Value)
+Assert-True ($gen1Num -lt $activeNum) "Generation 1 holds older lines than the active log"
+
+Set-LogRotation -MaxSizeMB 1 -Keep 3
+Set-LogPath $script:TestLog
+if (Test-Path $logDir) { Remove-Item -LiteralPath $logDir -Recurse -Force -ErrorAction SilentlyContinue }
+
+# ------------------------------------------- 12. Idle-pass heartbeat state ---
+Write-Host ''
+Write-Host "12. Testing idle-pass bookkeeping (lib/Pass.ps1)" -ForegroundColor Yellow
+
+. (Join-Path $root 'lib\Pass.ps1')
+
+$passStateRoot = Join-Path $testDir 'passstate'
+if (Test-Path $passStateRoot) { Remove-Item -LiteralPath $passStateRoot -Recurse -Force -ErrorAction SilentlyContinue }
+
+$idleOutcome = [pscustomobject]@{
+    Ran = $true; Skipped = $false; Reason = ''
+    Results = @([pscustomobject]@{
+        LinkId = 'X'; Applied = 0; Deferred = 2; Failed = 0
+        Conflicts = 0; Deleted = 0; CloudOnlyDeletes = 0
+        Aborted = $false; Message = 'quiet'; State = 'Ready'; Detail = ''
+    })
+}
+
+Write-PassSummary -Outcome $idleOutcome -StateRoot $passStateRoot `
+                  -IdleCount 4 -IdleSince '2026-08-12 09:00:00' -LastHeartbeat '2026-08-12 09:00:00'
+$readBack = Read-PassSummary -StateRoot $passStateRoot
+Assert-Equal $readBack.IdleCount 4 "Idle streak count round-trips through lastpass.json"
+Assert-Equal $readBack.IdleSince '2026-08-12 09:00:00' "Idle streak start round-trips"
+Assert-Equal $readBack.LastHeartbeat '2026-08-12 09:00:00' "Heartbeat timestamp round-trips"
+Assert-Equal $readBack.Deferred 2 "Deferred count still reported while the pass counts as idle"
+
+# Pre-existing summaries were written before these fields existed and must read
+# as a fresh streak rather than throwing.
+$legacy = '{"When":"2026-08-12 08:00:00","Links":1,"Applied":0,"Deferred":0,"Conflicts":0,"Deleted":0,"Failed":0,"Aborted":[],"Unavailable":[]}'
+Set-Content -LiteralPath (Get-PassSummaryPath -StateRoot $passStateRoot) -Value $legacy -Encoding utf8
+$legacyRead = Read-PassSummary -StateRoot $passStateRoot
+Assert-True ($null -ne $legacyRead) "A summary written before idle tracking still parses"
+Assert-True (-not $legacyRead.PSObject.Properties['IdleCount']) "Legacy summary simply has no idle fields"
+
+if (Test-Path $passStateRoot) { Remove-Item -LiteralPath $passStateRoot -Recurse -Force -ErrorAction SilentlyContinue }
 
 # Summary
 Write-Host ''

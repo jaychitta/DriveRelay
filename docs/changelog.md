@@ -2,6 +2,119 @@
 
 All notable changes to DriveRelay (formerly SyncOrchestrator) will be documented in this file.
 
+## [Unreleased] - 2026-08-12 — correct the command reference in `docs/04-operations.md`
+
+### Fixed
+- **Four commands the CLI never accepted** — the reference block listed `DriveRelay.ps1 ui`,
+  `log`, `install` and `uninstall`. None is in the `$Command` `ValidateSet` at
+  `DriveRelay.ps1:35`, so each one failed parameter validation before doing anything. The
+  functionality exists, just not there: the dashboard is `DriveRelayUI.ps1` (or the tray's
+  **Open Dashboard...**), the log is opened by the tray's **View Log** item, and install /
+  uninstall are `Install.ps1` / `Uninstall.ps1`, already documented lower in the same file.
+  The doc now points at each of those instead of inventing a command; nothing was added to
+  the CLI.
+- **`start` / `stop` described as tray controls** — the doc said they launched and stopped the
+  tray agent. `Invoke-StartCommand` (`DriveRelay.ps1:386`) registers a scheduled task named
+  `DriveRelay` running `DriveRelay.ps1 run` every `IntervalMinutes`, and
+  `Invoke-StopCommand` (`DriveRelay.ps1:415`) unregisters it (and the legacy
+  `SyncOrchestrator` task). Neither touches the tray process. The doc was the wrong source;
+  `CLAUDE.md` and the script's own header were already correct. `start`'s
+  `-IntervalMinutes` is now shown, since it takes one.
+- **Stale `compare` alias** — the same file claimed "`check` (or `compare`)". `compare` was
+  the pre-rename name of the command and is not in the `ValidateSet` either; the rename is
+  recorded further down this changelog. Dropped the parenthetical, and retitled the
+  *Reading a compare report* section to *Reading a check report* so the old name does not
+  survive as an implied command. `Compare-LinkState`, the internal classification function,
+  is unrelated and unchanged.
+
+## [Unreleased] - 2026-08-12 — cut the log down to what changed
+
+Reported by Jayadheer Chitta: "log is becoming too long to handle."
+
+Measured against the live log before the change: 2,820 lines, of which **1,856 (66%) were
+idle bookkeeping** — `pass starting`, three all-zero per-link summaries, and
+`pass finished: applied 0, conflicts 0, deleted 0`, written every ten minutes whether or not
+anything moved. A further ~230 lines named the same handful of files as `deferred` over and
+over, because a workbook held open by Excel or Tally is deferred again on every pass for as
+long as it stays open. Actual copies, deletes and errors were a minority of the file.
+
+### Added
+- **Severity threshold in `lib/Logging.ps1`** — `DEBUG`, `INFO`, `WARN`, `ERROR`, with
+  `Set-LogLevel` / `Get-LogLevel`. Anything below the active threshold is dropped before it
+  reaches the file. `-Verbose` still shows every level: somebody watching a run by hand
+  asked for the detail.
+- **Generational rotation** — `Set-LogRotation` and `Invoke-LogRotation`. At the size cap the
+  active log is renamed to `driverelay.1.log`, older generations shift down, and the oldest
+  beyond `LogKeepFiles` is dropped.
+- **Idle-pass heartbeat in `lib/Pass.ps1`** — consecutive passes that change nothing are
+  collapsed into one line an hour: `idle: N pass(es) since <time>, nothing to relay`. The
+  streak count and start are carried in `state/lastpass.json`, so they survive the separate
+  processes a pass can run in. The next pass that does something reports the quiet stretch it
+  followed: `pass finished: applied 3, ... (after 41 idle pass(es) since ...)`.
+- **`LogLevel`, `LogMaxSizeMB`, `LogKeepFiles` settings**, defaulting to `INFO` / 1 MB / 3,
+  settable with `DriveRelay config -LogLevel DEBUG` and applied by all three entry points
+  through `Initialize-LoggingFromSettings`.
+- 24 assertions covering the threshold, the rejected-typo case, rotation ordering and
+  generation count, and idle-streak round-tripping. Suite is now 97 assertions, up from 74.
+
+### Changed
+- `pass starting`, the all-zero per-link summary, and the idle `pass finished` are now
+  **DEBUG**. A link that moved something, aborted, or came back unavailable is still INFO.
+- Per-file `deferred (...)` lines are now **DEBUG**. The deferred count still appears on the
+  link summary and in `DriveRelay status`, so the backlog is not hidden — only the
+  once-per-pass roll call of the same open files is.
+- Rotation no longer truncates. The old behaviour re-read the file at 1 MB and rewrote the
+  last 2,000 lines, discarding everything older and paying a full-file rewrite on every write
+  above the threshold; rotation is now a rename.
+
+### Fixed
+- **`config -SettleMinutes`, `-MaxDelete`, `-IntervalMinutes` and `add -SettleMinutes` were
+  silently ignored.** The command functions tested `$PSBoundParameters`, which inside a
+  function is that function's own — and these take no parameters, so it was always empty.
+  Every override read as "not supplied": the command printed the unchanged settings and
+  reported nothing wrong. Now captured once at script scope as `$script:Typed`.
+- **`Logging.ps1` shadowed the CLI's `-LogLevel`.** The file is dot-sourced into
+  `DriveRelay.ps1`, so its `$script:LogLevel` was that script's scope — the same variable as
+  the parameter — and `Initialize-LoggingFromSettings` overwrote the value the caller typed.
+  Renamed to `$script:LogThreshold`, with the reason recorded at the declaration.
+
+### Notes on scope
+- Deferrals deliberately do **not** make a pass count as non-idle. A file held open all day
+  would otherwise defeat the whole heartbeat.
+- Nothing is dropped outright. `DriveRelay config -LogLevel DEBUG` restores the previous
+  detail in full, and the fixed CLI now makes that flag work.
+- Existing `state/lastpass.json` files predate the idle fields; they read as a fresh streak
+  rather than failing, and there is a test for that.
+
+## [Unreleased] - 2026-08-11 — remove folders a pass empties
+
+Reported by Jayadheer Chitta while working through a `MaxDelete` abort on the `Tally-Prime`
+link: "drive relay is leaving behind empty folders."
+
+Structural, not a glitch. The snapshot in `lib/Manifest.ps1` is `-File` only and nothing in
+the manifest describes a directory, so deleting a folder's files removed the files and left
+the folder standing on the other side. Nothing in the engine would ever have cleaned it up.
+
+### Added
+- **`Remove-EmptiedDirectory`** in `lib/Actions.ps1` — removes folders left empty by a pass,
+  walking upward toward the link root and stopping at the first folder that still holds
+  something. Runs after the action loop, once per side.
+- Seven assertions in `tests/Test-DriveRelay.ps1` section 8b covering the emptied folder, the
+  nested parent, the folder with a survivor, and the hand-made empty folder. Suite is now
+  74 assertions, up from 67.
+
+### Notes on scope
+- Only folders **this pass emptied** are considered — collected from the parents of files
+  actually deleted. An empty folder the user created by hand is invisible to the sync model
+  and is left alone; pruning it would be a change nobody asked for.
+- The link root is never removed, even when it ends up empty.
+- Deepest-first ordering, so a parent whose last remaining child is a folder emptied by the
+  same pass is also removed on that run rather than surviving until the next one.
+- A folder still holding deferred files stays: the prune runs after the deletes, so a folder
+  that has not finished emptying is simply revisited on a later pass.
+- Honours `-WhatIf` like every other writing step, so `check` still reports without touching
+  anything.
+
 ## [Unreleased] - 2026-08-08 (c) — report unavailable drives and stopped cloud clients
 
 Requested by Jayadheer Chitta: "if OneDrive or that particular drive is not turned on we
