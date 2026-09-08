@@ -35,6 +35,7 @@ function Get-DefaultSettings {
         LogLevel            = 'INFO'
         LogMaxSizeMB        = 1
         LogKeepFiles        = 3
+        LogMaxAgeDays       = 60
 
         # Global "stop touching my files for a bit", set from the tray menu.
         # Persisted rather than held in the tray process, so a reboot or a tray
@@ -100,6 +101,12 @@ function Get-AppSettings {
             [int]$parsed.LogKeepFiles
         } else { $defaults.LogKeepFiles }
 
+        # 0 disables the age cap (Keep is then the only limit); anything else
+        # negative or absent falls back to the default rather than being kept.
+        $logMaxAgeDays = if ($parsed.PSObject.Properties['LogMaxAgeDays'] -and $parsed.LogMaxAgeDays -ge 0) {
+            [int]$parsed.LogMaxAgeDays
+        } else { $defaults.LogMaxAgeDays }
+
         # Absent in settings files written before pausing was persisted, which
         # must read as "not paused" rather than as missing.
         $paused = if ($null -ne $parsed.PSObject.Properties['Paused']) {
@@ -116,6 +123,7 @@ function Get-AppSettings {
             LogLevel            = $logLevel
             LogMaxSizeMB        = $logMaxSizeMB
             LogKeepFiles        = $logKeepFiles
+            LogMaxAgeDays       = $logMaxAgeDays
             Paused              = $paused
         }
     }
@@ -136,7 +144,7 @@ function Initialize-LoggingFromSettings {
     try {
         $s = Get-AppSettings
         Set-LogLevel    $s.LogLevel
-        Set-LogRotation -MaxSizeMB $s.LogMaxSizeMB -Keep $s.LogKeepFiles
+        Set-LogRotation -MaxSizeMB $s.LogMaxSizeMB -Keep $s.LogKeepFiles -MaxAgeDays $s.LogMaxAgeDays
     }
     catch { }
 }

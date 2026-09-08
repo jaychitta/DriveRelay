@@ -7,5 +7,6 @@
     "StartDelaySeconds":  90,
     "LogLevel":  "INFO",
     "LogMaxSizeMB":  1,
-    "LogKeepFiles":  3
+    "LogKeepFiles":  3,
+    "LogMaxAgeDays":  60
 }

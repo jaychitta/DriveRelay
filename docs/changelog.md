@@ -2,6 +2,37 @@
 
 All notable changes to DriveRelay (formerly SyncOrchestrator) will be documented in this file.
 
+## [Unreleased] - 2026-09-08 — cap how long a rotated log is kept, by age not just size
+
+Requested by Jayadheer Chitta: size-based rotation (added 2026-08-12) bounds the log by MB,
+not by time — a quiet link could leave a generation sitting for a year without ever hitting
+the 1 MB cap. Asked for an explicit time limit on top of that: 60 days, deleting whatever is
+older regardless of size.
+
+### Added
+- **`LogMaxAgeDays` setting**, default 60. `Invoke-LogAgePurge` in `lib/Logging.ps1` deletes a
+  rotated generation (`driverelay.1.log` ..) once its last write is older than this, on every
+  call to `Invoke-LogRotation` — not only when a size rotation just fired, since a quiet link
+  may never trigger one. Only rotated generations are ever removed this way; the active
+  `driverelay.log` is not a candidate no matter its age. `0` disables the age cap and leaves
+  `LogKeepFiles` as the only limit, matching the behaviour before this existed.
+- Settable with `DriveRelay config -LogMaxAgeDays 60`, applied by all three entry points
+  through the existing `Initialize-LoggingFromSettings` -> `Set-LogRotation` path.
+- 5 assertions covering an aged-out generation being purged, a recent one surviving, the
+  active log being left alone regardless of age, and `MaxAgeDays 0` disabling the cap; plus a
+  `config -LogMaxAgeDays` round-trip through the real CLI alongside the existing
+  `-SettleMinutes`/`-LogLevel` regression test. Suite is now 104 assertions, up from 97.
+
+### Fixed
+- **`config -LogMaxAgeDays` silently had no effect** — caught by the new CLI round-trip
+  assertion before this shipped, not in the field. Same defect as the `LogLevel` /
+  `LogThreshold` split recorded on 2026-08-12: `Logging.ps1` is dot-sourced into
+  `DriveRelay.ps1`, so a `$script:LogMaxAgeDays` state variable there shares scope with the
+  CLI's `-LogMaxAgeDays` parameter, and `Initialize-LoggingFromSettings` overwrote the value
+  the caller typed before the command function ever read it. Renamed the internal variable to
+  `$script:LogAgeCapDays`. Any new logging setting added here needs a name that does not match
+  its CLI parameter, for the same reason.
+
 ## [Unreleased] - 2026-08-12 — correct the command reference in `docs/04-operations.md`
 
 ### Fixed

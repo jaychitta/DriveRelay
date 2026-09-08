@@ -53,7 +53,9 @@ DriveRelay.ps1 status  [-Id <id>]
 DriveRelay.ps1 start   [-IntervalMinutes 10]      installs the scheduled background task
 DriveRelay.ps1 stop                               removes the scheduled background task
 
-DriveRelay.ps1 config  [-LogLevel DEBUG]          shows or changes global settings
+DriveRelay.ps1 config  [-LogLevel DEBUG]
+                       [-LogMaxSizeMB 1] [-LogKeepFiles 3] [-LogMaxAgeDays 60]
+                                                   shows or changes global settings
 ```
 
 `start` and `stop` register and unregister a Windows scheduled task named `DriveRelay`, which
@@ -154,6 +156,13 @@ it is verbose:
 The log rotates at `LogMaxSizeMB` (default 1 MB) to `driverelay.1.log`, `driverelay.2.log`
 and so on, keeping `LogKeepFiles` generations (default 3). Older history is moved aside
 rather than truncated away, so roughly the last 4 MB is always available.
+
+That bounds the log by size, not by time — a quiet link can leave a generation sitting for
+months. `LogMaxAgeDays` (default 60) is the separate limit on that: once a rotated generation
+is older than this, it is deleted outright regardless of how many `LogKeepFiles` allows for.
+Only rotated generations are ever removed this way; the active `driverelay.log` is not.
+Set it with `config -LogMaxAgeDays 60`, or `0` to turn the age limit off and rely on
+`LogKeepFiles` alone, as before this existed.
 
 ## Files
 

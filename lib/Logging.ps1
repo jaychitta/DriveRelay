@@ -4,7 +4,7 @@
     Extracted from OneDriveGate.ps1 so both it and DriveRelay.ps1 write the same
     line format and share the same rotation behaviour.
 
-    Two things keep the log readable over months of unattended running:
+    Three things keep the log readable over months of unattended running:
 
       * A severity threshold. Per-file and per-pass bookkeeping is written at
         DEBUG and suppressed by default, so the log records what changed rather
@@ -13,6 +13,11 @@
         a fixed number of older generations is kept, so history survives instead
         of being truncated away, and rotation is a rename rather than a rewrite
         of the whole file on every subsequent write.
+      * An age cap on top of that. A quiet link can go a long time without
+        hitting the size cap, so a rotated generation is also deleted once it
+        is older than LogMaxAgeDays, regardless of how few generations that is.
+        Only rotated generations are ever aged out this way -- the active log
+        itself is never deleted out from under a running process.
 
     Logging must never take a caller down: every failure here is swallowed.
 #>
@@ -24,15 +29,18 @@ $script:LogPath     = Join-Path $script:DefaultRoot 'driverelay.log'
 # Ordered by severity. Anything below the active threshold is dropped before it
 # reaches the file.
 #
-# Named LogThreshold rather than LogLevel on purpose. This file is dot-sourced
-# into DriveRelay.ps1, so "$script:" here is that script's own scope -- a state
-# variable sharing a name with one of its parameters would quietly overwrite the
-# value the caller typed.
+# Named LogThreshold rather than LogLevel, and LogAgeCapDays rather than
+# LogMaxAgeDays, on purpose. This file is dot-sourced into DriveRelay.ps1, so
+# "$script:" here is that script's own scope -- a state variable sharing a name
+# with one of the CLI's parameters would quietly overwrite the value the caller
+# typed the moment Initialize-LoggingFromSettings ran, before the command even
+# looked at what was typed.
 $script:LogLevelRanks = @{ DEBUG = 0; INFO = 1; WARN = 2; ERROR = 3 }
 $script:LogThreshold  = 'INFO'
 
-$script:LogMaxBytes = 1MB
-$script:LogKeep     = 3
+$script:LogMaxBytes   = 1MB
+$script:LogKeep       = 3
+$script:LogAgeCapDays = 60
 
 function Set-LogPath {
     param([Parameter(Mandatory)][string] $Path)
@@ -60,14 +68,47 @@ function Set-LogRotation {
         MaxSizeMB is the size at which the active log is rotated aside.
         Keep is how many older generations are retained (driverelay.1.log ..
         driverelay.<Keep>.log). Keep = 0 discards on rotation.
+        MaxAgeDays is how long a rotated generation is kept before it is
+        deleted outright, independent of Keep. MaxAgeDays = 0 disables the
+        age cap -- Keep is then the only limit, as before this existed.
     #>
     param(
         [double] $MaxSizeMB,
-        [int]    $Keep = -1
+        [int]    $Keep = -1,
+        [int]    $MaxAgeDays = -1
     )
 
-    if ($MaxSizeMB -gt 0)  { $script:LogMaxBytes = [long]($MaxSizeMB * 1MB) }
-    if ($Keep -ge 0)       { $script:LogKeep     = $Keep }
+    if ($MaxSizeMB -gt 0)  { $script:LogMaxBytes   = [long]($MaxSizeMB * 1MB) }
+    if ($Keep -ge 0)       { $script:LogKeep       = $Keep }
+    if ($MaxAgeDays -ge 0) { $script:LogAgeCapDays = $MaxAgeDays }
+}
+
+function Invoke-LogAgePurge {
+    <#
+        Deletes rotated generations (driverelay.1.log ..) whose last write is
+        older than LogMaxAgeDays, regardless of how many generations that is.
+
+        This runs on every write, not just when a rotation just happened: a
+        quiet link can sit under the size cap for months, and the age cap has
+        to catch that generation eventually too. Only ever touches rotated
+        generations -- the active log is not a candidate.
+    #>
+    if ($script:LogAgeCapDays -le 0) { return }
+
+    try {
+        $dir  = Split-Path -Parent $script:LogPath
+        $base = [IO.Path]::GetFileNameWithoutExtension($script:LogPath)
+        $ext  = [IO.Path]::GetExtension($script:LogPath)
+        $cutoff = (Get-Date).AddDays(-$script:LogAgeCapDays)
+
+        for ($n = 1; $n -le $script:LogKeep; $n++) {
+            $path = Join-Path $dir ("{0}.{1}{2}" -f $base, $n, $ext)
+            if ((Test-Path -LiteralPath $path) -and (Get-Item -LiteralPath $path).LastWriteTime -lt $cutoff) {
+                Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    catch { }
 }
 
 function Invoke-LogRotation {
@@ -78,6 +119,8 @@ function Invoke-LogRotation {
         same moment one of the two loses a rename and the next call retries.
         Losing a rotation is harmless; failing a sync over one is not.
     #>
+    Invoke-LogAgePurge
+
     try {
         if (-not (Test-Path -LiteralPath $script:LogPath)) { return }
         if ((Get-Item -LiteralPath $script:LogPath).Length -le $script:LogMaxBytes) { return }

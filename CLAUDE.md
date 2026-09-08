@@ -22,8 +22,9 @@ DriveRelay relays files between a high-speed local NTFS working folder and a clo
   - `Hydration.ps1`: OneDrive file hydration and cloud dehydration handlers.
   - `Icons.ps1`: GDI+ programmatic icon drawing for tray and fallback icon generation.
   - `Logging.ps1`: Structured console and file logging. Severity threshold (`DEBUG`/`INFO`/
-    `WARN`/`ERROR`, default `INFO`) plus generational rotation to `driverelay.<n>.log`.
-    Dot-sourced into the entry scripts, so its state variables are deliberately named to
+    `WARN`/`ERROR`, default `INFO`) plus generational rotation to `driverelay.<n>.log`, each
+    generation also aged out past `LogMaxAgeDays` regardless of how many `LogKeepFiles` allows
+    for. Dot-sourced into the entry scripts, so its state variables are deliberately named to
     avoid colliding with their parameters (`$script:LogThreshold`, not `$script:LogLevel`).
   - `Manifest.ps1`: State manifests, file checksums, and change tracking.
   - `Pass.ps1`: Sync pass orchestration logic. Collapses runs of no-op passes into one
@@ -65,9 +66,11 @@ DriveRelay config                     View or update global settings
 ```
 
 Global settings live in `config/settings.json`. Log verbosity and retention are
-`LogLevel` (`DEBUG`/`INFO`/`WARN`/`ERROR`), `LogMaxSizeMB` and `LogKeepFiles`; at `INFO` the
-log records what changed, and `DriveRelay config -LogLevel DEBUG` restores the per-file and
-per-pass detail for diagnosis.
+`LogLevel` (`DEBUG`/`INFO`/`WARN`/`ERROR`), `LogMaxSizeMB`, `LogKeepFiles` and `LogMaxAgeDays`;
+at `INFO` the log records what changed, and `DriveRelay config -LogLevel DEBUG` restores the
+per-file and per-pass detail for diagnosis. `LogMaxAgeDays` (default 60) deletes a rotated
+generation once it is that old, regardless of `LogKeepFiles` — a size-only cap otherwise lets
+a quiet link's history sit indefinitely.
 
 Note that the entry scripts capture `$PSBoundParameters` once as `$script:Typed`. Command
 functions must use that: inside a function `$PSBoundParameters` is the function's own and is

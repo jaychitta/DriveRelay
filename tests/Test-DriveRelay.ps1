@@ -60,6 +60,7 @@ Assert-Equal $defaultSettings.IntervalMinutes 10 "Default IntervalMinutes is 10"
 Assert-Equal $defaultSettings.SettleMinutes 3 "Default SettleMinutes is 3"
 Assert-Equal $defaultSettings.MaxDelete 50 "Default MaxDelete is 50"
 Assert-Equal $defaultSettings.HydrateBeforeDelete $true "Default HydrateBeforeDelete is true"
+Assert-Equal $defaultSettings.LogMaxAgeDays 60 "Default LogMaxAgeDays is 60"
 
 $defaultSettings.SettleMinutes = 5
 $defaultSettings.IntervalMinutes = 15
@@ -146,20 +147,23 @@ if (Test-Path -LiteralPath $liveSettings) {
     $original = Get-Content -LiteralPath $liveSettings -Raw -Encoding UTF8 | ConvertFrom-Json
     $origSettle = [int]$original.SettleMinutes
     $origLevel  = if ($original.PSObject.Properties['LogLevel']) { [string]$original.LogLevel } else { 'INFO' }
+    $origMaxAge = if ($original.PSObject.Properties['LogMaxAgeDays']) { [int]$original.LogMaxAgeDays } else { 60 }
     try {
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cliPath config `
-            -SettleMinutes ($origSettle + 1) -LogLevel DEBUG | Out-Null
+            -SettleMinutes ($origSettle + 1) -LogLevel DEBUG -LogMaxAgeDays ($origMaxAge + 1) | Out-Null
         $after = Get-Content -LiteralPath $liveSettings -Raw -Encoding UTF8 | ConvertFrom-Json
         Assert-Equal ([int]$after.SettleMinutes) ($origSettle + 1) "config -SettleMinutes is persisted, not silently dropped"
         Assert-Equal ([string]$after.LogLevel) 'DEBUG' "config -LogLevel is persisted, not shadowed by Logging.ps1"
+        Assert-Equal ([int]$after.LogMaxAgeDays) ($origMaxAge + 1) "config -LogMaxAgeDays is persisted"
     }
     finally {
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cliPath config `
-            -SettleMinutes $origSettle -LogLevel $origLevel | Out-Null
+            -SettleMinutes $origSettle -LogLevel $origLevel -LogMaxAgeDays $origMaxAge | Out-Null
     }
     $restored = Get-Content -LiteralPath $liveSettings -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert-Equal ([int]$restored.SettleMinutes) $origSettle "The operator's SettleMinutes is restored after the test"
     Assert-Equal ([string]$restored.LogLevel) $origLevel "The operator's LogLevel is restored after the test"
+    Assert-Equal ([int]$restored.LogMaxAgeDays) $origMaxAge "The operator's LogMaxAgeDays is restored after the test"
 }
 
 # ------------------------------------------------------- 5. Overlap guard ---
@@ -617,6 +621,36 @@ $activeNum   = [int]([regex]::Match($activeFirst, 'filler line (\d+)').Groups[1]
 Assert-True ($gen1Num -lt $activeNum) "Generation 1 holds older lines than the active log"
 
 Set-LogRotation -MaxSizeMB 1 -Keep 3
+
+# Age cap: a rotated generation is deleted once it is older than MaxAgeDays,
+# independent of how many Keep allows for -- this is what catches a link too
+# quiet to ever hit the size cap.
+$ageLog = Join-Path $logDir 'age.log'
+Set-LogPath $ageLog
+Set-LogRotation -MaxSizeMB 1 -Keep 3 -MaxAgeDays 30
+
+$oldGen   = Join-Path $logDir 'age.1.log'
+$freshGen = Join-Path $logDir 'age.2.log'
+Set-Content -LiteralPath $ageLog   -Value 'active log'      -Encoding utf8
+Set-Content -LiteralPath $oldGen   -Value 'old generation'   -Encoding utf8
+Set-Content -LiteralPath $freshGen -Value 'fresh generation' -Encoding utf8
+(Get-Item -LiteralPath $ageLog).LastWriteTime   = (Get-Date).AddDays(-90)
+(Get-Item -LiteralPath $oldGen).LastWriteTime   = (Get-Date).AddDays(-45)
+(Get-Item -LiteralPath $freshGen).LastWriteTime = (Get-Date).AddDays(-10)
+
+Invoke-LogAgePurge
+Assert-True (-not (Test-Path -LiteralPath $oldGen)) "A generation older than MaxAgeDays is purged"
+Assert-True (Test-Path -LiteralPath $freshGen) "A generation younger than MaxAgeDays survives"
+Assert-True (Test-Path -LiteralPath $ageLog) "The active log is never touched by the age purge, however old"
+
+# MaxAgeDays = 0 disables the age cap -- Keep is then the only limit.
+Set-Content -LiteralPath $oldGen -Value 'old generation again' -Encoding utf8
+(Get-Item -LiteralPath $oldGen).LastWriteTime = (Get-Date).AddDays(-90)
+Set-LogRotation -MaxSizeMB 1 -Keep 3 -MaxAgeDays 0
+Invoke-LogAgePurge
+Assert-True (Test-Path -LiteralPath $oldGen) "MaxAgeDays 0 disables the age cap"
+
+Set-LogRotation -MaxSizeMB 1 -Keep 3 -MaxAgeDays 60
 Set-LogPath $script:TestLog
 if (Test-Path $logDir) { Remove-Item -LiteralPath $logDir -Recurse -Force -ErrorAction SilentlyContinue }
 

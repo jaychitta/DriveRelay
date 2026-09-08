@@ -66,7 +66,8 @@ param(
     [ValidateSet('DEBUG','INFO','WARN','ERROR')]
     [string] $LogLevel,
     [double] $LogMaxSizeMB,
-    [int]    $LogKeepFiles
+    [int]    $LogKeepFiles,
+    [int]    $LogMaxAgeDays
 )
 
 $ErrorActionPreference = 'Stop'
@@ -146,13 +147,15 @@ DriveRelay -- relay files between a local folder and a cloud drive.
                          [-IntervalMinutes 10] [-SettleMinutes 3] [-MaxDelete 50]
                          [-HydrateBeforeDelete]
                          [-LogLevel DEBUG|INFO|WARN|ERROR]
-                         [-LogMaxSizeMB 1] [-LogKeepFiles 3]
+                         [-LogMaxSizeMB 1] [-LogKeepFiles 3] [-LogMaxAgeDays 60]
 
                          At INFO the log records what changed. DEBUG adds the
                          per-file and per-pass detail for diagnosing a problem;
                          it is verbose, so turn it back down afterwards. The log
                          rotates to driverelay.1.log .. driverelay.<Keep>.log at
-                         the size cap.
+                         the size cap, and any of those generations older than
+                         LogMaxAgeDays is deleted regardless of Keep (0 disables
+                         the age cap).
 
 Seed decides which side is authoritative the first time a link runs.
 After that the pair is two-way.
@@ -456,6 +459,10 @@ function Invoke-SettingsCommand {
         $current.LogKeepFiles = [int]$LogKeepFiles
         $changed = $true
     }
+    if ($script:Typed.ContainsKey('LogMaxAgeDays')) {
+        $current.LogMaxAgeDays = [int]$LogMaxAgeDays
+        $changed = $true
+    }
 
     if ($changed) {
         Save-AppSettings -Settings $current
@@ -474,6 +481,7 @@ function Invoke-SettingsCommand {
     "  LogLevel            : {0}" -f $current.LogLevel
     "  LogMaxSizeMB        : {0}" -f $current.LogMaxSizeMB
     "  LogKeepFiles        : {0}" -f $current.LogKeepFiles
+    "  LogMaxAgeDays       : {0}" -f $current.LogMaxAgeDays
     "  Paused              : {0}" -f $current.Paused
     if ($current.Paused) {
         ''
