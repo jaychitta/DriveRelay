@@ -21,6 +21,7 @@ Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 . (Join-Path $root 'lib\Logging.ps1')
+. (Join-Path $root 'lib\LogViewer.ps1')
 . (Join-Path $root 'lib\Provider.ps1')
 . (Join-Path $root 'lib\Availability.ps1')
 . (Join-Path $root 'lib\Icons.ps1')
@@ -68,11 +69,14 @@ $script:StatusGray   = [System.Drawing.Color]::FromArgb(255, 110, 110, 120)
 $script:BtnBg        = [System.Drawing.Color]::FromArgb(255, 55, 55, 62)
 $script:BtnHover     = [System.Drawing.Color]::FromArgb(255, 70, 70, 78)
 $script:SepColor     = [System.Drawing.Color]::FromArgb(255, 55, 55, 62)
+$script:HeaderColor  = [System.Drawing.Color]::FromArgb(255, 24, 24, 28)
+$script:PanelColor   = [System.Drawing.Color]::FromArgb(255, 35, 35, 41)
 
 $script:FontName     = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 11, ([System.Drawing.FontStyle]::Bold)
 $script:FontPath     = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 8.5
 $script:FontStatus   = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 8.5, ([System.Drawing.FontStyle]::Bold)
 $script:FontBtn      = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 9
+$script:FontCaption  = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 7.5, ([System.Drawing.FontStyle]::Bold)
 
 # ------------------------------------------------------------------ helpers ---
 
@@ -548,9 +552,9 @@ function Show-LinkEditDialog {
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text          = 'DriveRelay'
-$form.Size          = New-Object System.Drawing.Size -ArgumentList 760, 520
+$form.Size          = New-Object System.Drawing.Size -ArgumentList 920, 620
 $form.StartPosition = 'CenterScreen'
-$form.MinimumSize   = New-Object System.Drawing.Size -ArgumentList 620, 420
+$form.MinimumSize   = New-Object System.Drawing.Size -ArgumentList 760, 500
 $form.BackColor     = $script:BgColor
 $form.ForeColor     = $script:TextPrimary
 $form.Font          = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 9.5
@@ -562,9 +566,9 @@ if ($script:AppIcon) { $form.Icon = $script:AppIcon }
 # ---- top header bar ----
 $headerBar = New-Object System.Windows.Forms.Panel
 $headerBar.Location  = New-Object System.Drawing.Point -ArgumentList 0, 0
-$headerBar.Size      = New-Object System.Drawing.Size -ArgumentList 760, 54
+$headerBar.Size      = New-Object System.Drawing.Size -ArgumentList 920, 112
 $headerBar.Anchor    = 'Top,Left,Right'
-$headerBar.BackColor = [System.Drawing.Color]::FromArgb(255, 24, 24, 28)
+$headerBar.BackColor = $script:HeaderColor
 $form.Controls.Add($headerBar)
 
 # Header logo from badge / png asset
@@ -577,8 +581,8 @@ $logoPath = $logoCandidates | Where-Object { Test-Path -LiteralPath $_ } | Selec
 if ($logoPath) {
     try {
         $logoPb = New-Object System.Windows.Forms.PictureBox
-        $logoPb.Location = New-Object System.Drawing.Point -ArgumentList 16, 9
-        $logoPb.Size = New-Object System.Drawing.Size -ArgumentList 36, 36
+        $logoPb.Location = New-Object System.Drawing.Point -ArgumentList 20, 17
+        $logoPb.Size = New-Object System.Drawing.Size -ArgumentList 48, 48
         $logoPb.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::Zoom
         $logoPb.Image = [System.Drawing.Image]::FromFile($logoPath)
         $logoPb.BackColor = [System.Drawing.Color]::Transparent
@@ -588,26 +592,82 @@ if ($logoPath) {
 
 $lblAppTitle = New-Object System.Windows.Forms.Label
 $lblAppTitle.Text = 'DriveRelay'
-$lblAppTitle.Location = New-Object System.Drawing.Point -ArgumentList 58, 8
-$lblAppTitle.Size = New-Object System.Drawing.Size -ArgumentList 180, 22
-$lblAppTitle.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 11.5, ([System.Drawing.FontStyle]::Bold)
+$lblAppTitle.Location = New-Object System.Drawing.Point -ArgumentList 82, 18
+$lblAppTitle.Size = New-Object System.Drawing.Size -ArgumentList 260, 25
+$lblAppTitle.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 13, ([System.Drawing.FontStyle]::Bold)
 $lblAppTitle.ForeColor = $script:TextPrimary
 $lblAppTitle.BackColor = [System.Drawing.Color]::Transparent
 $headerBar.Controls.Add($lblAppTitle)
 
 $lblAppSub = New-Object System.Windows.Forms.Label
-$lblAppSub.Text = 'Local NTFS working folder relay for cloud drives'
-$lblAppSub.Location = New-Object System.Drawing.Point -ArgumentList 59, 29
-$lblAppSub.Size = New-Object System.Drawing.Size -ArgumentList 400, 18
+$lblAppSub.Text = 'Your local folders, safely relayed to cloud storage.'
+$lblAppSub.Location = New-Object System.Drawing.Point -ArgumentList 83, 45
+$lblAppSub.Size = New-Object System.Drawing.Size -ArgumentList 340, 18
 $lblAppSub.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 8.5
 $lblAppSub.ForeColor = $script:TextMuted
 $lblAppSub.BackColor = [System.Drawing.Color]::Transparent
 $headerBar.Controls.Add($lblAppSub)
 
+function New-HeaderMetric($caption, $x, $w) {
+    $panel = New-Object System.Windows.Forms.Panel
+    $panel.Location = New-Object System.Drawing.Point -ArgumentList $x, 72
+    $panel.Size = New-Object System.Drawing.Size -ArgumentList $w, 32
+    $panel.Anchor = 'Top,Right'
+    $panel.BackColor = $script:PanelColor
+
+    $captionLabel = New-Object System.Windows.Forms.Label
+    $captionLabel.Text = $caption.ToUpperInvariant()
+    $captionLabel.Location = New-Object System.Drawing.Point -ArgumentList 8, 3
+    $captionLabel.Size = New-Object System.Drawing.Size -ArgumentList ($w - 16), 12
+    $captionLabel.Font = $script:FontCaption
+    $captionLabel.ForeColor = $script:TextMuted
+    $captionLabel.BackColor = [System.Drawing.Color]::Transparent
+    $panel.Controls.Add($captionLabel)
+
+    $value = New-Object System.Windows.Forms.Label
+    $value.Location = New-Object System.Drawing.Point -ArgumentList 8, 15
+    $value.Size = New-Object System.Drawing.Size -ArgumentList ($w - 16), 15
+    $value.Font = $script:FontStatus
+    $value.ForeColor = $script:TextPrimary
+    $value.BackColor = [System.Drawing.Color]::Transparent
+    $panel.Controls.Add($value)
+    $headerBar.Controls.Add($panel)
+    return $value
+}
+
+$summaryLinks   = New-HeaderMetric 'Folder pairs' 480 105
+$summaryHealth  = New-HeaderMetric 'Status' 594 150
+$summaryLastRun = New-HeaderMetric 'Last sync' 753 145
+
+$btnSync = New-Object System.Windows.Forms.Button
+$btnSync.Text = 'Sync all now'
+$btnSync.FlatStyle = 'Flat'
+$btnSync.BackColor = $script:AccentBlue
+$btnSync.ForeColor = [System.Drawing.Color]::White
+$btnSync.FlatAppearance.BorderColor = $script:AccentBlue
+$btnSync.Location = New-Object System.Drawing.Point -ArgumentList 753, 24
+$btnSync.Size = New-Object System.Drawing.Size -ArgumentList 145, 34
+$btnSync.Anchor = 'Top,Right'
+$btnSync.Font = $script:FontBtn
+$btnSync.Add_MouseEnter({ $this.BackColor = [System.Drawing.Color]::FromArgb(255, 70, 155, 245) })
+$btnSync.Add_MouseLeave({ $this.BackColor = $script:AccentBlue })
+$headerBar.Controls.Add($btnSync)
+
+# At the minimum supported width the status tiles would compete with the
+# product description. Hide the secondary information instead of letting
+# controls overlap; the full summary returns as soon as the window is widened.
+$form.Add_Resize({
+    $compact = $form.ClientSize.Width -lt 860
+    $lblAppSub.Visible = -not $compact
+    foreach ($metric in @($summaryLinks, $summaryHealth, $summaryLastRun)) {
+        $metric.Parent.Visible = -not $compact
+    }
+})
+
 # ---- scrollable card container ----
 $cardPanel = New-Object System.Windows.Forms.Panel
-$cardPanel.Location   = New-Object System.Drawing.Point -ArgumentList 0, 54
-$cardPanel.Size       = New-Object System.Drawing.Size -ArgumentList 740, 356
+$cardPanel.Location   = New-Object System.Drawing.Point -ArgumentList 0, 112
+$cardPanel.Size       = New-Object System.Drawing.Size -ArgumentList 900, 413
 $cardPanel.Anchor     = 'Top,Left,Right,Bottom'
 $cardPanel.AutoScroll = $true
 $cardPanel.BackColor  = $script:BgColor
@@ -615,41 +675,41 @@ $form.Controls.Add($cardPanel)
 
 # ---- bottom action bar ----
 $actionBar = New-Object System.Windows.Forms.Panel
-$actionBar.Location  = New-Object System.Drawing.Point -ArgumentList 0, 410
-$actionBar.Size      = New-Object System.Drawing.Size -ArgumentList 760, 70
+$actionBar.Location  = New-Object System.Drawing.Point -ArgumentList 0, 525
+$actionBar.Size      = New-Object System.Drawing.Size -ArgumentList 920, 56
 $actionBar.Anchor    = 'Bottom,Left,Right'
-$actionBar.BackColor = [System.Drawing.Color]::FromArgb(255, 26, 26, 30)
+$actionBar.BackColor = $script:HeaderColor
 $form.Controls.Add($actionBar)
 
 # Status label in action bar.
 $statusLabel = New-Object System.Windows.Forms.Label
-$statusLabel.Location  = New-Object System.Drawing.Point -ArgumentList 18, 8
-$statusLabel.Size      = New-Object System.Drawing.Size -ArgumentList 550, 20
+$statusLabel.Location  = New-Object System.Drawing.Point -ArgumentList 160, 18
+$statusLabel.Size      = New-Object System.Drawing.Size -ArgumentList 410, 20
+$statusLabel.Anchor    = 'Top,Left,Right'
 $statusLabel.ForeColor = $script:TextMuted
 $statusLabel.BackColor = [System.Drawing.Color]::Transparent
 $statusLabel.Font      = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 8.5
 $actionBar.Controls.Add($statusLabel)
 
-function New-ActionBtn($text, $x, $w=105) {
+function New-ActionBtn($text, $x, $w=105, [bool] $rightAligned=$false) {
     $b = New-Object System.Windows.Forms.Button
     $b.Text = $text; $b.FlatStyle = 'Flat'
     $b.BackColor = $script:BtnBg; $b.ForeColor = $script:TextPrimary
     $b.FlatAppearance.BorderColor = $script:SepColor
-    $b.Location = New-Object System.Drawing.Point -ArgumentList $x, 32
+    $b.Location = New-Object System.Drawing.Point -ArgumentList $x, 13
     $b.Size = New-Object System.Drawing.Size -ArgumentList $w, 30
-    $b.Anchor = 'Bottom,Left'
+    $b.Anchor = if ($rightAligned) { 'Bottom,Right' } else { 'Bottom,Left' }
     $b.Font = $script:FontBtn
     $b.Add_MouseEnter({ $this.BackColor = $script:BtnHover })
     $b.Add_MouseLeave({ $this.BackColor = $script:BtnBg })
     return $b
 }
 
-$btnAdd      = New-ActionBtn '+ Add folder' 16 110
-$btnSync     = New-ActionBtn 'Sync all' 132 90
-$btnSettings = New-ActionBtn 'Settings' 228 95
-$btnLog      = New-ActionBtn 'View log' 329 95
-$btnClose    = New-ActionBtn 'Close' 430 80
-$actionBar.Controls.AddRange(@($btnAdd, $btnSync, $btnSettings, $btnLog, $btnClose))
+$btnAdd      = New-ActionBtn '+ Add folder pair' 16 136
+$btnSettings = New-ActionBtn 'Settings' 630 90 $true
+$btnLog      = New-ActionBtn 'View log' 728 88 $true
+$btnClose    = New-ActionBtn 'Close' 824 76 $true
+$actionBar.Controls.AddRange(@($btnAdd, $btnSettings, $btnLog, $btnClose))
 
 # ------------------------------------------------------------ card builder ---
 
@@ -657,14 +717,15 @@ function New-LinkCard {
     param([object] $Link, [int] $Y)
 
     $card = New-Object System.Windows.Forms.Panel
-    $card.Location  = New-Object System.Drawing.Point -ArgumentList 16, $Y
-    $card.Size      = New-Object System.Drawing.Size -ArgumentList 706, 80
+    $card.Location  = New-Object System.Drawing.Point -ArgumentList 18, $Y
+    $card.Size      = New-Object System.Drawing.Size -ArgumentList 864, 116
     $card.Anchor    = 'Top,Left,Right'
     $card.BackColor = $script:CardColor
     $card.Tag       = $Link.Id
     $card.Cursor    = [System.Windows.Forms.Cursors]::Hand
 
-    # Rounded feel via Paint event.
+    # A restrained border and a status stripe distinguish links without making
+    # the dashboard look like a wall of equally weighted buttons.
     $card.Add_Paint({
         param($s, $e)
         $r = New-Object System.Drawing.Rectangle -ArgumentList 0, 0, ($s.Width - 1), ($s.Height - 1)
@@ -676,26 +737,34 @@ function New-LinkCard {
     $card.Add_MouseEnter({ $this.BackColor = $script:CardHover })
     $card.Add_MouseLeave({ $this.BackColor = $script:CardColor })
 
+    $si = Get-StatusInfo -Link $Link
+    $stripe = New-Object System.Windows.Forms.Panel
+    $stripe.Location = New-Object System.Drawing.Point -ArgumentList 0, 0
+    $stripe.Size = New-Object System.Drawing.Size -ArgumentList 5, 116
+    $stripe.Anchor = 'Top,Bottom,Left'
+    $stripe.BackColor = $si.Color
+    $card.Controls.Add($stripe)
+
     # Link name (bold).
     $lblName = New-Object System.Windows.Forms.Label
     $lblName.Text = $Link.Id
     $lblName.Font = $script:FontName
     $lblName.ForeColor = $script:TextPrimary
     $lblName.BackColor = [System.Drawing.Color]::Transparent
-    $lblName.Location = New-Object System.Drawing.Point -ArgumentList 14, 10
-    $lblName.Size = New-Object System.Drawing.Size -ArgumentList 300, 22
+    $lblName.Location = New-Object System.Drawing.Point -ArgumentList 20, 12
+    $lblName.Size = New-Object System.Drawing.Size -ArgumentList 464, 22
+    $lblName.Anchor = 'Top,Left,Right'
     $card.Controls.Add($lblName)
 
     # Status badge.
-    $si = Get-StatusInfo -Link $Link
     $lblStatus = New-Object System.Windows.Forms.Label
     $lblStatus.Text = $si.Text
     $lblStatus.Font = $script:FontStatus
     $lblStatus.ForeColor = $si.Color
     $lblStatus.BackColor = [System.Drawing.Color]::Transparent
     $lblStatus.TextAlign = 'TopRight'
-    $lblStatus.Location = New-Object System.Drawing.Point -ArgumentList 400, 12
-    $lblStatus.Size = New-Object System.Drawing.Size -ArgumentList 200, 20
+    $lblStatus.Location = New-Object System.Drawing.Point -ArgumentList 489, 14
+    $lblStatus.Size = New-Object System.Drawing.Size -ArgumentList 110, 20
     $lblStatus.Anchor = 'Top,Right'
     $card.Controls.Add($lblStatus)
 
@@ -709,18 +778,35 @@ function New-LinkCard {
         $tip.SetToolTip($card, $si.Detail)
     }
 
-    # Paths.
+    # Paths have labels so it is clear at a glance which side is the fast work
+    # folder and which is the cloud or backup destination.
     $remote = Get-RemotePath -Link $Link
     $drive = Get-ProviderLabel -Path $remote
-    $lblPaths = New-Object System.Windows.Forms.Label
-    $lblPaths.Text = "{0}  ->  {1}" -f $Link.LocalPath, $remote
-    $lblPaths.Font = $script:FontPath
-    $lblPaths.ForeColor = $script:TextMuted
-    $lblPaths.BackColor = [System.Drawing.Color]::Transparent
-    $lblPaths.Location = New-Object System.Drawing.Point -ArgumentList 14, 36
-    $lblPaths.Size = New-Object System.Drawing.Size -ArgumentList 500, 18
-    $lblPaths.Anchor = 'Top,Left,Right'
-    $card.Controls.Add($lblPaths)
+    foreach ($pathInfo in @(
+        [pscustomobject]@{ Label = 'LOCAL';  Value = $Link.LocalPath; Y = 40 }
+        [pscustomobject]@{ Label = 'REMOTE'; Value = $remote;         Y = 62 }
+    )) {
+        $caption = New-Object System.Windows.Forms.Label
+        $caption.Text = $pathInfo.Label
+        $caption.Font = $script:FontCaption
+        $caption.ForeColor = $script:TextMuted
+        $caption.BackColor = [System.Drawing.Color]::Transparent
+        $caption.Location = New-Object System.Drawing.Point -ArgumentList 20, $pathInfo.Y
+        $caption.Size = New-Object System.Drawing.Size -ArgumentList 54, 16
+        $card.Controls.Add($caption)
+
+        $value = New-Object System.Windows.Forms.Label
+        $value.Text = $pathInfo.Value
+        $value.Font = $script:FontPath
+        $value.ForeColor = $script:TextPrimary
+        $value.BackColor = [System.Drawing.Color]::Transparent
+        $value.Location = New-Object System.Drawing.Point -ArgumentList 80, $pathInfo.Y
+        $value.Size = New-Object System.Drawing.Size -ArgumentList 514, 16
+        $value.Anchor = 'Top,Left,Right'
+        $value.AutoEllipsis = $true
+        $card.Controls.Add($value)
+        if ($pathInfo.Label -eq 'LOCAL') { $lblPaths = $value }
+    }
 
     # Drive label + settle time + last sync.
     $lastSync = if ($Link.LastRun) { $Link.LastRun } else { 'never' }
@@ -730,9 +816,33 @@ function New-LinkCard {
     $lblMeta.Font = $script:FontPath
     $lblMeta.ForeColor = $script:TextMuted
     $lblMeta.BackColor = [System.Drawing.Color]::Transparent
-    $lblMeta.Location = New-Object System.Drawing.Point -ArgumentList 14, 56
-    $lblMeta.Size = New-Object System.Drawing.Size -ArgumentList 450, 18
+    $lblMeta.Location = New-Object System.Drawing.Point -ArgumentList 20, 88
+    $lblMeta.Size = New-Object System.Drawing.Size -ArgumentList 510, 18
+    $lblMeta.Anchor = 'Top,Left,Right'
     $card.Controls.Add($lblMeta)
+
+    # Give the common double-click action a visible button as well.
+    $btnOpen = New-Object System.Windows.Forms.Button
+    $btnOpen.Text = 'Open folder'
+    $btnOpen.FlatStyle = 'Flat'
+    $btnOpen.BackColor = $script:BtnBg
+    $btnOpen.ForeColor = $script:TextPrimary
+    $btnOpen.FlatAppearance.BorderColor = $script:SepColor
+    $btnOpen.Location = New-Object System.Drawing.Point -ArgumentList 604, 84
+    $btnOpen.Size = New-Object System.Drawing.Size -ArgumentList 84, 25
+    $btnOpen.Anchor = 'Top,Right'
+    $btnOpen.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 8
+    $btnOpen.Tag = $Link.Id
+    $btnOpen.Add_MouseEnter({ $this.BackColor = $script:BtnHover })
+    $btnOpen.Add_MouseLeave({ $this.BackColor = $script:BtnBg })
+    $btnOpen.Add_Click({
+        $lid = $this.Tag
+        $lnk = Get-LinkRegistry | Where-Object { $_.Id -eq $lid }
+        if ($lnk -and (Test-Path -LiteralPath $lnk.LocalPath)) {
+            Start-Process -FilePath 'explorer.exe' -ArgumentList ('"{0}"' -f $lnk.LocalPath)
+        }
+    })
+    $card.Controls.Add($btnOpen)
 
     # Edit button.
     $btnEdit = New-Object System.Windows.Forms.Button
@@ -741,8 +851,8 @@ function New-LinkCard {
     $btnEdit.BackColor = $script:BtnBg
     $btnEdit.ForeColor = $script:TextPrimary
     $btnEdit.FlatAppearance.BorderColor = $script:SepColor
-    $btnEdit.Location = New-Object System.Drawing.Point -ArgumentList 535, 48
-    $btnEdit.Size = New-Object System.Drawing.Size -ArgumentList 65, 24
+    $btnEdit.Location = New-Object System.Drawing.Point -ArgumentList 696, 84
+    $btnEdit.Size = New-Object System.Drawing.Size -ArgumentList 48, 25
     $btnEdit.Anchor = 'Top,Right'
     $btnEdit.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 8
     $btnEdit.Tag = $Link.Id
@@ -766,8 +876,8 @@ function New-LinkCard {
     $btnToggle.BackColor = $script:BtnBg
     $btnToggle.ForeColor = $script:TextPrimary
     $btnToggle.FlatAppearance.BorderColor = $script:SepColor
-    $btnToggle.Location = New-Object System.Drawing.Point -ArgumentList 608, 48
-    $btnToggle.Size = New-Object System.Drawing.Size -ArgumentList 80, 24
+    $btnToggle.Location = New-Object System.Drawing.Point -ArgumentList 752, 84
+    $btnToggle.Size = New-Object System.Drawing.Size -ArgumentList 92, 25
     $btnToggle.Anchor = 'Top,Right'
     $btnToggle.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 8
     $btnToggle.Tag = $Link.Id
@@ -813,37 +923,54 @@ function New-LinkCard {
 function Update-Cards {
     $cardPanel.Controls.Clear()
     $links = @(Get-LinkRegistry)
+    $sum = Read-PassSummarySafe
+
+    $summaryLinks.Text = "{0} linked" -f $links.Count
+    $summaryLastRun.Text = if ($sum) { $sum.When } else { 'Not run yet' }
+
+    $paused = $false
+    try { $paused = [bool](Get-AppSettings).Paused } catch { }
+
+    if ($paused) {
+        $summaryHealth.ForeColor = $script:StatusAmber
+        $summaryHealth.Text = 'Background paused'
+    }
+    elseif ($links.Count -eq 0) {
+        $summaryHealth.ForeColor = $script:TextMuted
+        $summaryHealth.Text = 'Ready to add'
+    }
+    else {
+        $attention = @($links | Where-Object { (Get-StatusInfo -Link $_).Text -ne 'Up to date' }).Count
+        $summaryHealth.ForeColor = if ($attention -gt 0) { $script:StatusAmber } else { $script:StatusGreen }
+        $summaryHealth.Text = if ($attention -eq 1) { '1 needs attention' }
+                              elseif ($attention -gt 1) { "{0} need attention" -f $attention }
+                              else { 'All healthy' }
+    }
 
     if ($links.Count -eq 0) {
         $empty = New-Object System.Windows.Forms.Label
-        $empty.Text = 'No folder pairs linked yet. Click "+ Add folder" to get started.'
+        $empty.Text = 'No folder pairs linked yet. Add a folder pair to get started.'
         $empty.ForeColor = $script:TextMuted
         $empty.BackColor = [System.Drawing.Color]::Transparent
         $empty.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 10
         $empty.TextAlign = 'MiddleCenter'
-        $empty.Location = New-Object System.Drawing.Point -ArgumentList 0, 120
-        $empty.Size = New-Object System.Drawing.Size -ArgumentList 700, 40
+        $empty.Location = New-Object System.Drawing.Point -ArgumentList 0, 150
+        $empty.Size = New-Object System.Drawing.Size -ArgumentList 880, 40
         $empty.Anchor = 'Top,Left,Right'
         $cardPanel.Controls.Add($empty)
         $statusLabel.Text = ''
         return
     }
 
-    $y = 12
+    $y = 16
     foreach ($l in $links) {
         $card = New-LinkCard -Link $l -Y $y
         $cardPanel.Controls.Add($card)
-        $y += 92
+        $y += 128
     }
 
-    $sum = Read-PassSummarySafe
     $base = if ($sum) { "Last sync {0} - {1} change(s), {2} conflict(s)" -f $sum.When, $sum.Applied, $sum.Conflicts }
             else      { "{0} folder pair(s) linked" -f $links.Count }
-
-    # A global pause set from the tray used to be invisible here: every link
-    # showed as active while nothing was actually running. Say so plainly.
-    $paused = $false
-    try { $paused = [bool](Get-AppSettings).Paused } catch { }
 
     if ($paused) {
         $statusLabel.ForeColor = $script:StatusAmber
@@ -887,10 +1014,7 @@ $btnSettings.Add_Click({
 })
 
 $btnLog.Add_Click({
-    $log = Join-Path $root 'driverelay.log'
-    if (-not (Test-Path $log)) { $log = Join-Path $root 'syncorch.log' }
-    if (Test-Path $log) { Start-Process notepad.exe $log }
-    else { [System.Windows.Forms.MessageBox]::Show($form, 'Nothing logged yet.', 'Log', 'OK', 'Information') | Out-Null }
+    Show-DriveRelayLog -Root $root -Owner $form -Icon $script:AppIcon
 })
 
 $btnClose.Add_Click({ $form.Close() })

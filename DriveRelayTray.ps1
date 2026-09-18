@@ -30,6 +30,7 @@ Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 . (Join-Path $root 'lib\Logging.ps1')
+. (Join-Path $root 'lib\LogViewer.ps1')
 . (Join-Path $root 'lib\Icons.ps1')
 . (Join-Path $root 'lib\Settings.ps1')
 . (Join-Path $root 'lib\Provider.ps1')
@@ -340,10 +341,7 @@ $miSettings.Add_Click({
 })
 
 $miLog.Add_Click({
-    $log = Join-Path $root 'driverelay.log'
-    # Fall back to legacy log name.
-    if (-not (Test-Path $log)) { $log = Join-Path $root 'syncorch.log' }
-    if (Test-Path $log) { Start-Process notepad.exe $log }
+    Show-DriveRelayLog -Root $root -Icon $script:IconIdle
 })
 
 $miExit.Add_Click({
