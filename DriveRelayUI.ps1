@@ -23,6 +23,7 @@ Add-Type -AssemblyName System.Drawing
 . (Join-Path $root 'lib\Logging.ps1')
 . (Join-Path $root 'lib\LogViewer.ps1')
 . (Join-Path $root 'lib\Provider.ps1')
+. (Join-Path $root 'lib\Conflicts.ps1')
 . (Join-Path $root 'lib\Availability.ps1')
 . (Join-Path $root 'lib\Icons.ps1')
 . (Join-Path $root 'lib\Registry.ps1')
@@ -35,6 +36,10 @@ Initialize-LoggingFromSettings
 $script:StateRoot = Join-Path $root 'state'
 $script:Cli       = Join-Path $root 'DriveRelay.ps1'
 $script:Child     = $null
+# The dashboard keeps the duplicate list in the selected card rather than
+# opening a second window.  Only one expanded list is useful at a time.
+$script:ExpandedDuplicateLink = $null
+$script:ConflictCopiesByLink = @{}
 
 # Try to enable dark title bar on Windows 10/11.
 try {
@@ -104,7 +109,7 @@ function Select-FolderDialog {
 }
 
 function Get-StatusInfo {
-    param([object] $Link)
+    param([object] $Link, [object[]] $ConflictCopies, [switch] $ConflictCopiesChecked)
     if (-not $Link.Enabled) {
         return @{ Text = 'Paused'; Color = $script:StatusGray; Detail = '' }
     }
@@ -125,7 +130,38 @@ function Get-StatusInfo {
         return @{ Text = 'Not synced yet'; Color = $script:StatusAmber; Detail = '' }
     }
     if ($Link.LastResult -like 'aborted*') {
-        return @{ Text = 'Needs attention'; Color = $script:StatusAmber; Detail = [string]$Link.LastResult }
+        # The pass persists the concrete reason (for example, that the delete
+        # limit was exceeded). Show it on the card instead of hiding it behind
+        # a generic warning; the tooltip shows the same actionable explanation.
+        $detail = [string]$Link.LastResult
+        $reason = ($detail -replace '^aborted:\s*', '').Trim()
+        if ($reason -match '^(?<count>\d+) deletions exceeds MaxDelete of (?<limit>\d+); nothing applied$') {
+            $count = [int]$Matches['count']
+            $oldLimit = [int]$Matches['limit']
+            $currentLimit = if ($Link.PSObject.Properties['MaxDelete'] -and
+                                $null -ne $Link.MaxDelete) { [int]$Link.MaxDelete } else { $oldLimit }
+            if ($currentLimit -gt $oldLimit) {
+                # This warning belongs to a pass that used the old limit. The
+                # new setting is already saved, so do not keep showing a stale
+                # error while the dashboard waits to retry the sync.
+                return @{ Text = 'Ready to sync'; Color = $script:AccentBlue
+                          Detail = 'The higher delete limit is saved. Sync all will retry this link.'
+                          Attention = $false }
+            }
+            $reason = '{0} deletions were blocked (limit: {1}). Increase it in Edit, then sync again.' -f
+                      $count, $oldLimit
+        }
+        return @{ Text = $(if ($reason) { $reason } else { 'Needs attention' })
+                  Color = $script:StatusAmber
+                  Detail = $(if ($reason) { $reason } else { $detail }) }
+    }
+    $files = @($ConflictCopies)
+    if (-not $ConflictCopiesChecked) {
+        try { $files = @(Get-LinkConflictCopies -Link $Link) } catch { $files = @() }
+    }
+    if ($files.Count -gt 0) {
+        return @{ Text = ("{0} duplicate(s)" -f $files.Count); Color = $script:StatusAmber
+            Detail = 'Click Duplicates to review the original and conflict copy.' }
     }
     return @{ Text = 'Up to date'; Color = $script:StatusGreen; Detail = '' }
 }
@@ -146,6 +182,76 @@ function Read-PassSummarySafe {
     if (-not (Test-Path -LiteralPath $p)) { return $null }
     try   { return ConvertFrom-Json -InputObject (Get-Content -LiteralPath $p -Raw -Encoding UTF8) }
     catch { return $null }
+}
+
+function New-ConflictGrid {
+    param([object[]] $Copies)
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $grid.Dock = 'Fill'
+    $grid.ReadOnly = $true
+    $grid.AllowUserToAddRows = $false
+    $grid.AllowUserToDeleteRows = $false
+    $grid.RowHeadersVisible = $false
+    $grid.AutoGenerateColumns = $false
+    $grid.SelectionMode = 'FullRowSelect'
+    $grid.BackgroundColor = $script:BgColor
+    $grid.DefaultCellStyle.BackColor = $script:CardColor
+    $grid.DefaultCellStyle.ForeColor = $script:TextPrimary
+    $grid.DefaultCellStyle.SelectionBackColor = $script:BtnBg
+    $grid.DefaultCellStyle.SelectionForeColor = $script:TextPrimary
+    $grid.EnableHeadersVisualStyles = $false
+    $grid.ColumnHeadersDefaultCellStyle.BackColor = $script:BtnBg
+    $grid.ColumnHeadersDefaultCellStyle.ForeColor = $script:TextPrimary
+    $grid.RowTemplate.Height = 34
+    foreach ($columnInfo in @(
+        @{ Name = 'Original'; Caption = 'Original file'; Width = 150 }
+        @{ Name = 'Duplicate'; Caption = 'Duplicate file'; Width = 250 }
+        @{ Name = 'Folder'; Caption = 'Folder'; Width = 170 }
+    )) {
+        $column = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+        $column.Name = $columnInfo.Name
+        $column.HeaderText = $columnInfo.Caption
+        $column.Width = $columnInfo.Width
+        $null = $grid.Columns.Add($column)
+    }
+    foreach ($side in @('Local', 'Remote')) {
+        $column = New-Object System.Windows.Forms.DataGridViewButtonColumn
+        $column.Name = $side
+        $column.HeaderText = "$side copy"
+        $column.Width = 100
+        $column.FlatStyle = 'Flat'
+        $null = $grid.Columns.Add($column)
+    }
+    foreach ($copy in $Copies) {
+        $index = $grid.Rows.Add(
+            [IO.Path]::GetFileName($copy.OriginalRelPath),
+            [IO.Path]::GetFileName($copy.CopyRelPath),
+            $(if ([IO.Path]::GetDirectoryName($copy.CopyRelPath)) { [IO.Path]::GetDirectoryName($copy.CopyRelPath) } else { '(root)' }),
+            $(if ($copy.CopyLocalPath) { 'Open folder' } else { 'Not present' }),
+            $(if ($copy.CopyRemotePath) { 'Open folder' } else { 'Not present' }))
+        $row = $grid.Rows[$index]
+        $row.Tag = $copy
+        $row.Cells[0].ToolTipText = $copy.OriginalRelPath
+        $row.Cells[1].ToolTipText = $copy.CopyRelPath
+        $row.Cells[3].ToolTipText = $copy.CopyLocalPath
+        $row.Cells[4].ToolTipText = $copy.CopyRemotePath
+    }
+    $grid.Add_CellContentClick({
+        param($sender, $eventArgs)
+        if ($eventArgs.RowIndex -lt 0 -or $eventArgs.ColumnIndex -lt 3) { return }
+        $copy = $sender.Rows[$eventArgs.RowIndex].Tag
+        $path = if ($eventArgs.ColumnIndex -eq 3) { $copy.CopyLocalPath } else { $copy.CopyRemotePath }
+        if (-not $path) { return }
+        $folder = [IO.Path]::GetDirectoryName($path)
+        if (-not (Test-Path -LiteralPath $folder -PathType Container)) {
+            $null = [System.Windows.Forms.MessageBox]::Show($sender.FindForm(), 'This folder is no longer available.', 'Open folder', 'OK', 'Warning')
+            return
+        }
+        # Selecting in Explorer opens the containing folder without opening content.
+        $arguments = if (Test-Path -LiteralPath $path -PathType Leaf) { '/select,"{0}"' -f $path } else { '"{0}"' -f $folder }
+        Start-Process -FilePath 'explorer.exe' -ArgumentList $arguments
+    })
+    return $grid
 }
 
 # ------------------------------------------------------------- add dialog ---
@@ -716,9 +822,20 @@ $actionBar.Controls.AddRange(@($btnAdd, $btnSettings, $btnLog, $btnClose))
 function New-LinkCard {
     param([object] $Link, [int] $Y)
 
+    # Scan at render time so the affordance is only present while conflict
+    # copies actually exist.  Pass summaries can be stale between background
+    # runs, whereas this inexpensive metadata-only inventory is current.
+    $duplicateCopies = if ($script:ConflictCopiesByLink.ContainsKey($Link.Id)) {
+        @($script:ConflictCopiesByLink[$Link.Id])
+    } else {
+        try { @(Get-LinkConflictCopies -Link $Link) } catch { @() }
+    }
+    $duplicatesExpanded = ($script:ExpandedDuplicateLink -eq $Link.Id -and $duplicateCopies.Count -gt 0)
+    $cardHeight = if ($duplicatesExpanded) { 398 } else { 116 }
+
     $card = New-Object System.Windows.Forms.Panel
     $card.Location  = New-Object System.Drawing.Point -ArgumentList 18, $Y
-    $card.Size      = New-Object System.Drawing.Size -ArgumentList 864, 116
+    $card.Size      = New-Object System.Drawing.Size -ArgumentList 864, $cardHeight
     $card.Anchor    = 'Top,Left,Right'
     $card.BackColor = $script:CardColor
     $card.Tag       = $Link.Id
@@ -737,10 +854,10 @@ function New-LinkCard {
     $card.Add_MouseEnter({ $this.BackColor = $script:CardHover })
     $card.Add_MouseLeave({ $this.BackColor = $script:CardColor })
 
-    $si = Get-StatusInfo -Link $Link
+    $si = Get-StatusInfo -Link $Link -ConflictCopies $duplicateCopies -ConflictCopiesChecked
     $stripe = New-Object System.Windows.Forms.Panel
     $stripe.Location = New-Object System.Drawing.Point -ArgumentList 0, 0
-    $stripe.Size = New-Object System.Drawing.Size -ArgumentList 5, 116
+    $stripe.Size = New-Object System.Drawing.Size -ArgumentList 5, $cardHeight
     $stripe.Anchor = 'Top,Bottom,Left'
     $stripe.BackColor = $si.Color
     $card.Controls.Add($stripe)
@@ -763,13 +880,13 @@ function New-LinkCard {
     $lblStatus.ForeColor = $si.Color
     $lblStatus.BackColor = [System.Drawing.Color]::Transparent
     $lblStatus.TextAlign = 'TopRight'
-    $lblStatus.Location = New-Object System.Drawing.Point -ArgumentList 489, 14
-    $lblStatus.Size = New-Object System.Drawing.Size -ArgumentList 110, 20
+    $lblStatus.Location = New-Object System.Drawing.Point -ArgumentList 604, 12
+    $lblStatus.Size = New-Object System.Drawing.Size -ArgumentList 240, 64
     $lblStatus.Anchor = 'Top,Right'
     $card.Controls.Add($lblStatus)
 
-    # The badge has room for a few words; the explanation of what to do about it
-    # lives in the tooltip.
+    # The badge shows the immediate reason; the tooltip retains the complete
+    # saved result and any suggested remedy.
     if ($si.Detail) {
         $tip = New-Object System.Windows.Forms.ToolTip
         $tip.AutoPopDelay = 20000
@@ -817,9 +934,36 @@ function New-LinkCard {
     $lblMeta.ForeColor = $script:TextMuted
     $lblMeta.BackColor = [System.Drawing.Color]::Transparent
     $lblMeta.Location = New-Object System.Drawing.Point -ArgumentList 20, 88
-    $lblMeta.Size = New-Object System.Drawing.Size -ArgumentList 510, 18
+    $lblMeta.Size = New-Object System.Drawing.Size -ArgumentList 488, 18
     $lblMeta.Anchor = 'Top,Left,Right'
     $card.Controls.Add($lblMeta)
+
+    if ($duplicateCopies.Count -gt 0) {
+        $btnDuplicates = New-Object System.Windows.Forms.Button
+        $btnDuplicates.Text = if ($duplicatesExpanded) { 'Hide' } else { 'Duplicates' }
+        $btnDuplicates.FlatStyle = 'Flat'
+        $btnDuplicates.BackColor = $script:BtnBg
+        $btnDuplicates.ForeColor = $script:TextPrimary
+        $btnDuplicates.Location = New-Object System.Drawing.Point -ArgumentList 514, 84
+        $btnDuplicates.Size = New-Object System.Drawing.Size -ArgumentList 84, 25
+        $btnDuplicates.Anchor = 'Top,Right'
+        $btnDuplicates.Tag = $Link.Id
+        $btnDuplicates.Add_Click({
+            $script:ExpandedDuplicateLink = if ($script:ExpandedDuplicateLink -eq $this.Tag) { $null } else { $this.Tag }
+            Update-Cards
+        })
+        $card.Controls.Add($btnDuplicates)
+
+        if ($duplicatesExpanded) {
+            $details = New-Object System.Windows.Forms.Panel
+            $details.Location = New-Object System.Drawing.Point -ArgumentList 20, 122
+            $details.Size = New-Object System.Drawing.Size -ArgumentList 824, 258
+            $details.Anchor = 'Top,Left,Right,Bottom'
+            $details.BackColor = $script:BgColor
+            $card.Controls.Add($details)
+            $details.Controls.Add((New-ConflictGrid -Copies $duplicateCopies))
+        }
+    }
 
     # Give the common double-click action a visible button as well.
     $btnOpen = New-Object System.Windows.Forms.Button
@@ -924,6 +1068,11 @@ function Update-Cards {
     $cardPanel.Controls.Clear()
     $links = @(Get-LinkRegistry)
     $sum = Read-PassSummarySafe
+    $script:ConflictCopiesByLink = @{}
+    foreach ($link in $links) {
+        try { $script:ConflictCopiesByLink[$link.Id] = @(Get-LinkConflictCopies -Link $link) }
+        catch { $script:ConflictCopiesByLink[$link.Id] = @() }
+    }
 
     $summaryLinks.Text = "{0} linked" -f $links.Count
     $summaryLastRun.Text = if ($sum) { $sum.When } else { 'Not run yet' }
@@ -940,7 +1089,11 @@ function Update-Cards {
         $summaryHealth.Text = 'Ready to add'
     }
     else {
-        $attention = @($links | Where-Object { (Get-StatusInfo -Link $_).Text -ne 'Up to date' }).Count
+        $attention = @($links | Where-Object {
+            $status = Get-StatusInfo -Link $_ -ConflictCopies $script:ConflictCopiesByLink[$_.Id] -ConflictCopiesChecked
+            if ($status.ContainsKey('Attention')) { return [bool]$status.Attention }
+            return $status.Text -ne 'Up to date'
+        }).Count
         $summaryHealth.ForeColor = if ($attention -gt 0) { $script:StatusAmber } else { $script:StatusGreen }
         $summaryHealth.Text = if ($attention -eq 1) { '1 needs attention' }
                               elseif ($attention -gt 1) { "{0} need attention" -f $attention }
@@ -966,7 +1119,7 @@ function Update-Cards {
     foreach ($l in $links) {
         $card = New-LinkCard -Link $l -Y $y
         $cardPanel.Controls.Add($card)
-        $y += 128
+        $y += $card.Height + 12
     }
 
     $base = if ($sum) { "Last sync {0} - {1} change(s), {2} conflict(s)" -f $sum.When, $sum.Applied, $sum.Conflicts }
@@ -995,6 +1148,16 @@ $timer.Add_Tick({
     }
 })
 
+# Conflict copies can be resolved in Explorer while the dashboard is open.
+# Rebuild the cards periodically so the duplicate badge/list disappears without
+# requiring a sync or a close-and-reopen of this window.
+$duplicateRefreshTimer = New-Object System.Windows.Forms.Timer
+$duplicateRefreshTimer.Interval = 5000
+$duplicateRefreshTimer.Add_Tick({
+    if (-not $script:Child) { Update-Cards }
+})
+$duplicateRefreshTimer.Start()
+
 $btnAdd.Add_Click({
     if ((Show-AddDialog -Owner $form) -eq [System.Windows.Forms.DialogResult]::OK) { Update-Cards }
 })
@@ -1003,7 +1166,9 @@ $btnSync.Add_Click({
     if ($script:Child) { return }
     $btnSync.Enabled = $false; $btnAdd.Enabled = $false
     $statusLabel.Text = 'Syncing...'
-    $script:Child = Start-Cli -CliArgs @('run')
+    # Wait for an existing scheduled or tray pass so an explicit dashboard
+    # retry is not discarded merely because it arrived while one was finishing.
+    $script:Child = Start-Cli -CliArgs @('run', '-WaitForPass')
     $timer.Start()
 })
 
@@ -1020,4 +1185,5 @@ $btnLog.Add_Click({
 $btnClose.Add_Click({ $form.Close() })
 
 $form.Add_Shown({ Update-Cards })
+[void]$form.Add_FormClosed({ $duplicateRefreshTimer.Stop(); $duplicateRefreshTimer.Dispose() })
 [void]$form.ShowDialog()

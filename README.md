@@ -135,6 +135,13 @@ the clock. Right-click it for sync-now, pause, settings and the log; double-clic
 for the dashboard, which shows each folder pair as a card with its status, paths
 and last sync.
 
+When conflict copies exist, a card's **Duplicates** section expands within the
+dashboard to list them alongside their original filenames and paths. It checks
+both folders when opened, even for paused pairs.
+CLI `status` shows the same list. The tray continues to warn while conflict copies
+remain, using the last pass's snapshot. These are the timestamped copies DriveRelay
+creates to preserve both versions when a file changes in both places.
+
 > Windows 11 hides new tray icons behind the chevron next to the clock. Drag it
 > onto the taskbar to keep it visible.
 

@@ -12,6 +12,7 @@
 #>
 
 $script:PassMutexName = 'Global\DriveRelayPass'
+. (Join-Path $PSScriptRoot 'Conflicts.ps1')
 $script:DefaultStateRoot = if ($PSScriptRoot) { Join-Path (Split-Path -Parent $PSScriptRoot) 'state' } else { 'state' }
 
 # How long a run of idle passes may go unmentioned before one heartbeat line is
@@ -58,6 +59,8 @@ function Write-PassSummary {
             Deleted    = [int](($r | Measure-Object -Property Deleted   -Sum).Sum)
             Failed     = [int](($r | Measure-Object -Property Failed    -Sum).Sum)
             Aborted    = @($r | Where-Object { $_.Aborted } | ForEach-Object { "$($_.LinkId): $($_.Message)" })
+            ConflictCopies = @($r | Where-Object { $_.PSObject.Properties['ConflictCopies'] } |
+                ForEach-Object { $_.ConflictCopies })
 
             # Availability is reported separately from failure. A drive that is
             # not plugged in is not a sync error, and calling it one trains
@@ -103,6 +106,7 @@ function Invoke-SyncPass {
         [string]   $LinkId,
         [string[]] $ExcludePatterns,
         [string]   $StateRoot = $script:DefaultStateRoot,
+        [int]      $WaitForLockSeconds = 0,
         [switch]   $Quiet
     )
 
@@ -128,7 +132,7 @@ function Invoke-SyncPass {
     }
 
     try {
-        try   { $held = $mutex.WaitOne(0) }
+        try   { $held = $mutex.WaitOne([TimeSpan]::FromSeconds([Math]::Max(0, $WaitForLockSeconds))) }
         catch [System.Threading.AbandonedMutexException] {
             # A previous pass died without releasing. We now hold it.
             $held = $true
@@ -164,6 +168,12 @@ function Invoke-SyncPass {
             $wasSeeded = $link.Seeded
             try {
                 $r = Invoke-LinkSync -Link $link -ExcludePatterns $ExcludePatterns -StateRoot $StateRoot
+                $copies = @()
+                try { $copies = @(Get-LinkConflictCopies -Link $link) }
+                catch {
+                    Write-Log ("could not list conflict copies for {0}: {1}" -f $link.Id, $_.Exception.Message) 'WARN'
+                }
+                $r | Add-Member -NotePropertyName ConflictCopies -NotePropertyValue $copies -Force
 
                 if ($PSCmdlet.ShouldProcess($link.Id, 'record link state')) {
                     $msg = if ($r.Aborted) { "aborted: $($r.Message)" } else { $r.Message }

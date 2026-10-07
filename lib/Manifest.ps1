@@ -98,12 +98,16 @@ function Read-Manifest {
 }
 
 function ConvertFrom-IsoUtc {
-    param([string] $Value)
+    param([object] $Value)
     if ([string]::IsNullOrWhiteSpace($Value)) { return [datetime]::MinValue }
     try {
-        return [datetime]::Parse($Value,
+        # Windows PowerShell's ConvertFrom-Json turns ISO timestamps into
+        # local DateTime objects. Keep that Kind long enough to convert back;
+        # declaring this parameter as [string] first silently discarded it.
+        if ($Value -is [datetime]) { return $Value.ToUniversalTime() }
+        return [datetime]::Parse([string]$Value,
                                  [Globalization.CultureInfo]::InvariantCulture,
-                                 [Globalization.DateTimeStyles]::RoundtripKind)
+                                 [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
     }
     catch { return [datetime]::MinValue }
 }

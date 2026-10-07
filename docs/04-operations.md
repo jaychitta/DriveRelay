@@ -129,6 +129,19 @@ company files for as long as a company is open; that is intended and protects th
 **A conflict copy appeared.** Both versions were kept. Open both, decide, delete the one you do
 not want. The next pass propagates the deletion.
 
+Cards show a **Duplicates** button only while conflict copies exist; it expands the list within
+the dashboard. Use it or CLI `status` to see which original
+file each conflict copy belongs to and its paths on both sides. The list checks
+both folders live when opened, including paused pairs. Copies present on both
+sides appear once. The dashboard shows original and duplicate filenames directly
+in rows, with **Open folder** buttons for each available local/remote copy. Explorer
+opens the containing folder and selects the duplicate. A missing copy is labelled
+**Not present**. Original paths
+identify the original filename and do not guarantee that file still exists.
+The tray warns while copies remain, using the last background pass's snapshot.
+This recognizes DriveRelay's `(conflict from <provider> <timestamp>)` names;
+renamed duplicates no longer appear, and ordinary duplicate content is not scanned.
+
 **Nothing is syncing at all.** Check the tray is running and not paused, then check
 `driverelay.log`. A run of passes with nothing to do logs one line an hour —
 `idle: 6 pass(es) since 09:10:00, nothing to relay` — so more than an hour of complete

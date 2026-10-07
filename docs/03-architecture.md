@@ -85,6 +85,14 @@ brought down beside the local one under a name like
 current. The conflict copy has no manifest entry, so the next pass sees it as a new local file
 and carries it across on its own.
 
+`lib/Conflicts.ps1` recognizes existing copies by that timestamped naming format
+on either side. It groups the same relative copy name across both folders, reports
+the original name and actual copy paths, and never reads content. CLI `status` and
+the dashboard's expandable **Duplicates** section list these copies live. Background passes
+store `ConflictCopies` in `lastpass.json` so the tray continues warning after the
+creation pass. Removing a copy clears it from the next scan; renamed copies no
+longer match. This inventory does not change replication decisions.
+
 ## Settle model
 
 A file is eligible only when it is **unlocked** and **unmodified for the settle window**

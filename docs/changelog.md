@@ -2,6 +2,39 @@
 
 All notable changes to DriveRelay (formerly SyncOrchestrator) will be documented in this file.
 
+## [Unreleased] - 2026-10-07 — identify DriveRelay conflict duplicates
+
+### Updated
+- Dashboard conflict duplicates now expand within their folder-pair card instead of opening
+  a separate window. The **Duplicates** control is shown only when a live scan finds copies.
+  The dashboard refreshes that inventory while open, so resolving a copy removes it promptly.
+- Duplicates now displays original and duplicate filenames directly in a table,
+  with per-copy **Open folder** buttons that select the duplicate in Explorer.
+  Missing local/remote copies are labelled **Not present**.
+- An aborted link's dashboard card now shows its saved abort reason (such as a
+  delete limit being exceeded), rather than the generic **Needs attention**.
+  Delete-limit warnings use concise, grammatical wording. Once a higher limit
+  is saved, the stale warning becomes a neutral **Ready to sync** state.
+- **Sync all now** waits for an in-progress pass before retrying, so a manual
+  retry uses recently saved link settings instead of silently skipping.
+
+### Fixed
+- Manifest timestamps read from Windows PowerShell JSON retain their UTC instant
+  instead of being shifted by the local timezone.
+
+### Added
+- Dashboard **Duplicates** and CLI `status` list existing conflict copies with
+  original filenames and paths. Metadata-only scans cover both linked folders and
+  group a copy present on both sides into one entry.
+- Background passes retain `ConflictCopies` in `lastpass.json`; the dashboard and
+  tray warn while copies remain, rather than only when a pass creates them.
+- Regression coverage for naming, original/copy pairing, remote-only copies,
+  grouping, removal and summary serialization.
+
+### Limitations
+- Recognizes DriveRelay's timestamped conflict naming format. Renamed files no
+  longer match. The list checks live when opened; tray counts use the latest pass.
+
 ## [Unreleased] - 2026-09-08 — cap how long a rotated log is kept, by age not just size
 
 Requested by Jayadheer Chitta: size-based rotation (added 2026-08-12) bounds the log by MB,

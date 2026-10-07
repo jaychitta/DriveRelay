@@ -404,6 +404,10 @@ Assert-Equal $res.Conflicts 1 "Conflict was forked, not resolved"
 
 $forks = @(Get-ChildItem -LiteralPath $ctx.Local -File | Where-Object { $_.Name -like '*conflict*' })
 Assert-Equal $forks.Count 1 "A conflict copy was written beside the local file"
+. (Join-Path $root 'lib\Conflicts.ps1')
+$actualForkCopies = @(Get-LinkConflictCopies -Link $ctx.Link)
+Assert-Equal $actualForkCopies.Count 1 "Duplicate inventory finds the copy created by the real conflict action"
+Assert-Equal $actualForkCopies[0].OriginalRelPath 'doc.txt' "Real conflict copy is paired with its original filename"
 if ($forks.Count -eq 1) {
     Assert-Equal (Get-Content -LiteralPath $forks[0].FullName -Raw) 'REMOTE VERSION' "Conflict copy holds the remote version"
 }
@@ -690,6 +694,53 @@ Assert-True (-not $legacyRead.PSObject.Properties['IdleCount']) "Legacy summary 
 
 if (Test-Path $passStateRoot) { Remove-Item -LiteralPath $passStateRoot -Recurse -Force -ErrorAction SilentlyContinue }
 
+# Existing conflict duplicate inventory.
+Write-Host 'Testing conflict duplicate reporting' -ForegroundColor Yellow
+. (Join-Path $root 'lib\Conflicts.ps1')
+$duplicateTestRoot = Join-Path $testDir 'conflict-report-fixture'
+$duplicateLocal = Join-Path $duplicateTestRoot 'local'
+$duplicateRemote = Join-Path $duplicateTestRoot 'remote'
+$null = New-Item -ItemType Directory -Path $duplicateLocal,$duplicateRemote -Force
+$duplicateLink = [pscustomobject]@{ Id = 'Duplicates'; LocalPath = $duplicateLocal; RemotePath = $duplicateRemote; Enabled = $false }
+try {
+    $copyName = 'Book.v2 (conflict from OneDrive 2026-10-07 123456).xlsx'
+    $remoteOnly = 'notes (conflict from Google Drive 2026-10-07 123457)'
+    Set-Content -LiteralPath (Join-Path $duplicateLocal $copyName) -Value 'saved remote version'
+    Set-Content -LiteralPath (Join-Path $duplicateRemote $copyName) -Value 'saved remote version'
+    Set-Content -LiteralPath (Join-Path $duplicateLocal 'Book.v2.xlsx') -Value 'current local version'
+    Set-Content -LiteralPath (Join-Path $duplicateRemote $remoteOnly) -Value 'remote-only copy'
+    Set-Content -LiteralPath (Join-Path $duplicateLocal 'some conflict notes.txt') -Value 'ordinary file'
+    $copies = @(Get-LinkConflictCopies -Link $duplicateLink)
+    Assert-Equal $copies.Count 2 'Conflict copies on both sides are grouped, even for paused links'
+    $bookCopy = $copies | Where-Object CopyRelPath -eq $copyName
+    Assert-Equal $bookCopy.OriginalRelPath 'Book.v2.xlsx' 'Duplicate is paired with original dotted filename'
+    Assert-Equal $bookCopy.CopyLocalPath (Join-Path $duplicateLocal $copyName) 'Duplicate includes actual local path'
+    Assert-Equal $bookCopy.CopyRemotePath (Join-Path $duplicateRemote $copyName) 'Duplicate includes actual remote path'
+    Assert-Equal $bookCopy.OriginalLocalPath (Join-Path $duplicateLocal 'Book.v2.xlsx') 'Original working path is included'
+    Assert-Equal ($copies | Where-Object CopyRelPath -eq $remoteOnly).OriginalRelPath 'notes' 'Extensionless remote-only copy is paired correctly'
+    Assert-Equal ($copies | Where-Object CopyRelPath -eq $remoteOnly).CopyLocalPath '' 'Absent local duplicate is not claimed to exist'
+    Assert-True ((Format-ConflictCopies -Copies $copies) -like '*Duplicate local:  (not present)*') 'Formatted list identifies missing copies'
+    $idleOutcome.Results[0] | Add-Member -NotePropertyName ConflictCopies -NotePropertyValue $copies -Force
+    Write-PassSummary -Outcome $idleOutcome -StateRoot $passStateRoot
+    Assert-Equal @((Read-PassSummary -StateRoot $passStateRoot).ConflictCopies).Count 2 'Existing duplicate list survives pass-summary JSON'
+    Remove-Item -LiteralPath (Join-Path $duplicateLocal $copyName),(Join-Path $duplicateRemote $copyName) -Force
+    $copies = @(Get-LinkConflictCopies -Link $duplicateLink)
+    Assert-Equal $copies.Count 1 'Removing copies removes the inventory entry'
+    $idleOutcome.Results[0].ConflictCopies = $copies
+    Write-PassSummary -Outcome $idleOutcome -StateRoot $passStateRoot
+    Assert-Equal @((Read-PassSummary -StateRoot $passStateRoot).ConflictCopies).Count 1 'Single duplicate stays an array in JSON'
+    Remove-Item -LiteralPath (Join-Path $duplicateRemote $remoteOnly) -Force
+    Assert-Equal @(Get-LinkConflictCopies -Link $duplicateLink).Count 0 'Ordinary filenames containing conflict are not duplicates'
+    $idleOutcome.Results[0].ConflictCopies = @()
+    Write-PassSummary -Outcome $idleOutcome -StateRoot $passStateRoot
+    Assert-Equal @((Read-PassSummary -StateRoot $passStateRoot).ConflictCopies).Count 0 'Cleared duplicate list persists an empty array'
+} finally {
+    foreach ($cleanupPath in @($duplicateTestRoot, $passStateRoot)) {
+        $resolvedCleanup = [IO.Path]::GetFullPath($cleanupPath)
+        if (-not $resolvedCleanup.StartsWith(([IO.Path]::GetFullPath($testDir) + '\'), [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe test cleanup path' }
+        if (Test-Path -LiteralPath $resolvedCleanup) { Remove-Item -LiteralPath $resolvedCleanup -Recurse -Force }
+    }
+}
 # Summary
 Write-Host ''
 Write-Host "=========================================" -ForegroundColor Cyan

@@ -61,6 +61,9 @@ param(
     [switch] $Detailed,
     [switch] $NoDehydrate,
     [switch] $HydrateBeforeDelete,
+    # Used by the dashboard's explicit retry. It waits for a pass already in
+    # progress instead of silently giving up at the mutex.
+    [switch] $WaitForPass,
     [int]    $IntervalMinutes,
 
     [ValidateSet('DEBUG','INFO','WARN','ERROR')]
@@ -88,6 +91,7 @@ $script:Typed = $PSBoundParameters
 . (Join-Path $root 'lib\Provider.ps1')
 . (Join-Path $root 'lib\Availability.ps1')
 . (Join-Path $root 'lib\Hydration.ps1')
+. (Join-Path $root 'lib\Conflicts.ps1')
 . (Join-Path $root 'lib\Settle.ps1')
 . (Join-Path $root 'lib\Registry.ps1')
 . (Join-Path $root 'lib\Manifest.ps1')
@@ -337,7 +341,8 @@ function Invoke-SyncCommand {
     }
 
     $patterns = Get-ExcludePatterns
-    $outcome  = Invoke-SyncPass -LinkId $linkId -ExcludePatterns $patterns -StateRoot $script:StateRoot -Quiet:$Silent
+    $outcome  = Invoke-SyncPass -LinkId $linkId -ExcludePatterns $patterns -StateRoot $script:StateRoot -Quiet:$Silent `
+        -WaitForLockSeconds $(if ($WaitForPass) { 900 } else { 0 })
 
     if ($Silent) { return }
 
@@ -521,6 +526,15 @@ function Invoke-StatusCommand {
         $items = Compare-LinkState -Link $link -ExcludePatterns $patterns -StateRoot $script:StateRoot
         $pending = @($items | Where-Object { $_.Action -ne 'InSync' -and $_.Action -ne 'Forget' })
 
+        try {
+            $copies = @(Get-LinkConflictCopies -Link $link)
+            if ($copies.Count -gt 0) {
+                "    {0} conflict duplicate(s) to review:" -f $copies.Count
+                Format-ConflictCopies -Copies $copies
+            }
+        } catch {
+            "    Could not list all conflict copies: {0}" -f $_.Exception.Message
+        }
         if ($pending.Count -eq 0) { '    up to date'; continue }
 
         "    {0} pending:" -f $pending.Count

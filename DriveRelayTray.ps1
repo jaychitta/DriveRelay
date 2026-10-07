@@ -34,6 +34,7 @@ Add-Type -AssemblyName System.Drawing
 . (Join-Path $root 'lib\Icons.ps1')
 . (Join-Path $root 'lib\Settings.ps1')
 . (Join-Path $root 'lib\Provider.ps1')
+. (Join-Path $root 'lib\Conflicts.ps1')
 . (Join-Path $root 'lib\Registry.ps1')
 . (Join-Path $root 'lib\Availability.ps1')
 
@@ -115,6 +116,16 @@ function Get-LinkCount {
     } catch { return 0 }
 }
 
+function Get-LiveConflictCopyCount {
+    $count = 0
+    try {
+        foreach ($link in @(Get-LinkRegistry)) {
+            $count += @(Get-LinkConflictCopies -Link $link).Count
+        }
+    } catch { }
+    return $count
+}
+
 # ------------------------------------------------------------------- menu ---
 
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
@@ -191,6 +202,12 @@ function Update-StatusLine {
 
     $s = Read-Summary
     $lc = Get-LinkCount
+    $duplicateCount = Get-LiveConflictCopyCount
+    if ($duplicateCount -gt 0) {
+        $miStatus.Text = "{0} conflict duplicate(s) - open Dashboard" -f $duplicateCount
+        if (-not $script:Paused) { Set-TrayState -State 'warn' -Tip ("DriveRelay - {0} duplicate(s) to review" -f $duplicateCount) }
+        return
+    }
     if (-not $s) {
         $miStatus.Text = if ($lc -gt 0) { "{0} link(s) ready" -f $lc } else { 'No links' }
         return
@@ -262,7 +279,19 @@ function Complete-Pass {
         Set-TrayState -State 'warn' -Tip 'DriveRelay - needs attention'
         $miStatus.Text = "Needs attention - {0} conflict(s)" -f $s.Conflicts
     }
+    elseif ($s.PSObject.Properties['ConflictCopies'] -and @($s.ConflictCopies).Count -gt 0) {
+        Update-StatusLine
+        $duplicateStamp = 'DUPLICATES|' + (($s.ConflictCopies | Sort-Object LinkId, CopyRelPath | ForEach-Object { "$($_.LinkId)|$($_.CopyRelPath)" }) -join ';')
+        if ($duplicateStamp -ne $script:LastSeen) {
+            $script:LastSeen = $duplicateStamp
+            $notify.BalloonTipTitle = 'DriveRelay - conflict duplicates'
+            $notify.BalloonTipText = "{0} duplicate(s) to review. Open Dashboard > Duplicates for original and copy paths." -f @($s.ConflictCopies).Count
+            $notify.BalloonTipIcon = 'Warning'
+            $notify.ShowBalloonTip(8000)
+        }
+    }
     else {
+        $script:LastSeen = $null
         Set-TrayState -State 'idle' -Tip 'DriveRelay - up to date'
         if ($s.Applied -gt 0) {
             $time = if ($s.When.Length -ge 16) { $s.When.Substring(11, 5) } else { $s.When }
