@@ -43,8 +43,15 @@ This tool moves and deletes real files, so the rules are worth stating plainly.
   download per file.
 - **Conflicts keep both versions.** If both sides changed, the remote version is
   saved alongside the local one under a conflict name and nothing is discarded.
+- **Deletions are not undone by possible edits.** When a previously synced file
+  is deleted on one side and the other copy's metadata changed, DriveRelay leaves
+  the deletion intact and preserves the surviving copy for review. The dashboard's
+  **Review** button lists paths and resolution guidance.
 - **Copies are atomic.** Content goes to a temp name and is moved into place, so
   a half-copied file is never visible as a complete one.
+- **Recognized moves stay moves.** Moving or renaming an unchanged file within
+  either linked folder moves its counterpart to the matching path. NTFS identity
+  proves the match; DriveRelay never guesses from filename, size or time alone.
 - **Files in use are left alone.** A file still being written, or held open by an
   application, is deferred to a later pass — it is never copied mid-write.
 - **`check` writes nothing.** Run it before `sync`, and `sync -WhatIf` before
@@ -83,10 +90,37 @@ it is merely degraded, with the full explanation in the tooltip.
 
 ## Install
 
+Double-click **`DriveRelay-Setup-1.0.0.exe`** from the release package. The wizard
+installs for your Windows account, normally in
+`%LOCALAPPDATA%\Programs\DriveRelay`, with a Start Menu entry and optional
+Windows startup and desktop shortcuts. No administrator rights are needed.
+Choose **Start DriveRelay** on the final page to launch the tray agent.
+
+Exit an existing DriveRelay tray agent and let any sync finish before upgrading;
+setup checks for both and asks you to close them before changing application files.
+Installing over an existing standalone installation preserves its links,
+preferences, sync history, logs and customized exclusion patterns. A new install
+starts with no linked folders; personal configuration is never in the installer.
+For everyday usage, see the [operating guide](docs/04-operations.md).
+
+To remove a packaged installation, use **Windows Settings > Apps > Installed
+apps > DriveRelay > Uninstall**, or **Uninstall DriveRelay** in the Start Menu.
+Uninstall removes application files and shortcuts while keeping settings, links,
+sync history, logs and exclusion patterns for a future reinstall. It never
+touches the files inside your linked folders.
+
+### Setting up from source
+
 Download or clone the repository, then double-click **`Setup.cmd`**.
 
 It creates a Start Menu entry, an optional Windows startup entry, and a hidden
-launcher for the tray agent. Options are passed straight through:
+launcher for the tray agent.
+
+The installer builds `DriveRelay.exe` using the .NET Framework compiler included
+with Windows. Startup apps in Task Manager identifies this launcher as
+**DriveRelay**. Rerun Setup to update an older shortcut that displays `wscript`.
+
+Options are passed straight through:
 
 ```
 Setup.cmd -IntervalMinutes 5
@@ -96,6 +130,26 @@ Setup.cmd -NoAutoStart
 To remove it again, double-click **`Uninstall.cmd`**. That takes away the
 shortcuts and the tray agent and leaves your links, your sync history and every
 file in every linked folder exactly as they are.
+
+### Building the installer
+
+Install [Inno Setup 6](https://jrsoftware.org/isinfo.php) on the build machine, then:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\New-Installer.ps1
+```
+
+The build produces `dist\DriveRelay-Setup-1.0.0.exe`, a SHA-256 checksum file and
+a payload inventory. `-Version 1.0.1`, `-OutputDirectory <path>` and
+`-CompilerPath <path-to-ISCC.exe>` are optional. The launcher is compiled freshly
+in an isolated staging folder. Only explicitly listed application files are
+packaged; live settings, links, sync state, logs and test files are excluded.
+The output is unsigned unless a separate signing process is applied.
+
+Run `tests\Test-Installer.ps1` with Windows PowerShell to rebuild and verify
+installation, upgrading, options and data-preserving removal. The verification
+installer remaps its shortcuts into scratch folders and disables Windows
+uninstall registration, so it does not change your live installation.
 
 ## Use
 
@@ -164,12 +218,33 @@ the shapes.
 `config/excludes.txt` holds wildcard patterns matched against file names —
 Office lock files, `*.tmp`, `Thumbs.db` and so on.
 
+### Moving files and folders
+
+Move files between subfolders or rename them on either side as usual. After a
+successful sync has recorded their filesystem identities, DriveRelay recognizes
+unchanged NTFS files at their new paths and moves the other copies without
+recopying content. A populated folder move is applied file by file; folders left
+empty by those moves are removed. Empty folders are still not tracked.
+
+`check` and `status` show `MoveLocal` or `MoveRemote` with the old and new paths.
+Proven moves do not count as deletions against `MaxDelete`. Files must be settled
+and unlocked, and a destination collision or a change since planning defers the
+move. Moves never overwrite a file or copy across volumes.
+
+Existing links collect identities during their next successful ordinary pass.
+Moves made before that baseline, files changed while moving, cross-volume moves,
+hard links, and providers that do not expose usable NTFS identities use the
+existing copy/delete/conflict rules. Cloud placeholders are queried through
+metadata handles without reading their contents; provider-specific cloud upload
+behavior remains the desktop client's responsibility.
+
 ## Project layout
 
 ```
 DriveRelay.ps1        CLI and command router
 DriveRelayTray.ps1    System tray agent
 DriveRelayUI.ps1      Dashboard window
+DriveRelay.exe        Generated silent launcher with DriveRelay branding
 OneDriveGate.ps1      Optional: hold the OneDrive client off during work hours
 Setup.cmd             Double-clickable installer
 Uninstall.cmd         Double-clickable uninstaller
@@ -180,6 +255,7 @@ lib/                  Actions, Hydration, Icons, Logging, Manifest, Pass,
 config/               settings, links, exclude patterns
 docs/                 rationale, architecture, operations, runbook, audit
 tests/                regression suite
+tools/                icon generator and launcher source/build script
 LICENSE               MIT
 ```
 
@@ -189,10 +265,10 @@ LICENSE               MIT
 powershell -ExecutionPolicy Bypass -File .\tests\Test-DriveRelay.ps1
 ```
 
-51 assertions. Alongside settings persistence, the link registry and icon
+Assertions cover settings persistence, the link registry and icon
 generation, the suite covers the parts that can lose data:
 
-- the full `Compare-LinkState` classification table — all eight outcomes,
+- the `Compare-LinkState` classification table,
   including the deleted-here-but-edited-there cases where guessing wrong either
   resurrects deleted files or destroys new ones
 - the `MaxDelete` abort, including the exactly-at-the-limit boundary, asserting
@@ -200,6 +276,10 @@ generation, the suite covers the parts that can lose data:
 - conflict forking — that both versions survive and which one ends up where
 - manifest round-tripping, including the empty-array and single-entry JSON
   shapes the code carries explicit workarounds for
+- deletion conflicts, surviving-copy preservation, persistent review details,
+  and destination deletions before and during a queued copy
+- moves in both directions, populated folder renames, retained file identities,
+  collisions, queued changes, locked and unsettled files, and legacy baselines
 
 Tests log to `tests/test-run.log` and never to the production log. They do use
 the real Recycle Bin, since that is the delete path under test.

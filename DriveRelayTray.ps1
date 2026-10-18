@@ -202,6 +202,12 @@ function Update-StatusLine {
 
     $s = Read-Summary
     $lc = Get-LinkCount
+    if ($s -and $s.PSObject.Properties['DeletionConflicts'] -and @($s.DeletionConflicts).Count -gt 0) {
+        $deletionCount = @($s.DeletionConflicts).Count
+        $miStatus.Text = "{0} deletion conflict(s) - open Dashboard > Review" -f $deletionCount
+        if (-not $script:Paused) { Set-TrayState -State 'warn' -Tip ("DriveRelay - {0} deletion conflict(s) to review" -f $deletionCount) }
+        return
+    }
     $duplicateCount = Get-LiveConflictCopyCount
     if ($duplicateCount -gt 0) {
         $miStatus.Text = "{0} conflict duplicate(s) - open Dashboard" -f $duplicateCount
@@ -300,13 +306,18 @@ function Complete-Pass {
         else { Update-StatusLine }
     }
 
-    $stamp = "$($s.When)|$($s.Conflicts)|$($s.Failed)|$(@($s.Aborted).Count)"
+    $deletionCount = if ($s.PSObject.Properties['DeletionConflicts']) { @($s.DeletionConflicts).Count } else { 0 }
+    $stamp = if ($deletionCount -gt 0 -and $s.Conflicts -eq $deletionCount -and $s.Failed -eq 0 -and @($s.Aborted).Count -eq 0) {
+        'DELETIONS|' + (($s.DeletionConflicts | Sort-Object LinkId, RelPath | ForEach-Object { "$($_.LinkId)|$($_.RelPath)|$($_.DeletedSide)" }) -join ';')
+    } else { "$($s.When)|$($s.Conflicts)|$($s.Failed)|$(@($s.Aborted).Count)" }
     if ($trouble -and $stamp -ne $script:LastSeen) {
         $script:LastSeen = $stamp
 
         $lines = @()
+        $deletionCount = if ($s.PSObject.Properties['DeletionConflicts']) { @($s.DeletionConflicts).Count } else { 0 }
         if ($s.Conflicts -gt 0) {
-            $lines += "{0} file(s) changed in both places. Both versions were kept." -f $s.Conflicts
+            if ($s.Conflicts -gt $deletionCount) { $lines += "{0} file(s) changed in both places. Both versions were kept." -f ($s.Conflicts - $deletionCount) }
+            if ($deletionCount -gt 0) { $lines += "{0} deletion conflict(s). Surviving copies preserved. Open Dashboard > Review." -f $deletionCount }
         }
         if (@($s.Aborted).Count -gt 0) { $lines += [string]($s.Aborted -join '; ') }
         if ($s.Failed -gt 0)           { $lines += "{0} file(s) could not be copied." -f $s.Failed }

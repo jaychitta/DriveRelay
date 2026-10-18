@@ -22,6 +22,7 @@
 # Filesystem timestamps are not exact across copies; treat writes within this
 # many seconds of each other as the same moment.
 $script:TimeToleranceSeconds = 2
+. (Join-Path $PSScriptRoot 'FileIdentity.ps1')
 $script:DefaultStateRoot = if ($PSScriptRoot) { Join-Path (Split-Path -Parent $PSScriptRoot) 'state' } else { 'state' }
 
 function Get-SideSnapshot {
@@ -52,6 +53,7 @@ function Get-SideSnapshot {
                 Length    = $_.Length
                 WriteUtc  = $_.LastWriteTimeUtc
                 IsOffline = [bool](([int] $_.Attributes) -band 0x1000)
+                FileId    = Get-FileIdentity -Path $_.FullName
             }
         }
 
@@ -62,6 +64,18 @@ function Get-ManifestPath {
     param([Parameter(Mandatory)][string] $LinkId,
           [string] $StateRoot = $script:DefaultStateRoot)
     return (Join-Path (Join-Path $StateRoot $LinkId) 'manifest.json')
+}
+
+function Get-ExistingCopyParent {
+    # Remember the closest existing destination directory at planning time.
+    # Its disappearance during a long pass is a deletion, not permission to
+    # recreate it for a previously planned copy.
+    param([Parameter(Mandatory)][string] $Path)
+    $parent = Split-Path -Parent $Path
+    while ($parent -and -not (Test-Path -LiteralPath $parent -PathType Container)) {
+        $parent = Split-Path -Parent $parent
+    }
+    return $parent
 }
 
 function Read-Manifest {
@@ -92,6 +106,8 @@ function Read-Manifest {
             LocalWriteUtc = ConvertFrom-IsoUtc $e.LocalWriteUtc
             OdLength     = [int64] $e.OdLength
             OdWriteUtc   = ConvertFrom-IsoUtc $e.OdWriteUtc
+            LocalFileId  = $e.LocalFileId
+            OdFileId     = $e.OdFileId
         }
     }
     return $map
@@ -133,6 +149,8 @@ function Write-Manifest {
             LocalWriteUtc = ConvertTo-IsoUtc $e.LocalWriteUtc
             OdLength      = $e.OdLength
             OdWriteUtc    = ConvertTo-IsoUtc $e.OdWriteUtc
+            LocalFileId   = $e.LocalFileId
+            OdFileId      = $e.OdFileId
         }
     }
 
@@ -173,9 +191,12 @@ function Compare-LinkState {
           InSync         nothing to do
           CopyToRemote local is newer or new
           CopyToLocal    remote side is newer or new
+          MoveRemote     unchanged tracked file moved locally
+          MoveLocal      unchanged tracked file moved remotely
           DeleteLocal    removed on the remote side, local unchanged since
           DeleteRemote removed locally, remote side unchanged since
           Conflict       both sides changed since the last pass -- keep both
+          DeletionConflict one side deleted, survivor metadata changed -- review
 
         Deletion is only ever proposed when the manifest proves the file
         existed at the last pass. Absence alone never causes a delete.
@@ -234,8 +255,8 @@ function Compare-LinkState {
                 $action = 'DeleteLocal'; $reason = 'deleted on remote side, local unchanged'
             }
             else {
-                # Deleted there, edited here. Keep the edit.
-                $action = 'CopyToRemote'; $reason = 'deleted on remote side but edited locally, keeping local'
+                # Preserve the possible edit without undoing the deletion.
+                $action = 'DeletionConflict'; $reason = 'deleted on remote side but local metadata changed; review required'
             }
         }
         elseif ($O -and -not $L) {
@@ -246,7 +267,7 @@ function Compare-LinkState {
                 $action = 'DeleteRemote'; $reason = 'deleted locally, remote side unchanged'
             }
             else {
-                $action = 'CopyToLocal'; $reason = 'deleted locally but edited on remote side, keeping remote'
+                $action = 'DeletionConflict'; $reason = 'deleted locally but remote metadata changed; review required'
             }
         }
         else {
@@ -261,10 +282,51 @@ function Compare-LinkState {
             Local     = $L
             Remote    = $O
             Manifest  = $M
+            LocalParent = if ($action -in @('CopyToLocal','Conflict')) { Get-ExistingCopyParent -Path (Join-Path $Link.LocalPath $rel) } else { $null }
+            RemoteParent = if ($action -in @('CopyToRemote','Conflict')) { Get-ExistingCopyParent -Path (Join-Path (Get-RemotePath -Link $Link) $rel) } else { $null }
         })
     }
 
-    return ,@($results | Sort-Object Action, RelPath)
+    # Pair a tracked disappearance with a new path only when the moving side's
+    # NTFS ID survived and BOTH versions still match their own baseline. Size
+    # and time alone cannot prove a move. Require unique IDs, including history,
+    # so hard links or a suspect manifest cannot choose the wrong counterpart.
+    $paired = @{}
+    foreach ($direction in @('Remote', 'Local')) {
+        $side = if ($direction -eq 'Remote') { 'Local' } else { 'Remote' }
+        $idField = if ($side -eq 'Local') { 'LocalFileId' } else { 'OdFileId' }
+        $lengthField = if ($side -eq 'Local') { 'LocalLength' } else { 'OdLength' }
+        $writeField = if ($side -eq 'Local') { 'LocalWriteUtc' } else { 'OdWriteUtc' }
+        $ids = @{}
+        foreach ($row in $results) {
+            $snapshot = $row.$side
+            if ($snapshot -and $snapshot.FileId) {
+                if (-not $ids.ContainsKey($snapshot.FileId)) { $ids[$snapshot.FileId] = @() }
+                $ids[$snapshot.FileId] += $row
+            }
+        }
+        $historyCounts = @{}
+        foreach ($entry in $manifest.Values) {
+            if ($entry.$idField) { $historyCounts[$entry.$idField]++ }
+        }
+        foreach ($old in $results) {
+            if ($old.Action -ne "Delete$direction") { continue }
+            $id = $old.Manifest.$idField
+            if (-not $id -or $historyCounts[$id] -ne 1 -or -not $ids.ContainsKey($id) -or $ids[$id].Count -ne 1) { continue }
+            $new = $ids[$id][0]
+            if ($new.Action -ne "CopyTo$direction" -or $new.Manifest) { continue }
+            $counterpart = $old.$direction
+            $counterpartIdField = if ($direction -eq 'Remote') { 'OdFileId' } else { 'LocalFileId' }
+            if (-not $counterpart.FileId -or $counterpart.FileId -ne $old.Manifest.$counterpartIdField) { continue }
+            if (-not (Test-SameFileState $new.$side.Length $new.$side.WriteUtc $old.Manifest.$lengthField $old.Manifest.$writeField)) { continue }
+            $new.Action = "Move$direction"
+            $new.Reason = "moved on $($side.ToLowerInvariant()) side: $($old.RelPath) -> $($new.RelPath)"
+            $new | Add-Member -NotePropertyName OldRelPath -NotePropertyValue $old.RelPath
+            $new | Add-Member -NotePropertyName MoveSource -NotePropertyValue $counterpart
+            $paired[$old.RelPath.ToLowerInvariant()] = $true
+        }
+    }
+    return ,@($results | Where-Object { -not $paired.ContainsKey($_.RelPath.ToLowerInvariant()) } | Sort-Object Action, RelPath)
 }
 
 function Test-ActionReady {
@@ -282,6 +344,8 @@ function Test-ActionReady {
     )
 
     switch ($Item.Action) {
+        'MoveRemote' { $src = $Item.Local }
+        'MoveLocal'  { $src = $Item.Remote }
         'CopyToRemote' { $src = $Item.Local }
         'CopyToLocal'    { $src = $Item.Remote }
         default          { return [pscustomobject]@{ Ready = $true; Reason = 'no source read required' } }
@@ -294,6 +358,15 @@ function Test-ActionReady {
     }
     if (Test-FileLocked -Path $src.FullPath) {
         return [pscustomobject]@{ Ready = $false; Reason = 'held open' }
+    }
+
+    if ($Item.Action -in @('MoveLocal', 'MoveRemote')) {
+        if (-not (Test-FileSettled -Path $Item.MoveSource.FullPath -SettleMinutes $SettleMinutes)) {
+            return [pscustomobject]@{ Ready = $false; Reason = 'counterpart still settling' }
+        }
+        if (Test-FileLocked -Path $Item.MoveSource.FullPath) {
+            return [pscustomobject]@{ Ready = $false; Reason = 'counterpart held open' }
+        }
     }
 
     return [pscustomobject]@{ Ready = $true; Reason = 'ok' }

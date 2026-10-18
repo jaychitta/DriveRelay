@@ -7,18 +7,23 @@ DriveRelay relays files between a high-speed local NTFS working folder and a clo
 - `DriveRelay.ps1`: Primary CLI and sync engine. Modern verb-based commands: `add`, `list`, `rm`, `pause`, `resume`, `check`, `sync`, `status`, `start`, `stop`.
 - `DriveRelayTray.ps1`: System tray agent. Runs periodic background passes, handles tray icon state, right-click menu, and balloon notifications.
 - `DriveRelayUI.ps1`: Modern dark-mode popup dashboard. Card-style folder link status, inline pause/resume toggles, folder adding dialog, and manual sync triggering.
-- `DriveRelayTray.vbs`: Silent windowless launcher for the system tray agent.
+- `DriveRelay.exe`: Generated branded windowless launcher for the tray agent; the Startup shortcut targets it so Task Manager identifies the app as DriveRelay.
+- `tools/DriveRelayLauncher.cs` / `tools/New-Launcher.ps1`: Launcher source and build script, using the Windows .NET Framework compiler (no extra SDK).
+- `DriveRelayTray.vbs`: Legacy silent launcher retained for compatibility with manual launches.
 - `Setup.cmd`: Double-clickable installer. Wraps `Install.ps1` with a process-scoped execution policy, guards against a partial extraction, passes arguments through, and offers to start the tray agent.
 - `Uninstall.cmd`: Double-clickable uninstaller wrapping `Uninstall.ps1`.
 - `Install.ps1`: Creates Startup and Start Menu shortcuts and sets up the tray agent.
+- `tools/New-Installer.ps1` / `tools/DriveRelay.iss`: Build a per-user Inno Setup 6 installer in `dist/`, with a freshly compiled launcher and an explicit allowlist of runtime files. Keep live settings, links, state, logs and tests out of the payload. Inno owns shortcuts and uninstall registration, checks the tray/pass mutexes, and preserves runtime data on upgrade/removal.
+- `tools/Configure-Install.ps1`: Persists the packaged installer's Windows startup choice through `lib/Settings.ps1`; preserves other supported settings.
 - `Uninstall.ps1`: Cleanly uninstalls shortcuts, launcher, and background processes.
 - `README.md`: Public-facing overview, safety model, install/usage, known issues, authorship (concept and direction: Jayadheer Chitta; implementation: Claude).
 - `LICENSE`: MIT, © 2026 Jayadheer Chitta.
 - `.gitignore`: Keeps runtime state and personal data (`config/links.json`, `config/settings.json`, `state/`, `*.log`) out of version control.
 - `OneDriveGate.ps1`: Process lifecycle controller for the OneDrive desktop client (Grace -> Blocked -> Resumed).
 - `lib/`: Modular PowerShell helper scripts:
-  - `Conflicts.ps1`: Lists existing timestamped conflict copies on either side, pairing each with its original filename and paths. Used by CLI status, the dashboard's Duplicates list and persistent tray warnings.
-  - `Actions.ps1`: Sync action execution, file copying, deletion with safety thresholds, and removal of folders a pass empties. Depends on `Availability.ps1`.
+  - `DashboardScan.ps1`: Read-only availability and conflict inventories in a background PowerShell runspace. Dashboard rendering reads completed results, rejects inventories for changed registries, and never waits for folder scans.
+  - `Conflicts.ps1`: Lists timestamped conflict copies and live deletion conflicts, with paths and review guidance. Used by CLI, dashboard Duplicates/Review controls and tray warnings. Live deletion classification depends on `Manifest.ps1` and `Availability.ps1`.
+  - `Actions.ps1`: Sync action execution, guarded atomic copying, deletion with safety thresholds, and removal of folders a pass empties. Depends on `Availability.ps1`, `Manifest.ps1` and `Conflicts.ps1`. Deletion conflicts preserve the survivor without undoing the deletion and retain their old manifest entry.
   - `Availability.ps1`: Distinguishes an unmounted drive from a deleted folder from a stopped cloud client, and reports what to do about each. Must be dot-sourced before `Actions.ps1`.
   - `Hydration.ps1`: OneDrive file hydration and cloud dehydration handlers.
   - `Icons.ps1`: GDI+ programmatic icon drawing for tray and fallback icon generation.
@@ -27,7 +32,8 @@ DriveRelay relays files between a high-speed local NTFS working folder and a clo
     generation also aged out past `LogMaxAgeDays` regardless of how many `LogKeepFiles` allows
     for. Dot-sourced into the entry scripts, so its state variables are deliberately named to
     avoid colliding with their parameters (`$script:LogThreshold`, not `$script:LogLevel`).
-  - `Manifest.ps1`: State manifests, file checksums, and change tracking.
+  - `Manifest.ps1`: Metadata-only snapshots and change tracking. Loads `FileIdentity.ps1`; records optional per-side NTFS IDs and pairs unchanged tracked moves into `MoveLocal`/`MoveRemote`. Produces `DeletionConflict` for a tracked deletion versus changed survivor, and records destination parents for queued-copy/move checks. Never hashes cloud content.
+  - `FileIdentity.ps1`: Zero-access Windows metadata handles for NTFS file IDs (volume, file index, creation time), excluding hard links and unsupported filesystems. Native same-volume rename refuses overwrites and copying across volumes. Loaded by `Manifest.ps1` in every engine/inventory host.
   - `Pass.ps1`: Sync pass orchestration logic. Collapses runs of no-op passes into one
     hourly heartbeat line, tracking the streak in `state/lastpass.json`.
   - `Provider.ps1`: Cloud provider detection and label resolution.
@@ -45,6 +51,8 @@ DriveRelay relays files between a high-speed local NTFS working folder and a clo
   - `DriveRelay_badge.png`: Full-bleed rounded badge master.
 - `tests/`:
   - `Test-DriveRelay.ps1`: Automated regression test suite.
+  - `Test-Installer.ps1`: Builds the release and verifies payload hashes/privacy, guarded installation, shortcut options, upgrades and data-preserving uninstall. Verification remaps OS integration into `build/installer-tests/` and disables uninstall registry entries; no live application is installed or stopped.
+- `build/` / `dist/`: Gitignored staging, verification logs, installer executable, SHA-256 sidecar and payload inventory. Staging trees are unique and retained for inspection.
 - `DriveRelay.ico`: Root-level icon for direct shortcut association.
 - `docs/`:
   - `changelog.md`: Record of project changes and updates.

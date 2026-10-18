@@ -65,10 +65,12 @@ would look like a folder full of new files.
 |---|---|
 | New or changed locally | `CopyToRemote` |
 | New or changed remotely | `CopyToLocal` |
+| Unchanged tracked NTFS file moved locally | `MoveRemote` |
+| Unchanged tracked NTFS file moved remotely | `MoveLocal` |
 | Gone remotely, local unchanged since manifest | `DeleteLocal` |
 | Gone locally, remote unchanged since manifest | `DeleteRemote` |
-| Gone remotely but **edited** locally | `CopyToRemote` — your edit outranks the delete |
-| Gone locally but **edited** remotely | `CopyToLocal` — the edit outranks the delete |
+| Gone remotely but local metadata changed | `DeletionConflict` — preserve the local copy and leave the remote deletion intact; review required |
+| Gone locally but remote metadata changed | `DeletionConflict` — preserve the remote copy and leave the local deletion intact; review required |
 | Changed on both sides | `Conflict` — keep both |
 | Both sides present, identical, no history | `InSync`, adopted into the manifest |
 | Both sides present, differ, no history | `Conflict` |
@@ -77,7 +79,52 @@ would look like a folder full of new files.
 **Absence alone never causes a delete.** A delete is only proposed when the manifest proves the
 file existed at the last pass.
 
+## Moves and renames
+
+Snapshots and manifests include optional `LocalFileId` / `OdFileId` fields.
+`lib/FileIdentity.ps1` uses a zero-access, shared Windows metadata handle with
+`OPEN_REPARSE_POINT` to query volume serial, NTFS file index and creation time.
+It never reads placeholder contents. Hard-linked files and unsupported or
+unavailable identities return no ID. Old manifests remain readable; successful
+ordinary actions and `InSync` adoption fill in IDs on the next pass.
+
+After ordinary classification, a `DeleteRemote` plus a new `CopyToRemote` becomes
+one `MoveRemote` only if the moving side has the same unique ID as its old
+manifest entry, both sides still match their own saved metadata, and the
+counterpart retains its saved ID. The reverse produces `MoveLocal`. The old
+delete is removed from the plan before checking `MaxDelete`. No filename or
+size/time heuristic substitutes for identity. Moves with edits, legacy baselines
+or unsupported identities retain the ordinary classification rules.
+
+Execution gates both files for settling and locks, then rechecks IDs, metadata,
+the old path's absence on the originating side, destination absence and the
+planned existing parent. The Windows rename uses neither `REPLACE_EXISTING` nor
+`COPY_ALLOWED`: collisions and volume boundaries cannot overwrite or silently
+turn into copies. Failed or deferred moves keep the old baseline; success drops
+the old entry and records the new path and both IDs. Emptied counterpart folders
+are pruned by the existing cleanup. Populated directory moves are individual
+file moves; empty directories and case-only renames remain outside the model.
+
+Windows API references: [CreateFile metadata access](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew),
+[file identity](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileinformationbyhandle),
+and [MoveFileEx flags](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw).
+
 ## Conflicts
+
+Deletion conflicts do not fork or copy anything. Since remote content is never
+hashed, a size or timestamp change is only evidence of a possible edit. The
+previous manifest entry is retained, so the conflict remains visible on later
+passes. CLI check/status list it; sync prints the surviving and deleted paths;
+the dashboard shows a **Review** button with those paths and resolution guidance.
+Dashboard availability and conflict inventories run in a background PowerShell
+runspace (`lib/DashboardScan.ps1`). Cards initially say **Checking folders...**;
+rendering never enumerates linked folders or compares manifests. A 250 ms UI
+timer collects completed results and schedules another scan five seconds after
+completion, with only one scan in flight. Results for a changed registry are
+discarded. Closing the dashboard requests cancellation without waiting on disk.
+Pass summaries retain `DeletionConflicts` for tray warnings. To keep the deletion,
+delete the surviving copy; to keep the file, deliberately restore it on the
+deleted side. New files without a manifest entry still copy normally.
 
 Both versions are kept; nothing is merged and no winner is picked. The remote version is
 brought down beside the local one under a name like
@@ -112,6 +159,10 @@ Observed working on live data: with TallyPrime running, a pass deferred `TSTATE.
 
 - **Atomic copies.** Content goes to a `.tmp` name the snapshot excludes, then moves into
   place, so a half-copied file is never visible as complete.
+- **Copies recheck destinations.** Planned copies record the destination metadata
+  and nearest existing parent. Both are checked before copying and again before
+  replacing the destination. A deletion or edit during a long pass defers the
+  copy and leaves its baseline intact. Conflict forks use the same checks.
 - **Recoverable deletes.** Recycle Bin where there is content to store; otherwise the cloud
   service's online recycle bin, and the log says which applies. `HydrateBeforeDelete` downloads
   first so the Recycle Bin keeps a real copy.
@@ -131,7 +182,8 @@ Observed working on live data: with TallyPrime running, a pass deferred `TSTATE.
 DriveRelay.ps1      CLI and engine entry: add, rm, list, check, sync, status, etc.
 DriveRelayTray.ps1  tray agent; runs passes on a timer, shows state
 DriveRelayUI.ps1    modernized dashboard window
-DriveRelayTray.vbs  hidden launcher (generated by Install.ps1)
+DriveRelay.exe      branded hidden launcher (built by Install.ps1)
+DriveRelayTray.vbs  legacy hidden launcher for manual use
 Install.ps1         icons, launcher, Start Menu and Startup shortcuts
 Uninstall.ps1       reverses the above; keeps links unless told otherwise
 
@@ -140,15 +192,55 @@ lib\Provider.ps1    remote path resolution and provider detection
 lib\Icons.ps1       the artwork, drawn in code
 lib\Registry.ps1    links.json
 lib\Manifest.ps1    snapshots, manifest, diff, readiness
+lib\FileIdentity.ps1 metadata-only NTFS identity and guarded native rename
 lib\Settle.ps1      lock and quiescence tests
 lib\Hydration.ps1   placeholder control
 lib\Actions.ps1     copy, delete, conflict fork, seed, the pass itself
 lib\Pass.ps1        single-instance pass runner shared by CLI, tray and scheduler
 tools\New-Icons.ps1 writes the .ico files
+tools\New-Launcher.ps1 builds DriveRelay.exe from DriveRelayLauncher.cs
 ```
 
 The tray, the CLI and the scheduled task all call `Invoke-SyncPass`. There is no behaviour that
 exists in one and not the others.
+
+The launcher is a .NET Framework Windows executable with DriveRelay file description,
+product name and icon. Startup and Start Menu shortcuts target it directly rather than
+`wscript.exe`, giving Task Manager's Startup apps the app's identity. It resolves the tray
+script beside itself and starts the Windows PowerShell host with `UseShellExecute = false`
+and `CreateNoWindow = true`, then exits. The tray continues to run in PowerShell. The build
+uses the compiler shipped with Windows; no separate SDK is required.
+
+## Packaged installation
+
+`tools/New-Installer.ps1` builds `dist/DriveRelay-Setup-<version>.exe` with Inno
+Setup 6. It stages an explicit allowlist of runtime scripts, required icons,
+example configuration and public documentation, then compiles a fresh launcher
+into that stage. Real configuration, manifests, logs, tests and repository
+metadata never enter the stage. A SHA-256 payload inventory and installer
+checksum accompany the output; unique staging directories are retained under
+`build/installer/` for inspection. Inno Setup is a build dependency only.
+
+`tools/DriveRelay.iss` installs under the current account's LocalAppData Programs
+folder by default, requires no elevation, and owns shortcuts and the Windows
+uninstall entry. It checks the existing global tray/pass mutexes before install
+or uninstall and never forcibly terminates a pass. After copying files,
+`tools/Configure-Install.ps1` persists the selected startup option using the
+settings module. The launcher is prebuilt, so end users need no compiler.
+
+Only installer-owned application files are removed. Settings, registered links,
+sync state and logs are generated at runtime and are outside the uninstall
+inventory. `config/excludes.txt` uses `onlyifdoesntexist uninsneveruninstall` to
+keep customized patterns through upgrades and removal. There is no recursive
+application-directory cleanup. Portable source setup remains available through
+`Setup.cmd` / `Install.ps1`.
+
+`tests/Test-Installer.ps1` builds the release and an isolated verification variant
+of the same installer template. The variant remaps Start Menu, Startup and
+Desktop paths and mutex names into test-only locations and disables Windows
+uninstall registration. It tests guarded installation, packaged CLI loading,
+shortcut targets/options, settings persistence, upgrading and removal while
+checking runtime sentinels survive. It never runs a sync or launches a tray.
 
 ## Two PowerShell 5.1 traps worth knowing
 

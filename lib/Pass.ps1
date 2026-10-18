@@ -54,6 +54,7 @@ function Write-PassSummary {
             IdleSince     = $IdleSince
             LastHeartbeat = $LastHeartbeat
             Applied    = [int](($r | Measure-Object -Property Applied   -Sum).Sum)
+            Moved      = [int](($r | Where-Object { $_.PSObject.Properties['Moved'] } | Measure-Object -Property Moved -Sum).Sum)
             Deferred   = [int](($r | Measure-Object -Property Deferred  -Sum).Sum)
             Conflicts  = [int](($r | Measure-Object -Property Conflicts -Sum).Sum)
             Deleted    = [int](($r | Measure-Object -Property Deleted   -Sum).Sum)
@@ -61,6 +62,8 @@ function Write-PassSummary {
             Aborted    = @($r | Where-Object { $_.Aborted } | ForEach-Object { "$($_.LinkId): $($_.Message)" })
             ConflictCopies = @($r | Where-Object { $_.PSObject.Properties['ConflictCopies'] } |
                 ForEach-Object { $_.ConflictCopies })
+            DeletionConflicts = @($r | Where-Object { $_.PSObject.Properties['DeletionConflicts'] } |
+                ForEach-Object { $_.DeletionConflicts })
 
             # Availability is reported separately from failure. A drive that is
             # not plugged in is not a sync error, and calling it one trains

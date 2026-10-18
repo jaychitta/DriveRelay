@@ -12,6 +12,11 @@ state/
 
 # --- runtime artefacts -------------------------------------------------------
 
+# Built by Install.ps1 from tools/DriveRelayLauncher.cs.
+/DriveRelay.exe
+/build/
+/dist/
+
 *.tmp
 *.superseded-*
 *.driverelay.tmp

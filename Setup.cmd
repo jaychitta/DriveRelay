@@ -74,14 +74,14 @@ echo.
 choice /c YN /n /m "  Start DriveRelay now? [Y/N] "
 if errorlevel 2 goto :done
 
-if exist "%~dp0DriveRelayTray.vbs" (
-    start "" wscript.exe "%~dp0DriveRelayTray.vbs"
+if exist "%~dp0DriveRelay.exe" (
+    start "" "%~dp0DriveRelay.exe"
     echo.
     echo  Started. Look for the DriveRelay icon by the clock -- Windows 11 hides
     echo  new tray icons behind the chevron until you drag them out.
 ) else (
     echo.
-    echo  DriveRelayTray.vbs was not created; skipping start.
+    echo  DriveRelay.exe was not created; skipping start.
 )
 
 :done

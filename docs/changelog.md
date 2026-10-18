@@ -2,6 +2,207 @@
 
 All notable changes to DriveRelay (formerly SyncOrchestrator) will be documented in this file.
 
+## [Maintenance] - 2026-10-18 — prepare current source for GitHub backup
+
+- Included the pending installer, move detection, deletion review and dashboard
+  work in the source backup. Removed client-identifying document names from
+  operational notes before publication. Private links, settings, history, logs,
+  generated executables and build output remain excluded from Git.
+- Verification: 234 core checks and 53 isolated installer checks passed. Live
+  linked folders and the running installation were not changed.
+
+## [Unreleased] - 2026-10-15 — distributable Windows installer
+
+### Added
+- `tools/New-Installer.ps1` and an Inno Setup 6 template produce
+  `dist/DriveRelay-Setup-1.0.0.exe`, a SHA-256 sidecar and a payload inventory.
+  Each build compiles a fresh branded launcher into unique staging, using an
+  explicit 29-file allowlist with runtime modules, icons, examples and public
+  usage/audit documentation. Private configuration, links, manifests, logs,
+  tests and repository metadata are excluded.
+- Per-user setup wizard with a configurable install folder (LocalAppData
+  Programs by default), Start Menu entries, optional Windows startup/desktop
+  shortcuts, launch-on-finish and a Windows Installed Apps uninstall entry.
+- Upgrades and removal check the global tray/pass mutexes before proceeding.
+  The installer owns its shortcuts and removal inventory; generated settings,
+  links, state and logs survive. Customized exclusions are neither overwritten
+  nor removed. A small settings helper persists the startup choice without
+  changing other supported preferences. Source-folder Setup.cmd remains usable.
+- Rebuild and end-user instructions in README/operations; generated build and
+  release directories are gitignored. Output is unsigned.
+
+### Verified
+- Windows PowerShell 5.1 installer verification: 53 passed. Compiled the release
+  and exercised the same template with isolated integration paths and no Windows
+  uninstall registry registration: active-app blocking, new install into a path
+  with spaces/ampersand, shortcut targets/options, packaged CLI loading, upgrade,
+  and removal. Link/history/log/exclusion sentinels survived upgrade and removal;
+  pause and sync preferences survived startup-option changes.
+- Core regression suite: 232 passed, 0 failed (hard-link scenario skipped where
+  creation is denied). Parser checks across 27 PowerShell scripts and
+  `git diff --check` passed. No live installation or linked folders were changed.
+
+## [Unreleased] - 2026-10-15 — relay moves and renames
+
+### Added
+- Unchanged tracked files moved or renamed within either linked folder now
+  produce `MoveLocal` / `MoveRemote` and move the counterpart without recopying
+  content. Populated folder moves are handled file by file and emptied old
+  counterpart directories are pruned. CLI check/status show old and new paths;
+  link results and pass summaries retain the moved count.
+- Metadata snapshots and manifests retain optional per-side NTFS identities
+  (volume serial, file index and creation time). Windows metadata handles request
+  zero content access and open reparse points without reading placeholder data.
+  Old manifests remain compatible and collect identities on successful passes.
+
+### Safety
+- A move requires unique identity evidence, unchanged metadata on both sides,
+  and the counterpart's original identity. Size/time matches alone never infer
+  a move. Missing identities, hard links, moved-and-edited files and legacy
+  baselines retain ordinary copy/delete/conflict handling.
+- Both files must settle and be unlocked. Execution rechecks identities,
+  metadata, old-path absence and the vacant destination/parent. Native renames
+  refuse overwrites and cross-volume copying; failed/deferred moves retain the
+  old baseline. Proven moves are removed from deletion-cap accounting.
+- Empty folders and case-only renames remain outside the file-based model.
+
+### Verified
+- Windows PowerShell 5.1 regression suite: 232 passed, 0 failed. Covers moves
+  both ways, folder renames with equal-size/time files, identity preservation,
+  WhatIf, MaxDelete zero, baseline migration/retention, locks and settling,
+  queued edits/replacements/deletions/collisions, ambiguous history and native
+  overwrite refusal. The hard-link creation scenario was skipped because the
+  execution environment denies creation; the test runs where permitted.
+- Parser checks across 24 PowerShell scripts and `git diff --check` passed.
+- Verification used isolated NTFS scratch folders; live cloud-placeholder
+  move/hydration behavior and provider upload effects were not exercised.
+
+## [Operations] - 2026-10-13 — review deletion and duplicate logs
+
+- Reviewed active and retained logs, the October 7 duplicate report, and current
+  metadata at the reported paths without running a sync or changing linked files.
+- The October 7 report recorded nine Office conflict copies absent locally but
+  present remotely. Retained logs contain failed remote deletion attempts for
+  several of them at 19:26, with DeleteFile reporting file-not-found; the logs
+  alone do not establish why those paths disappeared during that pass.
+- All nine old Office duplicate paths are now absent on both sides. The latest
+  pass summary still lists the a client guide conflict created October
+  8 at 10:16, but its recorded paths are also now absent on both sides, so that
+  summary is stale. Its creation was logged as a two-version conflict.
+- Recent logs confirm local deletions are reaching the OneDrive folder, including
+  Tally's TUPDATE.TSF on October 13 at 12:34. This verifies filesystem propagation,
+  not the online OneDrive account's state.
+
+## [Operations] - 2026-10-13 — start tray agent
+
+- Launched `DriveRelay.exe` on request; launcher exited successfully and the
+  held `Global\DriveRelayTray` mutex confirmed the tray agent was running.
+
+## [Unreleased] - 2026-10-13 — name the startup app DriveRelay
+
+### Fixed
+- Startup and Start Menu tray shortcuts now target a branded `DriveRelay.exe`
+  instead of `wscript.exe`, so Windows can identify the startup app as DriveRelay.
+- Reinstalling with `-NoAutoStart` removes an existing DriveRelay Startup shortcut.
+
+### Added
+- Windowless launcher source and build script using Windows' .NET Framework
+  compiler, with DriveRelay description, product name and embedded icon. The
+  launcher resolves the tray script beside itself and starts PowerShell without
+  a console window. Setup builds it; uninstall removes it and the legacy VBS.
+
+### Verified
+- Launcher compiled under Windows PowerShell 5.1; executable description and
+  product name both read DriveRelay, with the Windows GUI subsystem.
+- Isolated smoke launch from a path containing spaces and `&` executed the
+  sibling tray stub, set its working directory and created no console window.
+- Installed Startup and Start Menu tray shortcuts updated and read back to
+  confirm they target `D:\DriveRelay\DriveRelay.exe` with no arguments.
+- Windows PowerShell 5.1 parser checks and `git diff --check`: clean. Task Manager's
+  displayed label still needs a visual check after reopening it.
+
+
+## [Unreleased] - 2026-10-13 — responsive dashboard loading
+
+### Fixed
+- Opening and refreshing the dashboard no longer recursively scans every linked
+  folder and compares manifests on the Windows Forms thread. A read-only
+  background runspace collects availability, duplicates and deletion conflicts.
+- Cards show Checking folders until results arrive, report scan failures, and
+  discard results when link settings change. Scans never overlap and closing
+  the dashboard requests cancellation without waiting for folder enumeration.
+
+### Updated
+- Live inventory refresh starts five seconds after the previous scan completes.
+  Card expansion and other UI actions reuse the completed inventory.
+
+### Verified
+- Windows PowerShell 5.1 regression suite: 163 passed, 0 failed, including
+  asynchronous inventory, single-duplicate array shape, deletion conflicts,
+  read-only behavior, initial checking status and scan failure reporting.
+- With the three configured links, initial card rendering measured 115 ms;
+  live background inventory completed in about 19 seconds without scan errors.
+  Closing during an active scan returned in 92 ms in a Windows Forms smoke test.
+- PowerShell parser checks and `git diff --check` passed.
+
+## [Unreleased] - 2026-10-08 — preserve deletions when the survivor appears changed
+
+### Fixed
+- A tracked deletion versus changed survivor metadata now produces
+  `DeletionConflict` on either side. The deleted path stays absent, the survivor
+  is preserved, and the old baseline remains until the user resolves it.
+- Planned copies check destination metadata and the closest existing parent
+  before copying and before replacing the destination. A deletion during a long
+  pass defers the copy instead of recreating the file or folder. Conflict forks
+  also guard their destinations.
+- A single duplicate now retains its array shape when a dashboard card is built.
+  PowerShell 5.1 previously unwrapped it, hiding the Duplicates button despite
+  the badge correctly reporting one duplicate. A real-card construction test
+  reproduced this and verifies both Duplicates and Review appear without overlap.
+
+### Added
+- Live dashboard **Review** lists deletion conflicts and paths, with instructions
+  to delete the survivor or deliberately restore it. CLI check/status/sync and
+  tray warnings report these separately from conflict copies. Pass summaries
+  preserve their details, and unchanged deletion conflicts do not repeat balloons.
+- Copy/delete decision reasons are logged at INFO; deletion conflicts and
+  copies deferred because a destination changed are logged at WARN.
+- Regression coverage for timestamp-only conflicts, both deletion directions,
+  baseline retention, explicit resolution, WhatIf, summary serialization, queued
+  and in-progress copy deletions, and actual dashboard control construction.
+
+### Verified
+- Windows PowerShell 5.1 regression suite: 154 passed, 0 failed.
+- Parser checks across 20 project scripts and `git diff --check`: clean.
+
+## [Unreleased] - 2026-10-08 — investigate restored Office subfolder
+
+### Verified
+- The owner clarified that DriveRelay restored the deleted subfolder locally.
+  Logs confirm a copy to local of its workbook at 16:24:42 on October 8,
+  with an earlier copy to local at 19:47:32 on October 7. INFO logging does
+  not record the classification reason or the baseline used, so the cause
+  of choosing a copy instead of deletion remains unverified.
+- Checked for historical Office manifests: only the current manifest remains,
+  so the pre-restoration baseline cannot be reconstructed from retained state.
+- Traced and exercised the deletion branches using Windows PowerShell 5.1 in
+  isolated scratch folders. With a baseline and unchanged remote metadata,
+  local absence produces DeleteRemote. Changing only the remote timestamp by
+  three seconds produces CopyToLocal despite identical content, and executing
+  that copy recreates the deleted local subfolder. A missing baseline also
+  produces CopyToLocal. The historical incident's exact branch remains unknown;
+  these are verified code paths, not evidence of a historical timestamp change.
+- At inspection the subfolder was absent on both sides and the read-only
+  Office check proposed no file deletions. OneDrive was stopped and was
+  started in the background; this does not explain the earlier restoration.
+- No sync-engine changes or manual deletions were made.
+- Investigated the Office duplicate count: a live metadata scan confirms one
+  conflict copy of a client guide, present on both
+  sides. Its creation is logged at 10:16:39 on October 8. The current dashboard
+  creates the Duplicates control from the same live inventory as its badge;
+  no dashboard process was running during inspection, so the reported missing
+  control could not be verified visually.
+
 ## [Unreleased] - 2026-10-07 — identify DriveRelay conflict duplicates
 
 ### Updated

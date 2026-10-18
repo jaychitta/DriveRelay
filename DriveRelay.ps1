@@ -304,7 +304,8 @@ function Invoke-CheckCommand {
             foreach ($i in $actionable) {
                 $ready = Test-ActionReady -Item $i -SettleMinutes $link.SettleMinutes
                 $mark  = if ($ready.Ready) { ' ' } else { '~' }
-                "    {0} {1,-16} {2}" -f $mark, $i.Action, $i.RelPath
+                $displayPath = if ($i.Action -in @('MoveLocal', 'MoveRemote')) { "$($i.OldRelPath) -> $($i.RelPath)" } else { $i.RelPath }
+                "    {0} {1,-16} {2}" -f $mark, $i.Action, $displayPath
                 if ($Detailed -or -not $ready.Ready) {
                     "        {0}{1}" -f $i.Reason, $(if (-not $ready.Ready) { " | not yet: $($ready.Reason)" } else { '' })
                 }
@@ -367,7 +368,10 @@ function Invoke-SyncCommand {
             $r.Applied, $r.Deferred, $r.Conflicts, $r.Deleted, $r.Failed
 
         if ($r.Conflicts -gt 0) {
-            "    {0} conflict(s): both versions kept, the remote one renamed alongside the local file." -f $r.Conflicts
+            $deletionCount = @($r.DeletionConflicts).Count
+            $forkCount = $r.Conflicts - $deletionCount
+            if ($forkCount -gt 0) { "    {0} conflict(s): both versions kept, the remote one renamed alongside the local file." -f $forkCount }
+            if ($deletionCount -gt 0) { Format-DeletionConflicts -Conflicts $r.DeletionConflicts }
         }
         if ($r.Deleted -gt 0) {
             $recycled = $r.Deleted - $r.CloudOnlyDeletes
@@ -379,7 +383,7 @@ function Invoke-SyncCommand {
             }
         }
         if ($r.Deferred -gt 0) {
-            "    {0} file(s) left for a later pass (still settling or held open)." -f $r.Deferred
+            "    {0} file(s) left for a later pass (not ready, or changed during the pass)." -f $r.Deferred
         }
     }
 
@@ -540,9 +544,12 @@ function Invoke-StatusCommand {
         "    {0} pending:" -f $pending.Count
         foreach ($i in $pending) {
             $rd = Test-ActionReady -Item $i -SettleMinutes $link.SettleMinutes
-            if ($rd.Ready) { "      {0,-16} {1}" -f $i.Action, $i.RelPath }
-            else           { "      {0,-16} {1}   [waiting: {2}]" -f $i.Action, $i.RelPath, $rd.Reason }
+            $displayPath = if ($i.Action -in @('MoveLocal', 'MoveRemote')) { "$($i.OldRelPath) -> $($i.RelPath)" } else { $i.RelPath }
+            if ($rd.Ready) { "      {0,-16} {1}" -f $i.Action, $displayPath }
+            else           { "      {0,-16} {1}   [waiting: {2}]" -f $i.Action, $displayPath, $rd.Reason }
         }
+        $deletionConflicts = @($pending | Where-Object Action -eq 'DeletionConflict' | ForEach-Object { New-DeletionConflict -Item $_ -Link $link })
+        if ($deletionConflicts.Count -gt 0) { Format-DeletionConflicts -Conflicts $deletionConflicts }
     }
 }
 

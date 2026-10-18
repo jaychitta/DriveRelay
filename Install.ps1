@@ -4,10 +4,9 @@
     What it does, all under your own user account:
 
       1. Ensures the icon files exist.
-      2. Writes a tiny .vbs launcher. Windows shortcuts cannot start a process
-         truly hidden -- powershell.exe flashes a console window for a moment
-         however you set the shortcut. WScript.Shell.Run with a window style of
-         0 does not, and it is the standard way to launch a background script.
+      2. Builds a tiny branded DriveRelay.exe launcher using Windows' built-in
+         .NET Framework compiler. It starts PowerShell without a console window
+         and gives Task Manager's Startup apps entry the DriveRelay name.
       3. Puts a shortcut in Startup, so the tray comes back after every reboot.
       4. Puts a shortcut in the Start Menu, so it can be started by hand.
 
@@ -47,7 +46,7 @@ $iconPath   = Join-Path $assets 'DriveRelay.ico'
 if (-not (Test-Path $iconPath)) { $iconPath = Join-Path $root 'DriveRelay.ico' }
 $trayScript = Join-Path $root 'DriveRelayTray.ps1'
 $uiScript   = Join-Path $root 'DriveRelayUI.ps1'
-$launcher   = Join-Path $root 'DriveRelayTray.vbs'
+$launcher   = Join-Path $root 'DriveRelay.exe'
 
 Write-Host "Installing $appName"
 Write-Host "  from $root"
@@ -64,16 +63,7 @@ Write-Host "  $iconPath"
 
 # --- 2. hidden launcher ----------------------------------------------------
 
-$vbs = @"
-' Launches the DriveRelay tray agent without a console window.
-Dim fso, scriptDir, shell, cmd
-Set fso = CreateObject("Scripting.FileSystemObject")
-scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
-Set shell = CreateObject("WScript.Shell")
-cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File """ & scriptDir & "\DriveRelayTray.ps1"""
-shell.Run cmd, 0, False
-"@
-Set-Content -LiteralPath $launcher -Value $vbs -Encoding ASCII
+& (Join-Path $root 'tools\New-Launcher.ps1') -OutputPath $launcher -IconPath $iconPath
 Write-Host "  $launcher"
 
 # --- 3. shortcuts ----------------------------------------------------------
@@ -95,7 +85,7 @@ function New-Shortcut {
     $sc.TargetPath       = $Target
     $sc.Arguments        = $Arguments
     $sc.WorkingDirectory = $root
-    $sc.WindowStyle      = 7          # minimised, belt and braces with the .vbs
+    $sc.WindowStyle      = 7
     if ($Icon)        { $sc.IconLocation = "$Icon,0" }
     if ($Description) { $sc.Description  = $Description }
     $sc.Save()
@@ -113,7 +103,7 @@ $oldStartup = Join-Path $startupDir 'Sync Orchestrator.lnk'
 if (Test-Path $oldStartup) { Remove-Item -LiteralPath $oldStartup -Force -ErrorAction SilentlyContinue }
 
 New-Shortcut -Path (Join-Path $startMenuDir "$appName.lnk") `
-             -Target 'wscript.exe' -Arguments ('"{0}"' -f $launcher) `
+             -Target $launcher `
              -Icon $iconPath -Description 'Start the DriveRelay tray agent'
 Write-Host ("  Start Menu: {0}" -f (Join-Path $startMenuDir "$appName.lnk"))
 
@@ -125,11 +115,13 @@ Write-Host ("  Start Menu: {0}" -f (Join-Path $startMenuDir "$appName Dashboard.
 
 if (-not $NoAutoStart) {
     New-Shortcut -Path (Join-Path $startupDir "$appName.lnk") `
-                 -Target 'wscript.exe' -Arguments ('"{0}"' -f $launcher) `
+                 -Target $launcher `
                  -Icon $iconPath -Description 'Start DriveRelay with Windows'
     Write-Host ("  Startup:    {0}" -f (Join-Path $startupDir "$appName.lnk"))
 }
 else {
+    $startupShortcut = Join-Path $startupDir "$appName.lnk"
+    if (Test-Path -LiteralPath $startupShortcut) { Remove-Item -LiteralPath $startupShortcut -Force }
     Write-Host '  Startup:    skipped (-NoAutoStart)'
 }
 
@@ -157,7 +149,7 @@ if ($appSettings.Paused) {
 }
 Write-Host ''
 Write-Host 'Start it now with:'
-Write-Host ("  wscript.exe `"{0}`"" -f $launcher)
+Write-Host ("  & `"{0}`"" -f $launcher)
 Write-Host ''
 Write-Host 'Note: Windows 11 hides new tray icons by default. If you do not see it by'
 Write-Host 'the clock, click the chevron next to the clock -- it will be in there. To'

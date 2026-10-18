@@ -21,7 +21,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 $appName  = 'DriveRelay'
-$launcher = Join-Path $root 'DriveRelayTray.vbs'
+$launcher = Join-Path $root 'DriveRelay.exe'
 
 Write-Host "Uninstalling $appName"
 Write-Host ''
@@ -48,6 +48,7 @@ $targets = @(
     $startMenuDir,
     $oldStartMenu,
     $launcher,
+    (Join-Path $root 'DriveRelayTray.vbs'),
     (Join-Path $root 'SyncOrchTray.vbs')
 )
 

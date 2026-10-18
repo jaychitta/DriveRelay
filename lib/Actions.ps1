@@ -50,13 +50,25 @@ function Copy-FileAtomic {
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)][string] $Source,
-        [Parameter(Mandatory)][string] $Destination
+        [Parameter(Mandatory)][string] $Destination,
+        [switch] $CheckDestination,
+        [object] $ExpectedDestination,
+        [string] $ExpectedParent
     )
 
     if (-not $PSCmdlet.ShouldProcess($Destination, "copy from $Source")) { return $false }
 
+    if ($CheckDestination -and -not (Test-CopyDestinationState -Path $Destination -Expected $ExpectedDestination -ExpectedParent $ExpectedParent)) {
+        Write-Log ("copy deferred; destination changed or was deleted since planning: {0}" -f $Destination) 'WARN'
+        return $false
+    }
+
     $dir = Split-Path -Parent $Destination
     if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        if ($CheckDestination -and -not (Test-CopyDestinationState -Path $Destination -Expected $ExpectedDestination -ExpectedParent $ExpectedParent)) {
+            Write-Log ("copy deferred; destination folder was deleted: {0}" -f $Destination) 'WARN'
+            return $false
+        }
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
 
@@ -64,6 +76,13 @@ function Copy-FileAtomic {
     try {
         Copy-Item -LiteralPath $Source -Destination $tmp -Force
         $src = Get-Item -LiteralPath $Source -Force
+        # Hydration and copying can take minutes. Check again before replacing
+        # the destination, not just when this action was initially planned.
+        if ($CheckDestination -and -not (Test-CopyDestinationState -Path $Destination -Expected $ExpectedDestination -ExpectedParent $ExpectedParent)) {
+            Remove-Item -LiteralPath $tmp -Force
+            Write-Log ("copy deferred; destination changed or was deleted while copying: {0}" -f $Destination) 'WARN'
+            return $false
+        }
         Move-Item -LiteralPath $tmp -Destination $Destination -Force
 
         # Keep the timestamps equal so the next pass sees the pair as in sync.
@@ -81,6 +100,61 @@ function Copy-FileAtomic {
         }
         throw
     }
+}
+
+function Test-CopyDestinationState {
+    param([string] $Path, [object] $Expected, [string] $ExpectedParent)
+    if ($ExpectedParent -and -not (Test-Path -LiteralPath $ExpectedParent -PathType Container)) { return $false }
+    $current = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $Expected) { return (-not $current) }
+    if (-not $current -or $current.PSIsContainer) { return $false }
+    return (Test-SameFileState $current.Length $current.LastWriteTimeUtc $Expected.Length $Expected.WriteUtc)
+}
+
+function Test-MoveFileState {
+    param([object] $Expected)
+    if (-not $Expected -or -not $Expected.FileId) { return $false }
+    $current = Get-Item -LiteralPath $Expected.FullPath -Force -ErrorAction SilentlyContinue
+    if (-not $current -or $current.PSIsContainer) { return $false }
+    return ((Test-SameFileState $current.Length $current.LastWriteTimeUtc $Expected.Length $Expected.WriteUtc) -and
+            (Get-FileIdentity -Path $Expected.FullPath) -eq $Expected.FileId)
+}
+
+function Invoke-FileMove {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([Parameter(Mandatory)][object] $Item,
+          [Parameter(Mandatory)][object] $Link)
+
+    $toRemote = $Item.Action -eq 'MoveRemote'
+    $targetRoot = if ($toRemote) { Get-RemotePath -Link $Link } else { $Link.LocalPath }
+    $originRoot = if ($toRemote) { $Link.LocalPath } else { Get-RemotePath -Link $Link }
+    $origin = if ($toRemote) { $Item.Local } else { $Item.Remote }
+    $parent = if ($toRemote) { $Item.RemoteParent } else { $Item.LocalParent }
+    $destination = Join-Path $targetRoot $Item.RelPath
+    $oldOrigin = Join-Path $originRoot $Item.OldRelPath
+    if (-not $PSCmdlet.ShouldProcess($destination, "move from $($Item.MoveSource.FullPath)")) { return $false }
+
+    # Check the user's move, the counterpart, and the vacant destination again.
+    # Never replace a new file, recreate a deleted source, or copy on failure.
+    if (-not (Test-MoveFileState -Expected $origin) -or
+        -not (Test-MoveFileState -Expected $Item.MoveSource) -or
+        (Test-Path -LiteralPath $oldOrigin) -or
+        -not (Test-CopyDestinationState -Path $destination -ExpectedParent $parent)) {
+        Write-Log ("move deferred; paths changed since planning: {0} -> {1}" -f $Item.OldRelPath, $Item.RelPath) 'WARN'
+        return $false
+    }
+    $directory = Split-Path -Parent $destination
+    if (-not (Test-Path -LiteralPath $directory)) {
+        New-Item -ItemType Directory -Path $directory -Force -ErrorAction Stop | Out-Null
+    }
+    if (-not (Test-MoveFileState -Expected $origin) -or
+        -not (Test-MoveFileState -Expected $Item.MoveSource) -or
+        (Test-Path -LiteralPath $oldOrigin) -or
+        -not (Test-CopyDestinationState -Path $destination -ExpectedParent $parent)) { return $false }
+
+    [DriveRelay.FileIdentity]::Move($Item.MoveSource.FullPath, $destination)
+    Write-Log ("moved on {0} side: {1} -> {2}" -f $(if ($toRemote) { 'remote' } else { 'local' }), $Item.OldRelPath, $Item.RelPath)
+    return $true
 }
 
 function Remove-FileSafely {
@@ -254,7 +328,7 @@ function Invoke-CopyToRemote {
     $src = $Item.Local.FullPath
     $dst = Join-Path (Get-RemotePath -Link $Link) $Item.RelPath
 
-    if (-not (Copy-FileAtomic -Source $src -Destination $dst)) { return $false }
+    if (-not (Copy-FileAtomic -Source $src -Destination $dst -CheckDestination -ExpectedDestination $Item.Remote -ExpectedParent $Item.RemoteParent)) { return $false }
     Write-Log ("copied to remote side: {0}" -f $Item.RelPath)
 
     if ($Dehydrate) { $null = Request-Dehydration -Path $dst }
@@ -286,7 +360,7 @@ function Invoke-CopyToLocal {
         }
     }
 
-    if (-not (Copy-FileAtomic -Source $src -Destination $dst)) { return $false }
+    if (-not (Copy-FileAtomic -Source $src -Destination $dst -CheckDestination -ExpectedDestination $Item.Local -ExpectedParent $Item.LocalParent)) { return $false }
     Write-Log ("copied to local: {0}" -f $Item.RelPath)
 
     # Restore the placeholder state we found it in.
@@ -315,6 +389,10 @@ function Invoke-ConflictFork {
     $forkPath = Join-Path $Link.LocalPath $forkRel
 
     $wasOffline = $Item.Remote.IsOffline
+    if (-not (Test-CopyDestinationState -Path (Join-Path $Link.LocalPath $Item.RelPath) -Expected $Item.Local -ExpectedParent $Item.LocalParent)) {
+        Write-Log ("conflict fork deferred; local destination changed or was deleted: {0}" -f $Item.RelPath) 'WARN'
+        return $false
+    }
     if ($wasOffline) {
         if (-not (Wait-Hydrated -Path $odPath -TimeoutSeconds 1800 -Confirm:$false)) {
             Write-Log ("hydration timed out during conflict fork, deferring: {0}" -f $Item.RelPath) 'WARN'
@@ -322,10 +400,11 @@ function Invoke-ConflictFork {
         }
     }
 
-    if (-not (Copy-FileAtomic -Source $odPath -Destination $forkPath)) { return $false }
+    if (-not (Test-CopyDestinationState -Path (Join-Path $Link.LocalPath $Item.RelPath) -Expected $Item.Local -ExpectedParent $Item.LocalParent)) { return $false }
+    if (-not (Copy-FileAtomic -Source $odPath -Destination $forkPath -CheckDestination -ExpectedParent $Item.LocalParent)) { return $false }
     Write-Log ("conflict: kept OneDrive version as {0}" -f $forkRel) 'WARN'
 
-    if (-not (Copy-FileAtomic -Source $Item.Local.FullPath -Destination $odPath)) { return $false }
+    if (-not (Copy-FileAtomic -Source $Item.Local.FullPath -Destination $odPath -CheckDestination -ExpectedDestination $Item.Remote -ExpectedParent $Item.RemoteParent)) { return $false }
     Write-Log ("conflict: local version is now current for {0}" -f $Item.RelPath) 'WARN'
 
     if ($Dehydrate) { $null = Request-Dehydration -Path $odPath }
@@ -430,9 +509,11 @@ function Invoke-LinkSync {
     $result = [pscustomobject]@{
         LinkId           = $Link.Id
         Applied          = 0
+        Moved            = 0
         Deferred         = 0
         Failed           = 0
         Conflicts        = 0
+        DeletionConflicts = @()
         Deleted          = 0
         CloudOnlyDeletes = 0
         Aborted          = $false
@@ -515,6 +596,14 @@ function Invoke-LinkSync {
             continue
         }
 
+        if ($item.Action -eq 'DeletionConflict') {
+            $result.Conflicts++
+            $result.DeletionConflicts += (New-DeletionConflict -Item $item -Link $Link)
+            Write-Log ("deletion conflict: {0} | {1}; surviving copy preserved, deletion not undone" -f $item.RelPath, $item.Reason) 'WARN'
+            # Keep the old baseline so the conflict remains visible next pass.
+            continue
+        }
+
         $ready = Test-ActionReady -Item $item -SettleMinutes $settleMinutes
         if (-not $ready.Ready) {
             $result.Deferred++
@@ -529,10 +618,20 @@ function Invoke-LinkSync {
         }
 
         try {
+            Write-Log ("decision {0}: {1} | {2}" -f $item.Action, $item.RelPath, $item.Reason)
             $ok = $false
             switch ($item.Action) {
                 'CopyToRemote' { $ok = Invoke-CopyToRemote -Item $item -Link $Link -Dehydrate $dehydrate }
                 'CopyToLocal'    { $ok = Invoke-CopyToLocal    -Item $item -Link $Link -Dehydrate $dehydrate }
+                { $_ -in @('MoveLocal', 'MoveRemote') } {
+                    $ok = Invoke-FileMove -Item $item -Link $Link
+                    if ($ok) {
+                        $result.Moved++
+                        $forgotten[$item.OldRelPath.ToLowerInvariant()] = $true
+                        if ($item.Action -eq 'MoveLocal') { $emptiedLocal += (Split-Path -Parent $item.MoveSource.FullPath) }
+                        else { $emptiedRemote += (Split-Path -Parent $item.MoveSource.FullPath) }
+                    }
+                }
                 'Conflict'       {
                     $ok = Invoke-ConflictFork -Item $item -Link $Link -Dehydrate $dehydrate
                     if ($ok) { $result.Conflicts++ }
@@ -614,6 +713,8 @@ function Invoke-LinkSync {
                     LocalWriteUtc = $L.WriteUtc
                     OdLength      = $O.Length
                     OdWriteUtc    = $O.WriteUtc
+                    LocalFileId   = $L.FileId
+                    OdFileId      = $O.FileId
                 }
             }
         }
@@ -623,8 +724,8 @@ function Invoke-LinkSync {
     }
 
     if (-not $result.Message) {
-        $result.Message = ("applied {0}, deferred {1}, conflicts {2}, deleted {3}, failed {4}" -f `
-                            $result.Applied, $result.Deferred, $result.Conflicts, $result.Deleted, $result.Failed)
+        $result.Message = ("applied {0}, deferred {1}, conflicts {2}, deleted {3}, failed {4}, moved {5}" -f `
+                            $result.Applied, $result.Deferred, $result.Conflicts, $result.Deleted, $result.Failed, $result.Moved)
     }
     # A link that moved nothing is reported at DEBUG. With three links and a ten
     # minute interval these were three lines of zeroes every pass -- more than

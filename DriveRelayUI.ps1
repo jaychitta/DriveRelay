@@ -25,9 +25,12 @@ Add-Type -AssemblyName System.Drawing
 . (Join-Path $root 'lib\Provider.ps1')
 . (Join-Path $root 'lib\Conflicts.ps1')
 . (Join-Path $root 'lib\Availability.ps1')
+. (Join-Path $root 'lib\Settle.ps1')
+. (Join-Path $root 'lib\Manifest.ps1')
 . (Join-Path $root 'lib\Icons.ps1')
 . (Join-Path $root 'lib\Registry.ps1')
 . (Join-Path $root 'lib\Settings.ps1')
+. (Join-Path $root 'lib\DashboardScan.ps1')
 
 Set-LogPath      (Join-Path $root 'driverelay.log')
 Set-RegistryPath (Join-Path $root 'config\links.json')
@@ -40,6 +43,11 @@ $script:Child     = $null
 # opening a second window.  Only one expanded list is useful at a time.
 $script:ExpandedDuplicateLink = $null
 $script:ConflictCopiesByLink = @{}
+$script:DeletionConflictsByLink = @{}
+$script:AvailabilityByLink = @{}
+$script:ScanErrorsByLink = @{}
+$script:InventoryRegistryJson = ''
+$script:InventoryScan = $null
 
 # Try to enable dark title bar on Windows 10/11.
 try {
@@ -114,17 +122,22 @@ function Get-StatusInfo {
         return @{ Text = 'Paused'; Color = $script:StatusGray; Detail = '' }
     }
 
-    # Availability outranks everything else: if the drive is not there, saying
-    # "up to date" is worse than saying nothing. Checked live, so the card is
-    # right the moment the window opens rather than as of the last pass.
+    # Filesystem and process checks are collected by the background worker.
     try {
-        $a = Get-LinkAvailability -Link $Link
-        if ($a.State -ne 'Ready') {
+        $a = $script:AvailabilityByLink[$Link.Id]
+        if ($a -and $a.State -ne 'Ready') {
             $colour = if ($a.Blocking) { $script:StatusRed } else { $script:StatusAmber }
             return @{ Text = $a.Summary; Color = $colour; Detail = $a.Detail }
         }
     }
     catch { }
+
+    if ($script:ScanErrorsByLink[$Link.Id]) {
+        return @{ Text = 'Status check failed'; Color = $script:StatusAmber; Detail = $script:ScanErrorsByLink[$Link.Id] }
+    }
+    if (-not $a) {
+        return @{ Text = 'Checking folders...'; Color = $script:TextMuted; Detail = 'Folder status and conflicts are being checked in the background.' }
+    }
 
     if (-not $Link.Seeded) {
         return @{ Text = 'Not synced yet'; Color = $script:StatusAmber; Detail = '' }
@@ -155,10 +168,11 @@ function Get-StatusInfo {
                   Color = $script:StatusAmber
                   Detail = $(if ($reason) { $reason } else { $detail }) }
     }
-    $files = @($ConflictCopies)
-    if (-not $ConflictCopiesChecked) {
-        try { $files = @(Get-LinkConflictCopies -Link $Link) } catch { $files = @() }
+    if ($script:DeletionConflictsByLink.ContainsKey($Link.Id) -and @($script:DeletionConflictsByLink[$Link.Id]).Count -gt 0) {
+        return @{ Text = ("{0} deletion conflict(s)" -f @($script:DeletionConflictsByLink[$Link.Id]).Count)
+                  Color = $script:StatusAmber; Detail = 'Click Review to resolve deletion conflicts. The surviving copy has been preserved.' }
     }
+    $files = @($ConflictCopies)
     if ($files.Count -gt 0) {
         return @{ Text = ("{0} duplicate(s)" -f $files.Count); Color = $script:StatusAmber
             Detail = 'Click Duplicates to review the original and conflict copy.' }
@@ -822,15 +836,12 @@ $actionBar.Controls.AddRange(@($btnAdd, $btnSettings, $btnLog, $btnClose))
 function New-LinkCard {
     param([object] $Link, [int] $Y)
 
-    # Scan at render time so the affordance is only present while conflict
-    # copies actually exist.  Pass summaries can be stale between background
-    # runs, whereas this inexpensive metadata-only inventory is current.
-    $duplicateCopies = if ($script:ConflictCopiesByLink.ContainsKey($Link.Id)) {
-        @($script:ConflictCopiesByLink[$Link.Id])
-    } else {
-        try { @(Get-LinkConflictCopies -Link $Link) } catch { @() }
-    }
+    # Rendering only reads the latest completed background inventory.
+    $duplicateCopies = @(if ($script:ConflictCopiesByLink.ContainsKey($Link.Id)) {
+        $script:ConflictCopiesByLink[$Link.Id]
+    })
     $duplicatesExpanded = ($script:ExpandedDuplicateLink -eq $Link.Id -and $duplicateCopies.Count -gt 0)
+    $deletionConflicts = @($script:DeletionConflictsByLink[$Link.Id])
     $cardHeight = if ($duplicatesExpanded) { 398 } else { 116 }
 
     $card = New-Object System.Windows.Forms.Panel
@@ -934,7 +945,7 @@ function New-LinkCard {
     $lblMeta.ForeColor = $script:TextMuted
     $lblMeta.BackColor = [System.Drawing.Color]::Transparent
     $lblMeta.Location = New-Object System.Drawing.Point -ArgumentList 20, 88
-    $lblMeta.Size = New-Object System.Drawing.Size -ArgumentList 488, 18
+    $lblMeta.Size = New-Object System.Drawing.Size -ArgumentList 398, 18
     $lblMeta.Anchor = 'Top,Left,Right'
     $card.Controls.Add($lblMeta)
 
@@ -944,7 +955,8 @@ function New-LinkCard {
         $btnDuplicates.FlatStyle = 'Flat'
         $btnDuplicates.BackColor = $script:BtnBg
         $btnDuplicates.ForeColor = $script:TextPrimary
-        $btnDuplicates.Location = New-Object System.Drawing.Point -ArgumentList 514, 84
+        $duplicateX = if ($deletionConflicts.Count -gt 0) { 424 } else { 514 }
+        $btnDuplicates.Location = New-Object System.Drawing.Point -ArgumentList $duplicateX, 84
         $btnDuplicates.Size = New-Object System.Drawing.Size -ArgumentList 84, 25
         $btnDuplicates.Anchor = 'Top,Right'
         $btnDuplicates.Tag = $Link.Id
@@ -963,6 +975,35 @@ function New-LinkCard {
             $card.Controls.Add($details)
             $details.Controls.Add((New-ConflictGrid -Copies $duplicateCopies))
         }
+    }
+
+    if ($deletionConflicts.Count -gt 0) {
+        $btnReview = New-Object System.Windows.Forms.Button
+        $btnReview.Text = 'Review'
+        $btnReview.FlatStyle = 'Flat'
+        $btnReview.BackColor = $script:BtnBg
+        $btnReview.ForeColor = $script:TextPrimary
+        $btnReview.Location = New-Object System.Drawing.Point -ArgumentList 514, 84
+        $btnReview.Size = New-Object System.Drawing.Size -ArgumentList 84, 25
+        $btnReview.Anchor = 'Top,Right'
+        $btnReview.Tag = $Link.Id
+        $btnReview.Add_Click({
+            $review = New-Object System.Windows.Forms.Form
+            $review.Text = "Deletion conflicts - $($this.Tag)"
+            $review.Size = New-Object System.Drawing.Size -ArgumentList 760, 500
+            $review.StartPosition = 'CenterParent'
+            $review.BackColor = $script:BgColor
+            $text = New-Object System.Windows.Forms.TextBox
+            $text.Multiline = $true; $text.ReadOnly = $true
+            $text.ScrollBars = 'Both'; $text.WordWrap = $true; $text.Dock = 'Fill'
+            $text.BackColor = $script:BgColor; $text.ForeColor = $script:TextPrimary
+            $text.Text = Format-DeletionConflicts -Conflicts $script:DeletionConflictsByLink[$this.Tag]
+            $review.Controls.Add($text)
+            [void]$review.ShowDialog($form)
+            $review.Dispose()
+            Update-Cards
+        })
+        $card.Controls.Add($btnReview)
     }
 
     # Give the common double-click action a visible button as well.
@@ -1068,10 +1109,14 @@ function Update-Cards {
     $cardPanel.Controls.Clear()
     $links = @(Get-LinkRegistry)
     $sum = Read-PassSummarySafe
-    $script:ConflictCopiesByLink = @{}
-    foreach ($link in $links) {
-        try { $script:ConflictCopiesByLink[$link.Id] = @(Get-LinkConflictCopies -Link $link) }
-        catch { $script:ConflictCopiesByLink[$link.Id] = @() }
+    $registryJson = ConvertTo-Json -InputObject $links -Depth 8 -Compress
+    if ($script:InventoryRegistryJson -ne $registryJson) {
+        $script:ConflictCopiesByLink = @{}
+        $script:DeletionConflictsByLink = @{}
+        $script:AvailabilityByLink = @{}
+        $script:ScanErrorsByLink = @{}
+        $script:InventoryRegistryJson = $registryJson
+        $script:InventoryRefreshNeeded = $true
     }
 
     $summaryLinks.Text = "{0} linked" -f $links.Count
@@ -1148,13 +1193,41 @@ $timer.Add_Tick({
     }
 })
 
-# Conflict copies can be resolved in Explorer while the dashboard is open.
-# Rebuild the cards periodically so the duplicate badge/list disappears without
-# requiring a sync or a close-and-reopen of this window.
+# Poll completion cheaply; never stack scans if a large folder takes longer
+# than the refresh interval. Reject results if the registry changed meanwhile.
+$script:InventoryRefreshNeeded = $true
+$script:NextInventoryScan = [datetime]::MinValue
 $duplicateRefreshTimer = New-Object System.Windows.Forms.Timer
-$duplicateRefreshTimer.Interval = 5000
+$duplicateRefreshTimer.Interval = 250
 $duplicateRefreshTimer.Add_Tick({
-    if (-not $script:Child) { Update-Cards }
+    if ($script:InventoryScan -and $script:InventoryScan.Handle.IsCompleted) {
+        $scan = $script:InventoryScan
+        $script:InventoryScan = $null
+        try {
+            $entries = @($scan.Worker.EndInvoke($scan.Handle))
+            $current = ConvertTo-Json -InputObject @(Get-LinkRegistry) -Depth 8 -Compress
+            if ($current -eq $scan.RegistryJson) {
+                foreach ($entry in $entries) {
+                    $script:AvailabilityByLink[$entry.Id] = $entry.Availability
+                    $script:ConflictCopiesByLink[$entry.Id] = @($entry.Copies)
+                    $script:DeletionConflictsByLink[$entry.Id] = @($entry.Deletions)
+                    $script:ScanErrorsByLink[$entry.Id] = $entry.Error
+                }
+            } else { $script:InventoryRefreshNeeded = $true }
+        }
+        catch {
+            foreach ($link in @(Get-LinkRegistry)) { $script:ScanErrorsByLink[$link.Id] = $_.Exception.Message }
+        }
+        finally { $scan.Worker.Dispose() }
+        Update-Cards
+        $script:NextInventoryScan = (Get-Date).AddSeconds(5)
+    }
+    if (-not $script:Child -and -not $script:InventoryScan -and
+        ($script:InventoryRefreshNeeded -or (Get-Date) -ge $script:NextInventoryScan)) {
+        Update-Cards
+        $script:InventoryRefreshNeeded = $false
+        $script:InventoryScan = Start-DashboardScan -Root $root -Links @(Get-LinkRegistry) -StateRoot $script:StateRoot
+    }
 })
 $duplicateRefreshTimer.Start()
 
@@ -1185,5 +1258,12 @@ $btnLog.Add_Click({
 $btnClose.Add_Click({ $form.Close() })
 
 $form.Add_Shown({ Update-Cards })
-[void]$form.Add_FormClosed({ $duplicateRefreshTimer.Stop(); $duplicateRefreshTimer.Dispose() })
+[void]$form.Add_FormClosed({
+    $duplicateRefreshTimer.Stop(); $duplicateRefreshTimer.Dispose()
+    if ($script:InventoryScan) {
+        # Do not wait on a slow filesystem while closing the window. The UI's
+        # dedicated process exits after ShowDialog returns.
+        [void]$script:InventoryScan.Worker.BeginStop($null, $null)
+    }
+})
 [void]$form.ShowDialog()

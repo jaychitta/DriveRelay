@@ -4,6 +4,12 @@
 
 The tray icon by the clock is the normal interface.
 
+The dashboard displays cards immediately with **Checking folders...** while it
+checks availability, duplicate copies and deletion conflicts in the background.
+It refreshes these live inventories five seconds after each scan finishes;
+large or disconnected folders do not block the window. **Status check failed**
+means the inventory could not be read; its tooltip gives the error.
+
 | Menu item | What it does |
 |---|---|
 | *(top line)* | Current state — up to date, syncing, or needs attention |
@@ -100,6 +106,20 @@ Three things are not CLI commands, and are reached elsewhere:
 | held open | An application has the file locked |
 | excluded | Matches a pattern in `config\excludes.txt` |
 
+## Moves and renames
+
+Moves within a linked folder are detected automatically after a successful pass
+has recorded NTFS identities. `check` and `status` list `MoveLocal` / `MoveRemote`
+as `old\path -> new\path`. A folder move is relayed one file at a time, with empty
+old folders cleaned up. Proven moves do not use the deletion allowance and do
+not recopy file contents. Locked or unsettled files wait for a later pass.
+
+A move that cannot be proven from identity uses normal copy/delete/conflict
+handling. This includes moves made before the first identity baseline, files
+edited during the move, cross-volume moves, hard links and unsupported provider
+filesystems. Destination collisions or paths changed during a queued move are
+deferred without overwriting. Empty folders and case-only renames are not synced.
+
 ## Options per link
 
 | Option | Default | Meaning |
@@ -128,6 +148,14 @@ company files for as long as a company is open; that is intended and protects th
 
 **A conflict copy appeared.** Both versions were kept. Open both, decide, delete the one you do
 not want. The next pass propagates the deletion.
+
+**A card shows deletion conflicts.** Click **Review** for the affected files,
+the deleted side, and the surviving paths. A tracked file was deleted on one
+side while the other copy's size or timestamp changed. DriveRelay preserves
+that survivor and leaves the deletion intact. Delete the survivor to keep the
+deletion, or deliberately restore it to the listed deleted path to keep the
+file. The next pass clears the conflict after resolution. `check -Detailed`
+and `status` also list the pending `DeletionConflict` actions.
 
 Cards show a **Duplicates** button only while conflict copies exist; it expands the list within
 the dashboard. Use it or CLI `status` to see which original
@@ -189,6 +217,23 @@ Set it with `config -LogMaxAgeDays 60`, or `0` to turn the age limit off and rel
 
 ## Install and uninstall
 
+The distributable `DriveRelay-Setup-<version>.exe` is a normal Windows setup
+wizard. It installs for the current account in
+`%LOCALAPPDATA%\Programs\DriveRelay` by default, adds a Start Menu group, and
+offers Windows startup and desktop shortcuts. It is also listed under Windows
+Settings > Apps > Installed apps. End users need no separate build tools.
+
+Exit the tray and close the dashboard before upgrading; setup checks the tray
+and pass mutexes and refuses to replace files while either is running. Uninstall
+from Windows Settings or the Start Menu's Uninstall DriveRelay entry. Settings,
+links, sync history, logs and custom exclusions stay in the install folder.
+To keep them during an upgrade, select the same standalone install folder.
+A new folder starts fresh; the installer does not import private configuration
+from another location. If migrating a source installation that uses a scheduled
+task, run its `DriveRelay.ps1 stop` before switching to the packaged tray.
+
+For source-folder setup, the existing commands remain:
+
 ```powershell
 .\Install.ps1 -IntervalMinutes 10
 .\Install.ps1 -NoAutoStart      # no Startup shortcut
@@ -197,3 +242,9 @@ Set it with `config -LogMaxAgeDays 60`, or `0` to turn the age limit off and rel
 ```
 
 No administrator rights, no services. Uninstall never touches files in any linked folder.
+
+Setup builds a branded `DriveRelay.exe` launcher and points the Startup and Start Menu
+tray shortcuts at it. If Task Manager's **Startup apps** shows `wscript` from an older
+installation, rerun `Setup.cmd`, then reopen Task Manager. The entry should show
+**DriveRelay**. The background tray process itself still runs in Windows PowerShell.
+`-NoAutoStart` removes any existing DriveRelay Startup shortcut when reinstalling.

@@ -84,6 +84,13 @@ again.
 **Wrong version won.** It did not — conflicts keep both. Look for
 `<name> (conflict from <drive> <timestamp>)<ext>` beside the file.
 
+**A deletion conflicts with a possible edit.** The dashboard shows **Review**
+with the surviving copy and deleted path. DriveRelay leaves the deletion intact
+and preserves the survivor. To confirm deletion, delete the survivor. To keep
+the file, restore that survivor to the deleted path. Then sync again to clear
+the conflict. A timestamp-only change can trigger review because the engine
+never reads cloud content just to compare it.
+
 **Everything looks deleted.** Stop. Do not run another pass. This is what the delete cap is for:
 if more than `MaxDelete` files vanish, the pass aborts untouched. The usual cause is a remote
 folder that is not mounted — check the path exists and is populated before syncing again.
