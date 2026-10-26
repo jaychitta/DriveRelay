@@ -187,7 +187,11 @@ DriveRelayTray.vbs  legacy hidden launcher for manual use
 Install.ps1         icons, launcher, Start Menu and Startup shortcuts
 Uninstall.ps1       reverses the above; keeps links unless told otherwise
 
-lib\Logging.ps1     Write-Log, shared, size-capped
+lib\Logging.ps1     Write-Log, shared, severity-filtered, size/age retention
+lib\LogViewer.ps1   read-only log window for tray/dashboard
+lib\Availability.ps1 drive/folder/client availability classification
+lib\Conflicts.ps1   conflict-copy and deletion-conflict inventories
+lib\DashboardScan.ps1 background dashboard inventories
 lib\Provider.ps1    remote path resolution and provider detection
 lib\Icons.ps1       the artwork, drawn in code
 lib\Registry.ps1    links.json
@@ -211,36 +215,31 @@ script beside itself and starts the Windows PowerShell host with `UseShellExecut
 and `CreateNoWindow = true`, then exits. The tray continues to run in PowerShell. The build
 uses the compiler shipped with Windows; no separate SDK is required.
 
-## Packaged installation
+## Source installation and generated output
 
-`tools/New-Installer.ps1` builds `dist/DriveRelay-Setup-<version>.exe` with Inno
-Setup 6. It stages an explicit allowlist of runtime scripts, required icons,
-example configuration and public documentation, then compiles a fresh launcher
-into that stage. Real configuration, manifests, logs, tests and repository
-metadata never enter the stage. A SHA-256 payload inventory and installer
-checksum accompany the output; unique staging directories are retained under
-`build/installer/` for inspection. Inno Setup is a build dependency only.
+`Setup.cmd` invokes `Install.ps1` in the source folder. Setup persists startup
+preferences, builds the branded launcher with the Windows .NET Framework
+compiler and creates current-user Start Menu/Startup shortcuts. Shortcuts use
+the source folder directly. No separate application payload is staged, no
+Windows uninstall registration is created, and setup does not guard an active
+pass. The operator must wait for passes to finish and close the tray/dashboard
+before updating source. `Uninstall.cmd` / `Uninstall.ps1` reverse source setup;
+runtime links and history remain unless their removal is explicitly requested.
 
-`tools/DriveRelay.iss` installs under the current account's LocalAppData Programs
-folder by default, requires no elevation, and owns shortcuts and the Windows
-uninstall entry. It checks the existing global tray/pass mutexes before install
-or uninstall and never forcibly terminates a pass. After copying files,
-`tools/Configure-Install.ps1` persists the selected startup option using the
-settings module. The launcher is prebuilt, so end users need no compiler.
+Inno Setup packaging was withdrawn on 2026-10-26. Its builder, template,
+configuration helper and installer verification script are removed. Prior
+packages, checksums, inventories and logs under ignored `release/` are retained
+as historical local evidence. Older changelog entries describe the packaging
+that existed then; they are not current build instructions.
 
-Only installer-owned application files are removed. Settings, registered links,
-sync state and logs are generated at runtime and are outside the uninstall
-inventory. `config/excludes.txt` uses `onlyifdoesntexist uninsneveruninstall` to
-keep customized patterns through upgrades and removal. There is no recursive
-application-directory cleanup. Portable source setup remains available through
-`Setup.cmd` / `Install.ps1`.
-
-`tests/Test-Installer.ps1` builds the release and an isolated verification variant
-of the same installer template. The variant remaps Start Menu, Startup and
-Desktop paths and mutex names into test-only locations and disables Windows
-uninstall registration. It tests guarded installation, packaged CLI loading,
-shortcut targets/options, settings persistence, upgrading and removal while
-checking runtime sentinels survive. It never runs a sync or launches a tray.
+`tools/Clear-BuildOutput.ps1` accepts only `build` and `dist` at the repository
+root, checks their ancestors and descendants for links, and validates every
+requested tree before deleting any. It never removes `release/`, source,
+configuration or sync history. `tests/Test-BuildCleanup.ps1` exercises it in a
+disposable fixture, including a real junction. Clear stale generated output
+before builds and remove temporary output after successful checks and its
+consumers finish. The root launcher used by source setup is a runtime artifact
+and stays in place.
 
 ## Two PowerShell 5.1 traps worth knowing
 

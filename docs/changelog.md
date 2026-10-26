@@ -2,6 +2,73 @@
 
 All notable changes to DriveRelay (formerly SyncOrchestrator) will be documented in this file.
 
+## [Maintenance] - 2026-10-26 — audit and withdraw Inno Setup support
+
+- At Jay's direction, removed the Inno builder, installer template, packaged
+  settings helper and installer verification test. Source setup remains through
+  Setup.cmd / Install.ps1, with Uninstall.cmd / Uninstall.ps1 for removal.
+  Updated current installation, architecture and root guidance accordingly.
+  Historical changelog entries, local packages and verification evidence remain.
+- Audited the pending housekeeping/docs changes. Restricted output cleanup to
+  DriveRelay's root build/dist folders and stopped subset cleanup from deleting
+  unrequested empty folders. Added disposable-fixture regression coverage.
+  Installer-log overwrite concerns became obsolete with installer withdrawal.
+- Windows PowerShell 5.1 core regression: 232 passed, 0 failed; hard-link
+  creation was unavailable in the sandbox. Cleanup regression: 19 passed,
+  including real-junction refusal outside the sandbox. Local reports are in
+  release/verification/audit-2026-10-26/. No live sync or installation performed.
+- Final review: 26 PowerShell files parsed, 15 local documentation file links
+  resolved, whitespace checks passed and no remaining findings were identified
+  in the pending change set. Preserved the test log before removing generated
+  test scratch files; build/dist are absent. Runtime data and historical
+  packages/evidence remain excluded from the source commit.
+- The October 22 installer verification follow-up is superseded by withdrawal;
+  it is no longer pending. Historical packages in release are not rebuilt or
+  supported releases. This source change does not uninstall an existing app.
+
+## [Documentation] - 2026-10-26 — consistency review
+
+- Corrected the README's obsolete claim that audit fixes remain pending,
+  documented the current hydration default and CLI inheritance, and aligned
+  idle-log troubleshooting with the hourly heartbeat behavior.
+- Marked development-machine measurements as historical; completed module and
+  release-directory descriptions and the root documentation/verification map.
+- Documentation-only changes. Checked local Markdown file links, referenced
+  source/defaults, housekeeping evidence paths and diff whitespace. Application
+  tests were not rerun; the pending installer verification remains unchanged.
+
+## [Maintenance] - 2026-10-26 — housekeeping
+
+- Cleared stale build/dist staging: 204 files, 21,720,859 bytes. Preserved
+  the existing 1.0.0 installer, matching SHA-256 sidecar and payload inventory
+  under release/; retained 18 installer test logs/templates under
+  release/verification/housekeeping-2026-10-26/build/. Original paths, sizes,
+  hashes and preserved destinations are in that folder's inventory.csv.
+  Also removed three obsolete scratch_engine test fixture files (310 bytes).
+  Net space reclaimed before documentation: 19,276,934 bytes. Release/evidence
+  files remain ignored local artifacts, not a remote backup.
+- Checked exact repository paths and refused linked cleanup paths; verified
+  preserved copies by SHA-256 and confirmed build/dist are absent. Verified
+  55 tracked/runtime files remained unchanged during cleanup. Live settings,
+  links, sync history, operational logs and the launcher were retained.
+- No additional generated caches or previews were found; this chat's temporary
+  visualization folder was empty. Documentation whitespace checks passed.
+- Existing uncommitted build-cleanup changes remain pending as recorded in
+  the October 22 entry. Next action for that work is real installer verification
+  when Inno Setup 6 is available. No build, install, commit or push performed.
+
+## [Maintenance] - 2026-10-22 — build cleanup
+
+- Clear stale build/dist before packaging and remove both after success. Keep
+  installer, checksum and payload inventory in release; installer verification
+  consumes staging before saving logs and doing the same final cleanup.
+- Exact repository paths and linked directories are checked before removal.
+  Failed builds retain diagnostics. No live sync folders or installation change.
+- Verification: PowerShell parsing, whitespace, disposable deletion/preservation,
+  real-junction refusal and mocked compiler success/failure ordering passed.
+  Real Test-Installer stopped before cleanup because Inno Setup 6 is absent;
+  rerun it when the compiler is available. No installation, commit or push.
+
 ## [Maintenance] - 2026-10-19 — Git synchronization check
 
 - Main matched GitHub after fetching; no extra local or remote branches existed.

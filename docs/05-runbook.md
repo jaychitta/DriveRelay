@@ -116,7 +116,9 @@ finishing with them; lower it if changes take too long to appear. Edit `SettleMi
 ## When a pass will not run
 
 1. Is the tray running and not paused?
-2. `driverelay.log` — a pass always logs something, even when idle.
+2. `driverelay.log` — at INFO, unchanged passes are combined into an hourly
+   idle heartbeat. Silence between those heartbeats is expected; use `status`
+   to inspect the link without starting a sync.
 3. Another pass may still be working; overlapping passes are skipped by design.
 4. `status` will report a missing folder rather than treating it as mass deletion.
 

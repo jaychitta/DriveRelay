@@ -90,33 +90,20 @@ it is merely degraded, with the full explanation in the tooltip.
 
 ## Install
 
-Double-click **`DriveRelay-Setup-1.0.0.exe`** from the release package. The wizard
-installs for your Windows account, normally in
-`%LOCALAPPDATA%\Programs\DriveRelay`, with a Start Menu entry and optional
-Windows startup and desktop shortcuts. No administrator rights are needed.
-Choose **Start DriveRelay** on the final page to launch the tray agent.
-
-Exit an existing DriveRelay tray agent and let any sync finish before upgrading;
-setup checks for both and asks you to close them before changing application files.
-Installing over an existing standalone installation preserves its links,
-preferences, sync history, logs and customized exclusion patterns. A new install
-starts with no linked folders; personal configuration is never in the installer.
+Download or clone the repository into a permanent local folder, then double-click
+**`Setup.cmd`**. Keep the source folder in place: shortcuts launch the scripts
+and generated launcher from that location. No administrator rights are needed.
 For everyday usage, see the [operating guide](docs/04-operations.md).
 
-To remove a packaged installation, use **Windows Settings > Apps > Installed
-apps > DriveRelay > Uninstall**, or **Uninstall DriveRelay** in the Start Menu.
-Uninstall removes application files and shortcuts while keeping settings, links,
-sync history, logs and exclusion patterns for a future reinstall. It never
-touches the files inside your linked folders.
-
-### Setting up from source
-
-Download or clone the repository, then double-click **`Setup.cmd`**.
+Before updating the source folder, pause syncing, let the current pass finish,
+and exit the tray and dashboard. Preserve `config/links.json`,
+`config/settings.json`, `config/excludes.txt`, `state/` and operational logs.
+Rerun `Setup.cmd` after updating. Setup does not guard against a running pass.
 
 It creates a Start Menu entry, an optional Windows startup entry, and a hidden
 launcher for the tray agent.
 
-The installer builds `DriveRelay.exe` using the .NET Framework compiler included
+Setup builds `DriveRelay.exe` using the .NET Framework compiler included
 with Windows. Startup apps in Task Manager identifies this launcher as
 **DriveRelay**. Rerun Setup to update an older shortcut that displays `wscript`.
 
@@ -131,25 +118,11 @@ To remove it again, double-click **`Uninstall.cmd`**. That takes away the
 shortcuts and the tray agent and leaves your links, your sync history and every
 file in every linked folder exactly as they are.
 
-### Building the installer
-
-Install [Inno Setup 6](https://jrsoftware.org/isinfo.php) on the build machine, then:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\New-Installer.ps1
-```
-
-The build produces `dist\DriveRelay-Setup-1.0.0.exe`, a SHA-256 checksum file and
-a payload inventory. `-Version 1.0.1`, `-OutputDirectory <path>` and
-`-CompilerPath <path-to-ISCC.exe>` are optional. The launcher is compiled freshly
-in an isolated staging folder. Only explicitly listed application files are
-packaged; live settings, links, sync state, logs and test files are excluded.
-The output is unsigned unless a separate signing process is applied.
-
-Run `tests\Test-Installer.ps1` with Windows PowerShell to rebuild and verify
-installation, upgrading, options and data-preserving removal. The verification
-installer remaps its shortcuts into scratch folders and disables Windows
-uninstall registration, so it does not change your live installation.
+The Inno Setup installer was withdrawn on 2026-10-26. Its build tools and tests
+are no longer part of the project. Historical packages and verification evidence
+may remain locally under ignored `release/`; they are not the current install
+method. An existing packaged installation retains its own Windows uninstall
+entry; source setup does not migrate or uninstall it.
 
 ## Use
 
@@ -250,12 +223,15 @@ Setup.cmd             Double-clickable installer
 Uninstall.cmd         Double-clickable uninstaller
 Install.ps1           The install itself (shortcuts, launcher, startup entry)
 Uninstall.ps1         Reverses it
-lib/                  Actions, Hydration, Icons, Logging, Manifest, Pass,
-                      Provider, Registry, Settings, Settle
+lib/                  Actions, Availability, Conflicts, DashboardScan,
+                      FileIdentity, Hydration, Icons, Logging, LogViewer,
+                      Manifest, Pass, Provider, Registry, Settings, Settle
 config/               settings, links, exclude patterns
 docs/                 rationale, architecture, operations, runbook, audit
 tests/                regression suite
-tools/                icon generator and launcher source/build script
+tools/                icon/launcher sources, build scripts and output cleanup
+release/              Historical packages and saved verification evidence
+                      (local, ignored by Git)
 LICENSE               MIT
 ```
 
@@ -283,6 +259,12 @@ generation, the suite covers the parts that can lose data:
 
 Tests log to `tests/test-run.log` and never to the production log. They do use
 the real Recycle Bin, since that is the delete path under test.
+
+Run `powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-BuildCleanup.ps1`
+to verify output cleanup in a disposable fixture. Its junction-refusal checks
+require permission to create a Windows directory junction. The cleanup helper
+accepts only repository-root `build` and `dist`, validates all requested trees
+before deletion, and leaves saved evidence under `release/` alone.
 
 ## Audit
 
@@ -335,8 +317,8 @@ known to be wrong.
 
 Bugs found in AI review are listed in `docs/06-audit.md` with the method used to
 confirm each one — reproduced against running code, or identified by reading it.
-Twelve findings, two of them reproduced. None of the medium findings have been
-fixed yet; they are reported for triage, not quietly patched.
+All twelve findings are resolved; the audit's Summary and Resolutions sections
+record their disposition and the checks performed at that time.
 
 ## License
 

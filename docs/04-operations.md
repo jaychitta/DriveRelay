@@ -126,10 +126,15 @@ deferred without overwriting. Empty folders and case-only renames are not synced
 |---|---|---|
 | `SettleMinutes` | 3 | How long a file must be quiet before it is eligible |
 | `MaxDelete` | 50 | A pass proposing more deletions aborts without applying anything |
-| `HydrateBeforeDelete` | off | Download cloud-only files before deleting so the Recycle Bin keeps a copy |
+| `HydrateBeforeDelete` | on | Download cloud-only files before deleting so the Recycle Bin keeps a copy |
 | `Dehydrate` | on | Free space on the remote side after syncing |
 | `Provider` | Auto | Force `CloudFiles` or `Plain` if detection is wrong |
 | `Enabled` | on | Disable to pause one link |
+
+New CLI links inherit `SettleMinutes`, `MaxDelete` and `HydrateBeforeDelete`
+from global settings unless explicitly overridden. The table shows the shipped
+defaults; existing links retain their own saved values. The lower-level
+`Add-Link` helper defaults hydration off when called directly without an override.
 
 ## Unsticking things
 
@@ -217,22 +222,11 @@ Set it with `config -LogMaxAgeDays 60`, or `0` to turn the age limit off and rel
 
 ## Install and uninstall
 
-The distributable `DriveRelay-Setup-<version>.exe` is a normal Windows setup
-wizard. It installs for the current account in
-`%LOCALAPPDATA%\Programs\DriveRelay` by default, adds a Start Menu group, and
-offers Windows startup and desktop shortcuts. It is also listed under Windows
-Settings > Apps > Installed apps. End users need no separate build tools.
-
-Exit the tray and close the dashboard before upgrading; setup checks the tray
-and pass mutexes and refuses to replace files while either is running. Uninstall
-from Windows Settings or the Start Menu's Uninstall DriveRelay entry. Settings,
-links, sync history, logs and custom exclusions stay in the install folder.
-To keep them during an upgrade, select the same standalone install folder.
-A new folder starts fresh; the installer does not import private configuration
-from another location. If migrating a source installation that uses a scheduled
-task, run its `DriveRelay.ps1 stop` before switching to the packaged tray.
-
-For source-folder setup, the existing commands remain:
+Keep the complete source folder in a permanent local location and run
+`Setup.cmd`, or use the commands below. Shortcuts target this source folder;
+there is no separate application copy or Windows Installed Apps registration.
+Setup retires the old DriveRelay/SyncOrchestrator scheduled tasks, because the
+tray provides the timer.
 
 ```powershell
 .\Install.ps1 -IntervalMinutes 10
@@ -242,6 +236,16 @@ For source-folder setup, the existing commands remain:
 ```
 
 No administrator rights, no services. Uninstall never touches files in any linked folder.
+
+Before replacing source files, pause syncing, wait for the current pass to
+finish, then exit the tray and dashboard. Keep settings, links, customized
+exclusions, state and logs in place; rerun Setup afterwards. Source setup does
+not check the tray/pass mutexes and must not run over an active pass.
+
+Inno Setup support was withdrawn on 2026-10-26. Historical packages and their
+verification records remain local reference material, not the supported install
+method. Existing packaged installations keep their own Windows uninstall entry;
+these source commands do not migrate or remove that registration.
 
 Setup builds a branded `DriveRelay.exe` launcher and points the Startup and Start Menu
 tray shortcuts at it. If Task Manager's **Startup apps** shows `wscript` from an older

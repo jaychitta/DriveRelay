@@ -13,8 +13,6 @@ DriveRelay relays files between a high-speed local NTFS working folder and a clo
 - `Setup.cmd`: Double-clickable installer. Wraps `Install.ps1` with a process-scoped execution policy, guards against a partial extraction, passes arguments through, and offers to start the tray agent.
 - `Uninstall.cmd`: Double-clickable uninstaller wrapping `Uninstall.ps1`.
 - `Install.ps1`: Creates Startup and Start Menu shortcuts and sets up the tray agent.
-- `tools/New-Installer.ps1` / `tools/DriveRelay.iss`: Build a per-user Inno Setup 6 installer in `dist/`, with a freshly compiled launcher and an explicit allowlist of runtime files. Keep live settings, links, state, logs and tests out of the payload. Inno owns shortcuts and uninstall registration, checks the tray/pass mutexes, and preserves runtime data on upgrade/removal.
-- `tools/Configure-Install.ps1`: Persists the packaged installer's Windows startup choice through `lib/Settings.ps1`; preserves other supported settings.
 - `Uninstall.ps1`: Cleanly uninstalls shortcuts, launcher, and background processes.
 - `README.md`: Public-facing overview, safety model, install/usage, known issues, authorship (concept and direction: Jayadheer Chitta; implementation: Claude).
 - `LICENSE`: MIT, © 2026 Jayadheer Chitta.
@@ -32,6 +30,7 @@ DriveRelay relays files between a high-speed local NTFS working folder and a clo
     generation also aged out past `LogMaxAgeDays` regardless of how many `LogKeepFiles` allows
     for. Dot-sourced into the entry scripts, so its state variables are deliberately named to
     avoid colliding with their parameters (`$script:LogThreshold`, not `$script:LogLevel`).
+  - `LogViewer.ps1`: Read-only log viewer used by the tray and dashboard.
   - `Manifest.ps1`: Metadata-only snapshots and change tracking. Loads `FileIdentity.ps1`; records optional per-side NTFS IDs and pairs unchanged tracked moves into `MoveLocal`/`MoveRemote`. Produces `DeletionConflict` for a tracked deletion versus changed survivor, and records destination parents for queued-copy/move checks. Never hashes cloud content.
   - `FileIdentity.ps1`: Zero-access Windows metadata handles for NTFS file IDs (volume, file index, creation time), excluding hard links and unsupported filesystems. Native same-volume rename refuses overwrites and copying across volumes. Loaded by `Manifest.ps1` in every engine/inventory host.
   - `Pass.ps1`: Sync pass orchestration logic. Collapses runs of no-op passes into one
@@ -51,12 +50,30 @@ DriveRelay relays files between a high-speed local NTFS working folder and a clo
   - `DriveRelay_badge.png`: Full-bleed rounded badge master.
 - `tests/`:
   - `Test-DriveRelay.ps1`: Automated regression test suite.
-  - `Test-Installer.ps1`: Builds the release and verifies payload hashes/privacy, guarded installation, shortcut options, upgrades and data-preserving uninstall. Verification remaps OS integration into `build/installer-tests/` and disables uninstall registry entries; no live application is installed or stopped.
-- `build/` / `dist/`: Gitignored staging, verification logs, installer executable, SHA-256 sidecar and payload inventory. Staging trees are unique and retained for inspection.
+  - `Test-BuildCleanup.ps1`: Disposable-fixture checks for output removal, preservation, invalid requests and linked-path refusal. Real-junction checks need Windows junction creation permission.
+- `build/` / `dist/`: temporary generated work. `tools/Clear-BuildOutput.ps1` accepts only these two repository-root directories, validates all targets before removal and refuses links. Clear stale output before builds and remove temporary output after its consumers finish.
+- `release/`: ignored local historical packages, checksums, inventories and saved verification evidence. Preserve these records during housekeeping. Inno Setup support was withdrawn on 2026-10-26; its builder, template, configuration helper and installer test are removed. Source setup through `Setup.cmd` / `Install.ps1` remains supported.
 - `DriveRelay.ico`: Root-level icon for direct shortcut association.
 - `docs/`:
-  - `changelog.md`: Record of project changes and updates.
-  - `06-audit.md`: Full code audit — 12 findings, each labelled by how it was established (reproduced against running code, or read from source).
+  - [01-why.md](docs/01-why.md): Original problem and design rationale.
+  - [02-current-state.md](docs/02-current-state.md): Dated development-machine measurements, not a live inventory.
+  - [03-architecture.md](docs/03-architecture.md): Engine, safety rules, modules and source installation.
+  - [04-operations.md](docs/04-operations.md): Current commands, settings and installation guidance.
+  - [05-runbook.md](docs/05-runbook.md): Migration, recovery and troubleshooting procedures.
+  - [06-audit.md](docs/06-audit.md): Historical code audit, with all 12 findings resolved in its Summary and Resolutions sections.
+  - [changelog.md](docs/changelog.md): Changes, verification limits and pending work; read the latest entries before resuming.
+
+## What to read
+
+Read README.md and the documentation map above before implementation work.
+For engine changes, read architecture and the audit's resolutions; for UI or
+operator behavior, read operations; for setup, also read the source
+installation section of architecture. Use the runbook for migration/recovery.
+Before reporting completion, update the changelog, run `git diff --check`, and
+perform checks appropriate to the change. Engine changes use
+`tests/Test-DriveRelay.ps1`; cleanup changes also use `tests/Test-BuildCleanup.ps1`
+with Windows PowerShell 5.1. Record skipped checks and their limits. Do not run
+live syncs or install the application merely to verify source changes.
 
 ## CLI Quick Reference
 

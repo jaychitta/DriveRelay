@@ -16,6 +16,7 @@ state/
 /DriveRelay.exe
 /build/
 /dist/
+/release/
 
 *.tmp
 *.superseded-*

@@ -3,6 +3,10 @@
 Everything here was measured on the development machine, not assumed. Dates are when the
 measurement was taken.
 
+This is a historical measurement record from August 2026, not the current
+machine inventory. Present-tense deployment descriptions below refer to that
+measurement period. See [operations](04-operations.md) for current defaults.
+
 Volumes and folder names are generalised; the measured behaviour — attribute transitions,
 hydration effects, delete recovery — is reported exactly as observed, because that is what
 the design rests on.
@@ -88,8 +92,9 @@ Two findings the whole design rests on:
 
 A placeholder has no local content, so the Recycle Bin has nothing to store. The live links on
 this machine all have `HydrateBeforeDelete` enabled, which downloads a cloud-only file before
-deleting it so the Recycle Bin keeps a real copy. It costs a download per deleted file, which
-is why it is not the default.
+deleting it so the Recycle Bin keeps a real copy. It costs a download per deleted
+file. Current global settings default this option on for new CLI links;
+existing links keep their saved choice.
 
 ## Related
 
