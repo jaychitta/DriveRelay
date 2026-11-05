@@ -9,8 +9,15 @@ function Start-DashboardScan {
         foreach ($module in @('Provider', 'Availability', 'Settle', 'Manifest', 'Conflicts')) {
             . (Join-Path $Root "lib\$module.ps1")
         }
-        $patterns = @(Get-Content -LiteralPath (Join-Path $Root 'config\excludes.txt') |
-            Where-Object { $_ -and $_ -notmatch '^\s*#' } | ForEach-Object { $_.Trim() })
+        # Same handling as the CLI: a missing excludes file means no patterns,
+        # not a failed inventory for every link.
+        $excludesFile = Join-Path $Root 'config\excludes.txt'
+        $patterns = @()
+        if (Test-Path -LiteralPath $excludesFile) {
+            $patterns = @(Get-Content -LiteralPath $excludesFile |
+                Where-Object { $_ -and $_ -notmatch '^\s*#' } | ForEach-Object { $_.Trim() } |
+                Where-Object { $_ })
+        }
         foreach ($link in (ConvertFrom-Json -InputObject $RegistryJson)) {
             $entry = [pscustomobject]@{
                 Id = $link.Id; Availability = $null; Copies = @(); Deletions = @(); Error = ''

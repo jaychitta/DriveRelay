@@ -69,8 +69,12 @@ function Show-DriveRelayLog {
     $viewer.Font = New-Object System.Drawing.Font -ArgumentList 'Consolas', 9
     $form.Controls.Add($viewer)
 
+    # Resolved here, not inside the handler: GetNewClosure() binds the block to
+    # a new module scope that sees only globals and captured variables, so a
+    # script-scope function such as Get-DriveRelayLogPath is not callable there.
+    $logPath = Get-DriveRelayLogPath -Root $Root
     $load = {
-        $path = Get-DriveRelayLogPath -Root $Root
+        $path = $logPath
         try {
             if (Test-Path -LiteralPath $path) {
                 $heading.Text = "Newest entries -- $path"

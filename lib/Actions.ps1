@@ -111,6 +111,80 @@ function Test-CopyDestinationState {
     return (Test-SameFileState $current.Length $current.LastWriteTimeUtc $Expected.Length $Expected.WriteUtc)
 }
 
+function Test-DeleteStillValid {
+    <#
+        A delete was planned at the start of the pass; copies, hydrations and
+        moves can run for a long time before it is applied (actions run in name
+        order, so every delete comes after every copy). Re-check both halves of
+        the proof just before deleting: the file being deleted is still exactly
+        the version that was planned, and its counterpart is still absent. A
+        restored counterpart or a fresh edit defers the delete to a later pass,
+        which then classifies it from scratch.
+    #>
+    param([Parameter(Mandatory)][object] $Target,
+          [Parameter(Mandatory)][string] $CounterpartPath)
+    if (-not $Target -or -not $Target.FullPath) { return $false }
+    if (Test-Path -LiteralPath $CounterpartPath) { return $false }
+    return (Test-CopyDestinationState -Path $Target.FullPath -Expected $Target)
+}
+
+function Get-CommittedEntry {
+    <#
+        The manifest entry to record for an action that succeeded.
+
+        The manifest must describe what was actually reconciled, not whatever
+        happens to be on disk when the pass ends. A file edited after it was
+        planned (or after it was copied) must not have that edit written into
+        the baseline: the next pass would then see "unchanged" and the edit
+        would never be relayed -- and a later edit on the other side would
+        overwrite it.
+
+        So the side that was the source of truth for the action is recorded as
+        it was planned, and the other side is recorded as it is now only if it
+        still holds that same version. When the source is unchanged this is
+        identical to recording the current state. Returns $null when the pair
+        cannot be vouched for; the caller then keeps the previous entry.
+    #>
+    param([Parameter(Mandatory)][object] $Item,
+          [object] $LocalNow,
+          [object] $RemoteNow)
+
+    $L = $null; $O = $null
+    $action = $Item.Action
+
+    if ($action -eq 'InSync') {
+        $L = $Item.Local; $O = $Item.Remote
+    }
+    elseif ($action -in @('CopyToRemote', 'Conflict', 'MoveRemote')) {
+        # Local was the source; the remote now holds the copied or moved file.
+        $L = $Item.Local
+        $expected = if ($action -eq 'MoveRemote') { $Item.MoveSource } else { $Item.Local }
+        if ($RemoteNow -and $expected -and
+            (Test-SameFileState $RemoteNow.Length $RemoteNow.WriteUtc $expected.Length $expected.WriteUtc)) {
+            $O = $RemoteNow
+        }
+    }
+    elseif ($action -in @('CopyToLocal', 'MoveLocal')) {
+        $O = $Item.Remote
+        $expected = if ($action -eq 'MoveLocal') { $Item.MoveSource } else { $Item.Remote }
+        if ($LocalNow -and $expected -and
+            (Test-SameFileState $LocalNow.Length $LocalNow.WriteUtc $expected.Length $expected.WriteUtc)) {
+            $L = $LocalNow
+        }
+    }
+
+    if (-not $L -or -not $O) { return $null }
+    return [pscustomobject]@{
+        RelPath       = $L.RelPath
+        LocalLength   = $L.Length
+        LocalWriteUtc = $L.WriteUtc
+        OdLength      = $O.Length
+        OdWriteUtc    = $O.WriteUtc
+        LocalFileId   = $L.FileId
+        OdFileId      = $O.FileId
+    }
+}
+
 function Test-MoveFileState {
     param([object] $Expected)
     if (-not $Expected -or -not $Expected.FileId) { return $false }
@@ -585,7 +659,7 @@ function Invoke-LinkSync {
         # Plain conditionals, not a switch: `continue` inside a switch does not
         # reliably continue the enclosing loop in PowerShell.
         if ($item.Action -eq 'InSync') {
-            $succeeded[$key] = $true
+            $succeeded[$key] = $item
             # Space reclamation happens once for the whole tree after the loop,
             # not per file -- see the Set-TreeDehydrated call below.
             continue
@@ -638,7 +712,11 @@ function Invoke-LinkSync {
                 }
                 'DeleteLocal'    {
                     # Always a real file with content, so the Recycle Bin holds it.
-                    $ok = Remove-FileSafely -Path $item.Local.FullPath
+                    if (-not (Test-DeleteStillValid -Target $item.Local -CounterpartPath (Join-Path $remotePath $item.RelPath))) {
+                        Write-Log ("delete deferred; file or counterpart changed since planning: {0}" -f $item.RelPath) 'WARN'
+                        $ok = $false
+                    }
+                    else { $ok = Remove-FileSafely -Path $item.Local.FullPath }
                     if ($ok) {
                         $result.Deleted++
                         $forgotten[$key] = $true
@@ -646,7 +724,11 @@ function Invoke-LinkSync {
                     }
                 }
                 'DeleteRemote' {
-                    $ok = Remove-FileSafely -Path $item.Remote.FullPath -HydrateFirst:$hydrateBeforeDelete
+                    if (-not (Test-DeleteStillValid -Target $item.Remote -CounterpartPath (Join-Path $Link.LocalPath $item.RelPath))) {
+                        Write-Log ("delete deferred; file or counterpart changed since planning: {0}" -f $item.RelPath) 'WARN'
+                        $ok = $false
+                    }
+                    else { $ok = Remove-FileSafely -Path $item.Remote.FullPath -HydrateFirst:$hydrateBeforeDelete }
                     if ($ok) {
                         $result.Deleted++
                         $forgotten[$key] = $true
@@ -660,7 +742,7 @@ function Invoke-LinkSync {
 
             if ($ok) {
                 $result.Applied++
-                if ($item.Action -notlike 'Delete*') { $succeeded[$key] = $true }
+                if ($item.Action -notlike 'Delete*') { $succeeded[$key] = $item }
             }
             else {
                 # WhatIf, or a step that chose to defer.
@@ -701,22 +783,14 @@ function Invoke-LinkSync {
     # failed keeps its previous entry so the next pass compares against the
     # same baseline instead of seeing a phantom conflict.
     if ($PSCmdlet.ShouldProcess($Link.Id, 'commit manifest')) {
-        $localNow = Get-SideSnapshot -Root $Link.LocalPath -ExcludePatterns $ExcludePatterns
-        $odNow    = Get-SideSnapshot -Root $remotePath     -ExcludePatterns $ExcludePatterns
+        # Partial listings are acceptable here: a path missing from them simply
+        # keeps its previous entry, which the next pass re-evaluates.
+        $localNow = Get-SideSnapshot -Root $Link.LocalPath -ExcludePatterns $ExcludePatterns -AllowPartial
+        $odNow    = Get-SideSnapshot -Root $remotePath     -ExcludePatterns $ExcludePatterns -AllowPartial
 
-        foreach ($key in $succeeded.Keys) {
-            $L = $localNow[$key]; $O = $odNow[$key]
-            if ($L -and $O) {
-                $manifest[$key] = [pscustomobject]@{
-                    RelPath       = $L.RelPath
-                    LocalLength   = $L.Length
-                    LocalWriteUtc = $L.WriteUtc
-                    OdLength      = $O.Length
-                    OdWriteUtc    = $O.WriteUtc
-                    LocalFileId   = $L.FileId
-                    OdFileId      = $O.FileId
-                }
-            }
+        foreach ($key in @($succeeded.Keys)) {
+            $entry = Get-CommittedEntry -Item $succeeded[$key] -LocalNow $localNow[$key] -RemoteNow $odNow[$key]
+            if ($entry) { $manifest[$key] = $entry }
         }
         foreach ($key in $forgotten.Keys) { $manifest.Remove($key) }
 

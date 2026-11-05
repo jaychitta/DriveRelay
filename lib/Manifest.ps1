@@ -29,10 +29,19 @@ function Get-SideSnapshot {
     <#
         Enumerate one side. Metadata only -- never opens a file.
         Returns a hashtable keyed by lower-cased relative path.
+
+        A listing that hit an error is incomplete, and an incomplete listing is
+        dangerous: a tracked file missing from it reads as "deleted on this
+        side" and its counterpart is deleted. So any enumeration error (access
+        denied, path too long, a cloud provider that cannot list a folder)
+        throws by default and the link is skipped for this pass. -AllowPartial
+        is only for callers where a missing entry is harmless -- the post-pass
+        manifest refresh, which then keeps that path's previous baseline.
     #>
     param(
         [Parameter(Mandatory)][string] $Root,
-        [string[]] $ExcludePatterns
+        [string[]] $ExcludePatterns,
+        [switch] $AllowPartial
     )
 
     $map  = @{}
@@ -40,8 +49,9 @@ function Get-SideSnapshot {
     if (-not (Test-Path -LiteralPath $root)) { return $map }
 
     $prefix = $root.Length + 1
+    $listErrors = $null
 
-    Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue |
+    Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue -ErrorVariable listErrors |
         ForEach-Object {
             $name = $_.Name
             if (Test-FileExcluded -Name $name -Patterns $ExcludePatterns) { return }
@@ -56,6 +66,14 @@ function Get-SideSnapshot {
                 FileId    = Get-FileIdentity -Path $_.FullName
             }
         }
+
+    if (-not $AllowPartial -and $listErrors -and @($listErrors).Count -gt 0) {
+        $first = @($listErrors)[0]
+        $where = if ($first.TargetObject) { [string] $first.TargetObject } else { $root }
+        throw (("could not list every file under {0} ({1} error(s); first at {2}: {3}). " +
+                "Nothing was copied or deleted -- an incomplete listing is never read as deletions.") -f
+               $root, @($listErrors).Count, $where, $first.Exception.Message)
+    }
 
     return $map
 }

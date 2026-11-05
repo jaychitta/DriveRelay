@@ -517,15 +517,15 @@ function Show-SettingsDialog {
     $f.CancelButton = $cancel
 
     $ok.Add_Click({
-        $newSettings = [pscustomobject]@{
-            IntervalMinutes     = [int]$numInterval.Value
-            SettleMinutes       = [int]$numSettle.Value
-            MaxDelete           = [int]$numMaxDelete.Value
-            HydrateBeforeDelete = [bool]$cbSafe.Checked
-            StartWithWindows    = [bool]$cbStartup.Checked
-            StartDelaySeconds   = [int]$current.StartDelaySeconds
-            Paused              = [bool]$current.Paused
-        }
+        # Start from what is saved now, not a hand-built object: anything this
+        # dialog does not show (log level and retention, the start delay, a
+        # pause set from the tray while the dialog was open) must survive.
+        $newSettings = Get-AppSettings
+        $newSettings.IntervalMinutes     = [int]$numInterval.Value
+        $newSettings.SettleMinutes       = [int]$numSettle.Value
+        $newSettings.MaxDelete           = [int]$numMaxDelete.Value
+        $newSettings.HydrateBeforeDelete = [bool]$cbSafe.Checked
+        $newSettings.StartWithWindows    = [bool]$cbStartup.Checked
         Save-AppSettings -Settings $newSettings
 
         # Only on request -- see the note by the checkbox.
@@ -841,7 +841,11 @@ function New-LinkCard {
         $script:ConflictCopiesByLink[$Link.Id]
     })
     $duplicatesExpanded = ($script:ExpandedDuplicateLink -eq $Link.Id -and $duplicateCopies.Count -gt 0)
-    $deletionConflicts = @($script:DeletionConflictsByLink[$Link.Id])
+    # Guarded like the duplicates above: @($null) has a Count of 1, which showed
+    # a Review button on every card until the background scan completed.
+    $deletionConflicts = @(if ($script:DeletionConflictsByLink.ContainsKey($Link.Id)) {
+        $script:DeletionConflictsByLink[$Link.Id]
+    })
     $cardHeight = if ($duplicatesExpanded) { 398 } else { 116 }
 
     $card = New-Object System.Windows.Forms.Panel

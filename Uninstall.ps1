@@ -30,7 +30,9 @@ Write-Host ''
 
 $stopped = 0
 Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -and ($_.CommandLine -like '*DriveRelayTray.ps1*' -or $_.CommandLine -like '*SyncOrchTray.ps1*') } |
+    Where-Object { $_.CommandLine -and ($_.CommandLine -like '*DriveRelayTray.ps1*' -or
+                                        $_.CommandLine -like '*DriveRelayUI.ps1*' -or
+                                        $_.CommandLine -like '*SyncOrchTray.ps1*') } |
     ForEach-Object {
         try { Stop-Process -Id $_.ProcessId -Force -Confirm:$false; $stopped++ } catch { }
     }
@@ -48,7 +50,8 @@ $targets = @(
     $startMenuDir,
     $oldStartMenu,
     $launcher,
-    (Join-Path $root 'DriveRelayTray.vbs'),
+    # DriveRelayTray.vbs is a tracked source file kept for manual launches;
+    # only the pre-rename launcher is removed.
     (Join-Path $root 'SyncOrchTray.vbs')
 )
 

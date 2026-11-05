@@ -285,12 +285,29 @@ function Invoke-CheckCommand {
             ''
         }
 
-        $items = Compare-LinkState -Link $link -ExcludePatterns $patterns -StateRoot $script:StateRoot
+        try { $items = Compare-LinkState -Link $link -ExcludePatterns $patterns -StateRoot $script:StateRoot }
+        catch {
+            "    SKIPPED -- {0}" -f $_.Exception.Message
+            continue
+        }
 
         $actionable = @($items | Where-Object { $_.Action -ne 'InSync' -and $_.Action -ne 'Forget' })
         $summary = $items | Group-Object Action | Sort-Object Name
 
         foreach ($g in $summary) { "    {0,-16} {1}" -f $g.Name, $g.Count }
+
+        if (-not $link.Seeded) {
+            # The classification below assumes an ordinary pass. A first run
+            # seeds instead: files present on both sides that differ are not
+            # forked, they are overwritten from the seed side.
+            $differing = @($items | Where-Object { $_.Action -eq 'Conflict' }).Count
+            if ($differing -gt 0) {
+                $other = if ($link.Seed -eq 'Local') { 'remote' } else { 'local' }
+                ''
+                "    !! {0} file(s) differ on both sides. Seeding from {1} will overwrite the" -f $differing, $link.Seed
+                "       {0} copy of each rather than keeping both. Review them before syncing." -f $other
+            }
+        }
 
         $deletes = @($items | Where-Object { $_.Action -like 'Delete*' }).Count
         if ($deletes -gt $link.MaxDelete) {
@@ -527,7 +544,11 @@ function Invoke-StatusCommand {
             if ($avail.Blocking) { continue }
         }
 
-        $items = Compare-LinkState -Link $link -ExcludePatterns $patterns -StateRoot $script:StateRoot
+        try { $items = Compare-LinkState -Link $link -ExcludePatterns $patterns -StateRoot $script:StateRoot }
+        catch {
+            "    UNAVAILABLE: {0}" -f $_.Exception.Message
+            continue
+        }
         $pending = @($items | Where-Object { $_.Action -ne 'InSync' -and $_.Action -ne 'Forget' })
 
         try {

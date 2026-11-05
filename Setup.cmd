@@ -23,7 +23,7 @@ cd /d "%~dp0"
 echo.
 echo  DriveRelay setup
 echo  ----------------
-echo  Folder: %~dp0
+echo  Folder: "%~dp0"
 echo.
 
 rem --- PowerShell present? ---------------------------------------------------

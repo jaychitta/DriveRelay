@@ -68,12 +68,14 @@ function Test-CloudPlaceholderRoot {
     $cloudMask = $script:AttrOfflineP -bor $script:AttrRecallP -bor
                  $script:AttrPinnedP  -bor $script:AttrUnpinnedP
 
-    $seen = 0
-    foreach ($f in (Get-ChildItem -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue)) {
+    # Select-Object -First stops the enumeration once the sample is taken. A
+    # parenthesised Get-ChildItem in a foreach header collects the entire tree
+    # first, so a `break` after N items saved nothing.
+    $sample = @(Get-ChildItem -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue |
+                Select-Object -First $SampleSize)
+    foreach ($f in $sample) {
         if (([int] $f.Attributes) -band $cloudMask)  { return $true }
         if ($f.PSIsContainer -and (([int] $f.Attributes) -band $script:AttrReparse)) { return $true }
-        $seen++
-        if ($seen -ge $SampleSize) { break }
     }
 
     return $false

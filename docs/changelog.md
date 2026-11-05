@@ -2,6 +2,49 @@
 
 All notable changes to DriveRelay (formerly SyncOrchestrator) will be documented in this file.
 
+## [Audit] - 2026-11-05 — second code audit, first fixes
+
+- Audited every script at 2b42a7e across engine, state/concurrency, UI/tray,
+  setup and docs. Findings were reported in chat for triage; owner decisions
+  are still pending for the items listed under Pending below.
+- Engine (data safety):
+  - A folder listing that hits any error (access denied, path too long, a
+    cloud provider that cannot list a folder) now stops the link instead of
+    returning a partial snapshot whose missing files read as deletions. The
+    post-pass manifest refresh alone tolerates partial listings.
+  - Deletes are re-checked just before they are applied: the target must still
+    be the planned version and its counterpart still absent. Deletes run after
+    every copy and hydration, so the planning-to-apply gap could be long.
+  - The manifest now records the version that was reconciled, not whatever is
+    on disk when the pass ends. An edit made during a pass was previously
+    absorbed into the baseline and never relayed.
+  - `check` warns that seeding an unseeded link overwrites files that differ
+    on both sides, which it previously listed as Conflict (keep both).
+    `check`/`status` report an unlistable link per link instead of stopping.
+- Dashboard and tray: the Settings dialog no longer resets log settings, start
+  delay or a pause made while it was open; the log viewer resolves its path
+  outside the closure (a script function was not callable inside it);
+  a spurious Review button no longer appears before the first scan; the
+  background scan tolerates a missing `excludes.txt`.
+- Setup and uninstall: `Setup.cmd` quotes the echoed folder (`&` in a path ran
+  a command); uninstall also stops dashboard processes and no longer deletes
+  the tracked `DriveRelayTray.vbs`. Provider auto-detection stops after its
+  200-item sample instead of listing the whole remote tree.
+- Tests: added section 9c (listing errors, delete re-checks, manifest commit
+  rules, an edit during a pass). Not run: this audit ran in a Linux sandbox
+  with no PowerShell, so no parse check, regression run or PSScriptAnalyzer.
+  Run `tests/Test-DriveRelay.ps1` under Windows PowerShell 5.1 before relying
+  on these changes. No live sync or installation performed.
+- Pending owner decisions: seeding overwrites without keeping the replaced
+  copy; Recycle Bin deletion on network/removable volumes (permanent) and
+  error dialogs in unattended passes; Windows PowerShell 5.1 recursion into
+  junctions; missing/empty manifest for a seeded link; manifest set-aside after
+  re-adding a link; settings.json locking and per-field validation; tray
+  "Sync now" while paused, failed passes shown as up to date, menu scans on
+  the UI thread; log rotation races and orphaned generations; OneDriveGate
+  relaunch and ResumeTime parsing; registry lock unlocked fallback;
+  `StartWithWindows` having no effect; documentation drift.
+
 ## [Maintenance] - 2026-10-26 — audit and withdraw Inno Setup support
 
 - At Jay's direction, removed the Inno builder, installer template, packaged

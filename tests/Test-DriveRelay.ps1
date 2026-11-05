@@ -777,6 +777,93 @@ Write-TestManifest -Ctx $ctx -Entries @($back['old\a.txt'], $duplicateId)
 Move-Item -LiteralPath (Join-Path $ctx.Local 'old\a.txt') -Destination (Join-Path $ctx.Local 'new.txt')
 Assert-Equal (Get-Action $ctx 'new.txt') 'CopyToRemote' 'Ambiguous identity in history is never optimized into a move'
 
+# ------------------------------------------- 9c. Audit 2026-11-05 safeguards ---
+Write-Host "9c. Testing incomplete listings, delete re-checks and manifest commits" -ForegroundColor Yellow
+
+# --- an enumeration error must not read as deletions ---
+$ctx = New-TestLink
+$when = [datetime]::UtcNow.AddHours(-1)
+$lf = Set-TestFile (Join-Path $ctx.Local 'a.txt') 'kept' $when
+$rf = Set-TestFile (Join-Path $ctx.Remote 'a.txt') 'kept' $when
+Write-TestManifest $ctx @([pscustomobject]@{
+    RelPath = 'a.txt'
+    LocalLength = $lf.Length; LocalWriteUtc = $lf.LastWriteTimeUtc
+    OdLength    = $rf.Length; OdWriteUtc    = $rf.LastWriteTimeUtc
+})
+$script:FailListingUnder = $ctx.Remote
+function Get-ChildItem {
+    # Simulates a folder that cannot be listed (access denied, provider error):
+    # a non-terminating error and no files from the failing side.
+    [CmdletBinding()]
+    param([string] $LiteralPath, [switch] $Recurse, [switch] $File, [switch] $Force)
+    if ($LiteralPath -eq $script:FailListingUnder) {
+        Write-Error -Message 'simulated: access denied' -TargetObject (Join-Path $LiteralPath 'locked')
+        return
+    }
+    Microsoft.PowerShell.Management\Get-ChildItem -LiteralPath $LiteralPath -Recurse:$Recurse -File:$File -Force:$Force
+}
+try {
+    $threw = $false
+    try { $null = Get-SideSnapshot -Root $ctx.Remote -ExcludePatterns @() } catch { $threw = $true }
+    Assert-True $threw "A listing error makes the snapshot throw instead of returning a partial map"
+    $partial = Get-SideSnapshot -Root $ctx.Remote -ExcludePatterns @() -AllowPartial
+    Assert-Equal $partial.Count 0 "-AllowPartial returns what could be listed"
+    $threw = $false
+    try { $null = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State } catch { $threw = $true }
+    Assert-True $threw "A pass over an incompletely listed side stops before acting"
+} finally { Remove-Item Function:\Get-ChildItem; $script:FailListingUnder = $null }
+Assert-True (Test-Path -LiteralPath $lf.FullName) "The tracked local file is not deleted when the remote listing failed"
+
+# --- a delete is re-checked just before it is applied ---
+$ctx = New-TestLink
+$rf = Set-TestFile (Join-Path $ctx.Remote 'gone.txt') 'kept' $when
+$planned = (Get-SideSnapshot -Root $ctx.Remote -ExcludePatterns @())['gone.txt']
+$counterpart = Join-Path $ctx.Local 'gone.txt'
+Assert-True (Test-DeleteStillValid -Target $planned -CounterpartPath $counterpart) "An unchanged delete is still valid"
+$null = Set-TestFile $counterpart 'restored' $when
+Assert-True (-not (Test-DeleteStillValid -Target $planned -CounterpartPath $counterpart)) "A restored counterpart cancels the planned delete"
+Remove-Item -LiteralPath $counterpart -Force
+$null = Set-TestFile $rf.FullName 'edited since planning' ([datetime]::UtcNow)
+Assert-True (-not (Test-DeleteStillValid -Target $planned -CounterpartPath $counterpart)) "An edit since planning cancels the planned delete"
+
+# --- the manifest records what was reconciled, not later edits ---
+$t0 = [datetime]::UtcNow.AddHours(-2)
+$t1 = [datetime]::UtcNow.AddHours(-1)
+$plannedLocal  = [pscustomobject]@{ RelPath = 'a.txt'; Length = 4; WriteUtc = $t0; FileId = 'L1' }
+$plannedRemote = [pscustomobject]@{ RelPath = 'a.txt'; Length = 4; WriteUtc = $t0; FileId = 'R1' }
+$editedLocal   = [pscustomobject]@{ RelPath = 'a.txt'; Length = 9; WriteUtc = $t1; FileId = 'L1' }
+$copiedRemote  = [pscustomobject]@{ RelPath = 'a.txt'; Length = 4; WriteUtc = $t0; FileId = 'R2' }
+
+$e = Get-CommittedEntry -Item ([pscustomobject]@{ Action = 'InSync'; Local = $plannedLocal; Remote = $plannedRemote }) `
+                        -LocalNow $editedLocal -RemoteNow $plannedRemote
+Assert-Equal $e.LocalLength 4 "An InSync file edited during the pass keeps the reconciled local baseline"
+
+$e = Get-CommittedEntry -Item ([pscustomobject]@{ Action = 'CopyToRemote'; Local = $plannedLocal; Remote = $null }) `
+                        -LocalNow $editedLocal -RemoteNow $copiedRemote
+Assert-Equal $e.LocalLength 4 "A source edited after its copy is recorded as the version that was copied"
+Assert-Equal $e.OdFileId 'R2' "The copied destination is recorded as it is now"
+
+$e = Get-CommittedEntry -Item ([pscustomobject]@{ Action = 'CopyToRemote'; Local = $plannedLocal; Remote = $null }) `
+                        -LocalNow $plannedLocal -RemoteNow $editedLocal
+Assert-True ($null -eq $e) "A destination that no longer holds the copied version is not vouched for"
+
+# End to end: the edit made during the pass is relayed on the next one.
+$ctx = New-TestLink
+$lf = Set-TestFile (Join-Path $ctx.Local 'a.txt') 'one' $t0
+$script:EditDuringPass = $lf.FullName
+$script:RealCopyToRemote = ${function:Invoke-CopyToRemote}
+function Invoke-CopyToRemote {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([object] $Item, [object] $Link, [bool] $Dehydrate = $true)
+    $ok = & $script:RealCopyToRemote -Item $Item -Link $Link -Dehydrate $Dehydrate
+    Set-Content -LiteralPath $script:EditDuringPass -Value 'two, edited mid-pass' -Encoding utf8 -NoNewline
+    (Get-Item -LiteralPath $script:EditDuringPass).LastWriteTimeUtc = $t1
+    return $ok
+}
+try { $null = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State }
+finally { Set-Item -Path Function:\Invoke-CopyToRemote -Value $script:RealCopyToRemote; $script:EditDuringPass = $null }
+Assert-Equal (Get-Action $ctx 'a.txt') 'CopyToRemote' "A local edit made during the pass is still pending, not absorbed into the baseline"
+
 # ------------------------------------------------------- 10. Availability ---
 # An unmounted drive, a deleted folder and a stopped cloud client all look like
 # "path missing" to Test-Path, but need different things done about them.
