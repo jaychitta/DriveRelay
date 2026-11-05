@@ -353,7 +353,8 @@ function Show-AddDialog {
     $cbSafe.Text = 'Keep deleted files in the Recycle Bin'
     $cbSafe.ForeColor = $script:TextPrimary; $cbSafe.BackColor = [System.Drawing.Color]::Transparent
     $cbSafe.Location = New-Object System.Drawing.Point -ArgumentList 20, 186; $cbSafe.Size = New-Object System.Drawing.Size -ArgumentList 500, 22
-    $cbSafe.Checked = $true
+    # Starts from the global default, as the CLI's `add` does.
+    $cbSafe.Checked = [bool](Get-AppSettings).HydrateBeforeDelete
     $f.Controls.Add($cbSafe)
 
     $ok = New-DarkBtn 'Add' 360 230 90
@@ -662,7 +663,14 @@ function Show-LinkEditDialog {
     $btnDelete.Add_Click({
         $confirm = [System.Windows.Forms.MessageBox]::Show($f, "Unregister '$($Link.Id)'? No files will be deleted.", 'Remove folder pair', 'YesNo', 'Question')
         if ($confirm -eq [System.Windows.Forms.DialogResult]::Yes) {
-            Remove-Link -Id $Link.Id
+            # The registry lock can time out (another process mid-change); say
+            # so instead of letting the error escape the WinForms handler.
+            try { Remove-Link -Id $Link.Id }
+            catch {
+                [System.Windows.Forms.MessageBox]::Show($f, ("Could not remove '{0}': {1}" -f $Link.Id, $_.Exception.Message),
+                    'DriveRelay', 'OK', 'Warning') | Out-Null
+                return
+            }
             $f.DialogResult = [System.Windows.Forms.DialogResult]::OK
             $f.Close()
         }
@@ -682,7 +690,14 @@ function Show-LinkEditDialog {
     $f.CancelButton = $cancel
 
     $ok.Add_Click({
-        Set-LinkSettings -Id $Link.Id -SettleMinutes ([int]$numSettle.Value) -MaxDelete ([int]$numMaxDelete.Value) -HydrateBeforeDelete ([bool]$cbSafe.Checked)
+        try {
+            $null = Set-LinkSettings -Id $Link.Id -SettleMinutes ([int]$numSettle.Value) -MaxDelete ([int]$numMaxDelete.Value) -HydrateBeforeDelete ([bool]$cbSafe.Checked)
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show($f, ("Could not save '{0}': {1}" -f $Link.Id, $_.Exception.Message),
+                'DriveRelay', 'OK', 'Warning') | Out-Null
+            return
+        }
         Write-Log ("link {0} settings updated: Settle={1}m MaxDelete={2}" -f $Link.Id, $numSettle.Value, $numMaxDelete.Value)
         $f.DialogResult = [System.Windows.Forms.DialogResult]::OK
         $f.Close()
@@ -1099,7 +1114,11 @@ function New-LinkCard {
         $lid = $this.Tag
         $lnk = Get-LinkRegistry | Where-Object { $_.Id -eq $lid }
         if ($lnk) {
-            Set-LinkEnabled -Id $lid -Enabled (-not $lnk.Enabled)
+            try { $null = Set-LinkEnabled -Id $lid -Enabled (-not $lnk.Enabled) }
+            catch {
+                [System.Windows.Forms.MessageBox]::Show($form, ("Could not change '{0}': {1}" -f $lid, $_.Exception.Message),
+                    'DriveRelay', 'OK', 'Warning') | Out-Null
+            }
             Update-Cards
         }
     })

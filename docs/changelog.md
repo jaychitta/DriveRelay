@@ -2,6 +2,35 @@
 
 All notable changes to DriveRelay (formerly SyncOrchestrator) will be documented in this file.
 
+## [Audit] - 2026-11-05 — low findings (R4, R5, R8, R9, R11, S3, S9, U7, D1)
+
+- R4: a last-write time more than a minute in the future counts as settled
+  (the held-open check still applies); the hourly idle heartbeat names how
+  many files are waiting; `Add-Link` rejects negative SettleMinutes/MaxDelete.
+- R5: `lastpass.json` keeps per-link results; a single-link `sync <id>`
+  replaces only its own entry and leaves the idle streak alone. `sync <id>` on
+  a paused link says so instead of "no enabled links".
+- R8: the registry lock fails closed if it cannot be opened.
+- R9: log rotation runs under a named lock and re-checks the size once held;
+  generations above `LogKeepFiles` are removed along with those past
+  `LogMaxAgeDays`; the purge runs at most hourly per process and after each
+  rotation (immediately after the log path or policy changes).
+- R11 OneDriveGate: starts OneDrive once on resuming instead of every poll;
+  `-ResumeTime` must be `HH:mm` under 24 hours; only this session's processes.
+- S2 remainder: `Uninstall.ps1 -AlsoRemoveSettings` waits for and holds the
+  pass lock before removing `state\`, or keeps everything and says to retry.
+- S3: `Install.ps1` checks every required file before installing and names
+  what is missing. S9: `start` warns when the tray already runs passes.
+- U7: dashboard Edit/Save, Pause/Resume and Remove report registry failures
+  instead of throwing from the handler; the Add dialog's Recycle Bin option
+  starts from the global default.
+- D1: documentation brought in line with the code (README settings table and
+  CLI reference, operations tray/manager/config/Files, architecture component
+  list, CLI and Uninstall headers, example configs, CLAUDE.md).
+- Tests: future timestamps settle, `Add-Link` range check, per-link summary,
+  log generations above `LogKeepFiles`; existing age-purge tests now force the
+  purge. Not run (no PowerShell in the sandbox). R3 stays partly fixed.
+
 ## [Audit] - 2026-11-05 — remaining medium findings (R2, U5, U6, U8)
 
 - R2 settings: `Get-AppSettings` no longer writes, validates each field on

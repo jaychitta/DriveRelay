@@ -5,7 +5,8 @@
 
       1. GRACE   -- for $GraceMinutes after this script starts, OneDrive runs untouched.
       2. BLOCKED -- after that, OneDrive is shut down, and shut down again if it relaunches.
-      3. RESUMED -- at $ResumeTime, OneDrive is started and left alone for the rest of the run.
+      3. RESUMED -- at $ResumeTime, OneDrive is started once and then left alone: if you
+                  quit it after that, it stays quit until the next day's cycle.
 
     Once resumed it stays resumed for the rest of that day. At midnight the gate
     re-arms: the new day gets its own blocked phase, ending at that day's $ResumeTime.
@@ -87,7 +88,11 @@ function Get-OneDrivePath {
 }
 
 function Get-OneDriveProcesses {
-    try   { return @(Get-Process -Name 'OneDrive' -ErrorAction Stop) }
+    # This user's session only. On a shared or terminal-server machine, other
+    # people's OneDrive processes are not this gate's to stop -- and their
+    # presence must not read as "running" here either.
+    $session = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+    try   { return @(Get-Process -Name 'OneDrive' -ErrorAction Stop | Where-Object { $_.SessionId -eq $session }) }
     catch { return @() }
 }
 
@@ -133,9 +138,14 @@ if ($null -eq $exe) {
     throw 'OneDrive.exe not found.'
 }
 
+# A time of day, HH:mm, strictly. [timespan]::TryParse accepts '17' as
+# seventeen *days*, which put the resume moment permanently in the future: the
+# gate re-armed every midnight and OneDrive was never started again.
 $resumeSpan = [timespan]::Zero
-if (-not [timespan]::TryParse($ResumeTime, [ref] $resumeSpan)) {
-    throw ("ResumeTime '{0}' is not a valid time. Use HH:mm, e.g. 17:45." -f $ResumeTime)
+$parsedTime = [timespan]::TryParseExact($ResumeTime.Trim(), [string[]]@('h\:mm', 'hh\:mm'),
+                                         [Globalization.CultureInfo]::InvariantCulture, [ref] $resumeSpan)
+if (-not $parsedTime -or $resumeSpan -lt [timespan]::Zero -or $resumeSpan -ge [timespan]::FromDays(1)) {
+    throw ("ResumeTime '{0}' is not a valid time of day. Use HH:mm, e.g. 17:45." -f $ResumeTime)
 }
 
 $scriptStart = Get-Date
@@ -188,11 +198,14 @@ while ($true) {
         }
 
         if ($resumed) {
+            # Start it once, on entering the phase. After that it is left alone,
+            # as the header promises: a user who quits OneDrive in the evening
+            # must not have it relaunched every poll.
             if ($phase -ne 'resumed') {
                 Write-Log ('Phase: resumed (running={0})' -f $running) 'INFO'
                 $phase = 'resumed'
+                if (-not $running) { Start-OneDrive -ExePath $exe }
             }
-            if (-not $running) { Start-OneDrive -ExePath $exe }
         }
         elseif ($now -lt $graceEnds) {
             if ($phase -ne 'grace') {

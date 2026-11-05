@@ -89,6 +89,14 @@ function Test-FileSettled {
     }
 
     $age = (Get-Date) - $item.LastWriteTime
+
+    # A last-write time in the future (clock skew, a camera or archive import)
+    # can never age past the window, so the file would be deferred forever
+    # without a word at INFO. Its timestamp says nothing about whether it is
+    # still being written; Test-FileLocked, which every caller also asks,
+    # still catches a writer that has it open.
+    if ($age.TotalMinutes -lt -1) { return $true }
+
     return ($age.TotalMinutes -ge $SettleMinutes)
 }
 

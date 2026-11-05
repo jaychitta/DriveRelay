@@ -65,6 +65,21 @@ function Write-PassSummary {
             DeletionConflicts = @($r | Where-Object { $_.PSObject.Properties['DeletionConflicts'] } |
                 ForEach-Object { $_.DeletionConflicts })
 
+            # Per-link results, so a single-link `sync <id>` can replace its own
+            # link's entry and keep everyone else's (see Invoke-SyncPass).
+            PerLink = @($r | ForEach-Object {
+                [pscustomobject]@{
+                    LinkId = $_.LinkId; Applied = [int]$_.Applied; Deferred = [int]$_.Deferred
+                    Moved = $(if ($_.PSObject.Properties['Moved']) { [int]$_.Moved } else { 0 })
+                    Conflicts = [int]$_.Conflicts; Deleted = [int]$_.Deleted; Failed = [int]$_.Failed
+                    Aborted = [bool]$_.Aborted; Message = [string]$_.Message
+                    State = $(if ($_.PSObject.Properties['State']) { [string]$_.State } else { 'Ready' })
+                    Detail = $(if ($_.PSObject.Properties['Detail']) { [string]$_.Detail } else { '' })
+                    ConflictCopies = @($(if ($_.PSObject.Properties['ConflictCopies']) { $_.ConflictCopies }))
+                    DeletionConflicts = @($(if ($_.PSObject.Properties['DeletionConflicts']) { $_.DeletionConflicts }))
+                }
+            })
+
             # Availability is reported separately from failure. A drive that is
             # not plugged in is not a sync error, and calling it one trains
             # people to ignore the warning that matters.
@@ -81,7 +96,7 @@ function Write-PassSummary {
         if (-not (Test-Path $StateRoot)) { New-Item -ItemType Directory -Path $StateRoot -Force | Out-Null }
         $path = Get-PassSummaryPath -StateRoot $StateRoot
         $tmp  = "$path.tmp"
-        ConvertTo-Json -InputObject $summary -Depth 4 | Set-Content -LiteralPath $tmp -Encoding utf8
+        ConvertTo-Json -InputObject $summary -Depth 6 | Set-Content -LiteralPath $tmp -Encoding utf8
         Move-Item -LiteralPath $tmp -Destination $path -Force
     }
     catch {
@@ -149,12 +164,17 @@ function Invoke-SyncPass {
             return $outcome
         }
 
-        $links = @(Get-LinkRegistry | Where-Object { $_.Enabled })
+        $allLinks = @(Get-LinkRegistry)
+        $links = @($allLinks | Where-Object { $_.Enabled })
         if ($LinkId) { $links = @($links | Where-Object { $_.Id -eq $LinkId }) }
 
         if ($links.Count -eq 0) {
             $outcome.Ran    = $true
-            $outcome.Reason = 'no enabled links'
+            # Say which: "no enabled links" for a link that exists but is
+            # paused sent people looking for a missing link.
+            $outcome.Reason = if (-not $LinkId) { 'no enabled links' }
+                              elseif (@($allLinks | Where-Object { $_.Id -eq $LinkId }).Count -gt 0) { "link '$LinkId' is paused; resume it first" }
+                              else { "no link named '$LinkId'" }
             # Logged deliberately: an unattended run that writes nothing is
             # indistinguishable from one that never fired.
             Write-Log 'pass ran with no enabled links'
@@ -234,6 +254,24 @@ function Invoke-SyncPass {
 
         $line = "pass finished: applied {0}, conflicts {1}, deleted {2}" -f $applied, $conflicts, $deleted
 
+        # A single-link `sync <id>` says nothing about the other links, and is
+        # not one of the unattended passes the idle streak counts. Merge its
+        # result over the previous summary's entry for that link, keep the rest,
+        # and leave the streak as it was.
+        $summaryResults = @($results)
+        if ($LinkId) {
+            if ($prev -and $prev.PSObject.Properties['PerLink']) {
+                $enabledIds = @($links | ForEach-Object { $_.Id })
+                try { $enabledIds = @(Get-LinkRegistry | Where-Object { $_.Enabled } | ForEach-Object { $_.Id }) } catch { }
+                $others = @($prev.PerLink | Where-Object { $_.LinkId -ne $LinkId -and $enabledIds -contains $_.LinkId })
+                $summaryResults = @($others) + @($results)
+            }
+            if (-not $idle) { Write-Log $line }
+            Write-PassSummary -Outcome ([pscustomobject]@{ Results = $summaryResults }) -StateRoot $StateRoot `
+                              -IdleCount $idleCount -IdleSince $idleSince -LastHeartbeat $heartbeat
+            return $outcome
+        }
+
         if (-not $idle) {
             # Something happened. Report it, and close out any idle run that
             # preceded it so the quiet stretch is still accounted for.
@@ -256,7 +294,12 @@ function Invoke-SyncPass {
             }
 
             if ($due) {
-                Write-Log ("idle: {0} pass(es) since {1}, nothing to relay" -f $idleCount, $idleSince)
+                # Deferrals do not break the idle streak (see above), so this is
+                # where a file that keeps waiting -- held open, still settling --
+                # becomes visible at INFO, once an hour instead of every pass.
+                $deferred = [int](($results | Measure-Object -Property Deferred -Sum).Sum)
+                $waiting  = if ($deferred -gt 0) { "; {0} file(s) waiting (held open or settling) -- see 'status'" -f $deferred } else { '' }
+                Write-Log ("idle: {0} pass(es) since {1}, nothing to relay{2}" -f $idleCount, $idleSince, $waiting)
                 $heartbeat = $now.ToString('yyyy-MM-dd HH:mm:ss')
             }
             else {

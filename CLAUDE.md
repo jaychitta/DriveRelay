@@ -9,7 +9,9 @@ DriveRelay relays files between a high-speed local NTFS working folder and a clo
 - `DriveRelayUI.ps1`: Modern dark-mode popup dashboard. Card-style folder link status, inline pause/resume toggles, folder adding dialog, and manual sync triggering.
 - `DriveRelay.exe`: Generated branded windowless launcher for the tray agent; the Startup shortcut targets it so Task Manager identifies the app as DriveRelay.
 - `tools/DriveRelayLauncher.cs` / `tools/New-Launcher.ps1`: Launcher source and build script, using the Windows .NET Framework compiler (no extra SDK).
-- `DriveRelayTray.vbs`: Legacy silent launcher retained for compatibility with manual launches.
+- `tools/New-Icons.ps1`: Draws the `.ico` files with `lib/Icons.ps1`; Install runs it when the icon is missing.
+- `tools/Clear-BuildOutput.ps1`: Removes the repository-root `build/` and `dist/` folders only (see `build/` below).
+- `DriveRelayTray.vbs`: Legacy silent launcher retained for compatibility with manual launches. Uninstall leaves it in place.
 - `Setup.cmd`: Double-clickable installer. Wraps `Install.ps1` with a process-scoped execution policy, guards against a partial extraction, passes arguments through, and offers to start the tray agent.
 - `Uninstall.cmd`: Double-clickable uninstaller wrapping `Uninstall.ps1`.
 - `Install.ps1`: Creates Startup and Start Menu shortcuts and sets up the tray agent.
@@ -17,7 +19,7 @@ DriveRelay relays files between a high-speed local NTFS working folder and a clo
 - `README.md`: Public-facing overview, safety model, install/usage, known issues, authorship (concept and direction: Jayadheer Chitta; implementation: Claude).
 - `LICENSE`: MIT, © 2026 Jayadheer Chitta.
 - `.gitignore`: Keeps runtime state and personal data (`config/links.json`, `config/settings.json`, `state/`, `*.log`) out of version control.
-- `OneDriveGate.ps1`: Process lifecycle controller for the OneDrive desktop client (Grace -> Blocked -> Resumed).
+- `OneDriveGate.ps1`: Process lifecycle controller for the OneDrive desktop client (Grace -> Blocked -> Resumed). Starts OneDrive once on resuming, accepts `-ResumeTime` only as `HH:mm`, and acts on the current session's processes only.
 - `lib/`: Modular PowerShell helper scripts:
   - `DashboardScan.ps1`: Read-only availability and conflict inventories in a background PowerShell runspace. Dashboard rendering reads completed results, rejects inventories for changed registries, and never waits for folder scans.
   - `Conflicts.ps1`: Lists timestamped conflict copies and live deletion conflicts, with paths and review guidance. Used by CLI, dashboard Duplicates/Review controls and tray warnings. Live deletion classification depends on `Manifest.ps1` and `Availability.ps1`.
@@ -30,11 +32,16 @@ DriveRelay relays files between a high-speed local NTFS working folder and a clo
     generation also aged out past `LogMaxAgeDays` regardless of how many `LogKeepFiles` allows
     for. Dot-sourced into the entry scripts, so its state variables are deliberately named to
     avoid colliding with their parameters (`$script:LogThreshold`, not `$script:LogLevel`).
+    Rotation runs under the `Global\DriveRelayLogRotation` mutex and re-checks the size once
+    held; the purge (hourly per process, and after each rotation) also removes generations
+    numbered above `LogKeepFiles`.
   - `LogViewer.ps1`: Read-only log viewer used by the tray and dashboard.
   - `Manifest.ps1`: Metadata-only snapshots and change tracking. Loads `FileIdentity.ps1`; records optional per-side NTFS IDs and pairs unchanged tracked moves into `MoveLocal`/`MoveRemote`. Produces `DeletionConflict` for a tracked deletion versus changed survivor, and records destination parents for queued-copy/move checks. Never hashes cloud content. Snapshots walk folder by folder, throw on any listing error (except `-AllowPartial`), skip junctions/symbolic links and `.driverelay-deleted`; paths under a skipped link get no action. Writes are flushed and swapped with `File.Replace`, keeping `.bak`; `Repair-LinkManifest` handles recovery.
   - `FileIdentity.ps1`: Zero-access Windows metadata handles for NTFS file IDs (volume, file index, creation time), excluding hard links and unsupported filesystems. Native same-volume rename refuses overwrites and copying across volumes. Loaded by `Manifest.ps1` in every engine/inventory host.
   - `Pass.ps1`: Sync pass orchestration logic. Collapses runs of no-op passes into one
-    hourly heartbeat line, tracking the streak in `state/lastpass.json`.
+    hourly heartbeat line (which also counts files still waiting), tracking the streak in
+    `state/lastpass.json`. The summary keeps per-link results (`PerLink`); a single-link
+    `sync <id>` replaces only its own entry and leaves the idle streak alone.
   - `Provider.ps1`: Cloud provider detection and label resolution.
   - `Registry.ps1`: Link registration and persistence. `Add-Link -StateRoot` sets aside an earlier registration's `state\<id>\` (`Move-LinkStateAside`) inside the registry lock and before the save, holding the pass lock (taken first) when there is history to move; a failed set-aside registers nothing.
   - `Settle.ps1`: Settle time detection for in-flight file writes.
@@ -49,6 +56,7 @@ DriveRelay relays files between a high-speed local NTFS working folder and a clo
   - `DriveRelay.ico`: Multi-resolution Windows icon (16x16 through 256x256, 32-bit RGBA).
   - `DriveRelay.png`: High-resolution transparent PNG icon badge.
   - `DriveRelay_badge.png`: Full-bleed rounded badge master.
+  - `driverelay-sync.ico` / `driverelay-warn.ico`: Tray state icons (syncing, needs attention).
 - `tests/`:
   - `Test-DriveRelay.ps1`: Automated regression test suite.
   - `Test-BuildCleanup.ps1`: Disposable-fixture checks for output removal, preservation, invalid requests and linked-path refusal. Real-junction checks need Windows junction creation permission.
@@ -80,18 +88,22 @@ live syncs or install the application merely to verify source changes.
 ## CLI Quick Reference
 
 ```
-DriveRelay add    <local> <remote>    Register a new link pair
-DriveRelay list                       Show all registered links
-DriveRelay rm     <id>                Unregister a link
-DriveRelay pause  <id>                Disable a link
-DriveRelay resume <id>                Re-enable a paused link
-DriveRelay check  [<id>]              Report what a sync would do
-DriveRelay sync   [<id>]              Apply it
-DriveRelay status [<id>]              Per-link state and outstanding work
-DriveRelay start                      Install scheduled background task
-DriveRelay stop                       Remove scheduled task
-DriveRelay config                     View or update global settings
+DriveRelay.ps1 add    <local> <remote>   Register a new link pair
+DriveRelay.ps1 list                      Show all registered links
+DriveRelay.ps1 rm     <id>               Unregister a link
+DriveRelay.ps1 pause  <id>               Disable a link
+DriveRelay.ps1 resume <id>               Re-enable a paused link
+DriveRelay.ps1 check  [<id>]             Report what a sync would do
+DriveRelay.ps1 sync   [<id>]             Apply it (runs even while syncing is paused)
+DriveRelay.ps1 run                       Quiet pass for automation; honours the pause
+DriveRelay.ps1 status [<id>]             Per-link state and outstanding work
+DriveRelay.ps1 start                     Install scheduled background task
+DriveRelay.ps1 stop                      Remove scheduled task
+DriveRelay.ps1 config                    View or update global settings
 ```
+
+There is no `DriveRelay` command on the PATH: run the script as `.\DriveRelay.ps1` from the
+DriveRelay folder.
 
 Global settings live in `config/settings.json`. Log verbosity and retention are
 `LogLevel` (`DEBUG`/`INFO`/`WARN`/`ERROR`), `LogMaxSizeMB`, `LogKeepFiles` and `LogMaxAgeDays`;

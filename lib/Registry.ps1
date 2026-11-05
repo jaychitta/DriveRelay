@@ -47,8 +47,14 @@ function Invoke-RegistryTransaction {
     $mutex = $null
     $held  = $false
     try {
+        # Fail closed, as the pass lock does. Proceeding unlocked brings back
+        # the lost-update race the lock exists for; the usual cause is a
+        # process at a different elevation level owning the name, and the
+        # change can be retried from a normal (non-elevated) window.
         try   { $mutex = New-Object System.Threading.Mutex($false, $script:RegistryMutexName) }
-        catch { return (& $Body) }   # no mutex available; better to proceed than to fail closed
+        catch {
+            throw ("Could not open the link registry lock ({0}); nothing was changed. If DriveRelay is also running elevated, close that window and try again." -f $_.Exception.Message)
+        }
 
         try   { $held = $mutex.WaitOne($TimeoutMs) }
         catch [System.Threading.AbandonedMutexException] {
@@ -168,8 +174,10 @@ function Add-Link {
         [Parameter(Mandatory)][string] $Remote,
         [ValidateSet('Local','Remote')][string] $Seed = 'Local',
         [ValidateSet('Auto','CloudFiles','Plain')][string] $Provider = 'Auto',
-        [int] $SettleMinutes = 3,
-        [int] $MaxDelete = 50,
+        # Range-checked here, not only when read: a negative settle window would
+        # disable settling, and a negative cap would abort every pass.
+        [ValidateRange(0, 2147483647)][int] $SettleMinutes = 3,
+        [ValidateRange(0, 2147483647)][int] $MaxDelete = 50,
         [bool] $Dehydrate = $true,
         [bool] $HydrateBeforeDelete = $false,
 

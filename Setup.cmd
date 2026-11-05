@@ -38,6 +38,8 @@ if errorlevel 1 (
 )
 
 rem --- the payload has to actually be here -----------------------------------
+rem Only the two files needed to get started are checked here; Install.ps1
+rem checks the full list of required files before installing anything.
 
 if not exist "%~dp0Install.ps1" (
     echo  ERROR: Install.ps1 is missing from this folder.

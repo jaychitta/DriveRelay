@@ -144,6 +144,12 @@ Assert-True (-not (Test-Path -LiteralPath $oldHistory)) "The earlier registratio
 Assert-Equal @(Get-ChildItem -LiteralPath $tmpState -Directory -Filter "$($link.Id).superseded-*").Count 1 "The set-aside history is kept, not deleted"
 Remove-Link -Id $readded.Id
 
+# Per-link limits are range-checked at registration.
+$badRange = $false
+try { $null = Add-Link -Local $tmpLocal -Remote $tmpRemote -Seed 'Local' -SettleMinutes -1 } catch { $badRange = $true }
+Assert-True $badRange "Add-Link refuses a negative SettleMinutes"
+Assert-Equal @(Get-LinkRegistry).Count 0 "A refused add registers nothing"
+
 # If the history cannot be set aside, nothing is registered.
 New-Item -ItemType Directory -Path $oldHistory -Force | Out-Null
 $holdOpen = [IO.File]::Open((Join-Path $oldHistory 'manifest.json'), [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
@@ -921,6 +927,12 @@ try { $null = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $c
 finally { Set-Item -Path Function:\Invoke-CopyToRemote -Value $script:RealCopyToRemote; $script:EditDuringPass = $null }
 Assert-Equal (Get-Action $ctx 'a.txt') 'CopyToRemote' "A local edit made during the pass is still pending, not absorbed into the baseline"
 
+# --- a file stamped in the future is not deferred forever ---
+$future = Set-TestFile (Join-Path $engineRoot 'future.txt') 'from a fast clock' ([datetime]::UtcNow.AddDays(2))
+Assert-True (Test-FileSettled -Path $future.FullName -SettleMinutes 3) "A future last-write time counts as settled (the lock check still applies)"
+$recent = Set-TestFile (Join-Path $engineRoot 'recent.txt') 'just saved' ([datetime]::UtcNow)
+Assert-True (-not (Test-FileSettled -Path $recent.FullName -SettleMinutes 3)) "A file saved just now is still settling"
+
 # --- seeding keeps the version it replaces ---
 $ctx = New-TestLink
 $ctx.Link.Seeded = $false
@@ -1140,7 +1152,7 @@ Set-Content -LiteralPath $freshGen -Value 'fresh generation' -Encoding utf8
 (Get-Item -LiteralPath $oldGen).LastWriteTime   = (Get-Date).AddDays(-45)
 (Get-Item -LiteralPath $freshGen).LastWriteTime = (Get-Date).AddDays(-10)
 
-Invoke-LogAgePurge
+Invoke-LogAgePurge -Force
 Assert-True (-not (Test-Path -LiteralPath $oldGen)) "A generation older than MaxAgeDays is purged"
 Assert-True (Test-Path -LiteralPath $freshGen) "A generation younger than MaxAgeDays survives"
 Assert-True (Test-Path -LiteralPath $ageLog) "The active log is never touched by the age purge, however old"
@@ -1149,8 +1161,15 @@ Assert-True (Test-Path -LiteralPath $ageLog) "The active log is never touched by
 Set-Content -LiteralPath $oldGen -Value 'old generation again' -Encoding utf8
 (Get-Item -LiteralPath $oldGen).LastWriteTime = (Get-Date).AddDays(-90)
 Set-LogRotation -MaxSizeMB 1 -Keep 3 -MaxAgeDays 0
-Invoke-LogAgePurge
+Invoke-LogAgePurge -Force
 Assert-True (Test-Path -LiteralPath $oldGen) "MaxAgeDays 0 disables the age cap"
+
+# Lowering Keep must not strand the higher-numbered generations forever.
+$orphan = Join-Path $logDir 'age.7.log'
+Set-Content -LiteralPath $orphan -Value 'from when Keep was larger' -Encoding utf8
+Invoke-LogAgePurge -Force
+Assert-True (-not (Test-Path -LiteralPath $orphan)) "A generation numbered above LogKeepFiles is removed"
+Assert-True (Test-Path -LiteralPath $freshGen) "Generations within LogKeepFiles are kept"
 
 Set-LogRotation -MaxSizeMB 1 -Keep 3 -MaxAgeDays 60
 Set-LogPath $script:TestLog
@@ -1181,6 +1200,8 @@ Assert-Equal $readBack.IdleCount 4 "Idle streak count round-trips through lastpa
 Assert-Equal $readBack.IdleSince '2026-08-12 09:00:00' "Idle streak start round-trips"
 Assert-Equal $readBack.LastHeartbeat '2026-08-12 09:00:00' "Heartbeat timestamp round-trips"
 Assert-Equal $readBack.Deferred 2 "Deferred count still reported while the pass counts as idle"
+Assert-Equal @($readBack.PerLink).Count @($idleOutcome.Results).Count "The summary keeps one per-link entry per result, for single-link merges"
+Assert-Equal ([string]@($readBack.PerLink)[0].LinkId) ([string]@($idleOutcome.Results)[0].LinkId) "Per-link entries carry their link id"
 
 # Pre-existing summaries were written before these fields existed and must read
 # as a fresh streak rather than throwing.

@@ -8,5 +8,6 @@
     "LogLevel":  "INFO",
     "LogMaxSizeMB":  1,
     "LogKeepFiles":  3,
-    "LogMaxAgeDays":  60
+    "LogMaxAgeDays":  60,
+    "Paused":  false
 }

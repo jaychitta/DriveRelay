@@ -215,6 +215,8 @@ DriveRelay.exe      branded hidden launcher (built by Install.ps1)
 DriveRelayTray.vbs  legacy hidden launcher for manual use
 Install.ps1         icons, launcher, Start Menu and Startup shortcuts
 Uninstall.ps1       reverses the above; keeps links unless told otherwise
+Setup.cmd / Uninstall.cmd  double-clickable wrappers for the two scripts above
+OneDriveGate.ps1    optional: keeps the OneDrive client stopped during working hours
 
 lib\Logging.ps1     Write-Log, shared, severity-filtered, size/age retention
 lib\LogViewer.ps1   read-only log window for tray/dashboard
@@ -228,12 +230,13 @@ lib\Manifest.ps1    snapshots, manifest, diff, readiness
 lib\FileIdentity.ps1 metadata-only NTFS identity and guarded native rename
 lib\Settle.ps1      lock and quiescence tests
 lib\Hydration.ps1   placeholder control
-lib\Actions.ps1     copy, delete, conflict fork, seed, the pass itself
+lib\Actions.ps1     copy, delete, conflict fork, seed, one link's pass (Invoke-LinkSync)
 lib\Pass.ps1        single-instance pass runner shared by CLI, tray and scheduler
 lib\Settings.ps1    settings.json: per-field validation, locked Update-AppSettings
 lib\Startup.ps1     the Startup shortcut, shared by Install.ps1 and the dashboard
 tools\New-Icons.ps1 writes the .ico files
 tools\New-Launcher.ps1 builds DriveRelay.exe from DriveRelayLauncher.cs
+tools\Clear-BuildOutput.ps1 removes the root build\ and dist\ folders, nothing else
 ```
 
 The tray, the CLI and the scheduled task all call `Invoke-SyncPass`. There is no behaviour that

@@ -30,6 +30,20 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 
+# A partial extraction must fail here, with the missing names, before anything
+# is installed -- not later as a tray agent that dies invisibly at logon.
+$required = @(
+    'DriveRelay.ps1', 'DriveRelayTray.ps1', 'DriveRelayUI.ps1', 'config\excludes.txt',
+    'tools\New-Launcher.ps1', 'tools\DriveRelayLauncher.cs', 'tools\New-Icons.ps1'
+) + @('Actions', 'Availability', 'Conflicts', 'DashboardScan', 'FileIdentity', 'Hydration',
+      'Icons', 'Logging', 'LogViewer', 'Manifest', 'Pass', 'Provider', 'Registry',
+      'Settings', 'Settle', 'Startup' | ForEach-Object { "lib\$_.ps1" })
+$missing = @($required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $root $_)) })
+if ($missing.Count -gt 0) {
+    throw ("These files are missing from {0}: {1}. Extract the whole DriveRelay folder again; nothing was installed." -f
+           $root, ($missing -join ', '))
+}
+
 . (Join-Path $root 'lib\Settings.ps1')
 . (Join-Path $root 'lib\Startup.ps1')
 Set-SettingsPath (Join-Path $root 'config\settings.json')

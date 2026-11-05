@@ -12,21 +12,23 @@
     `check` reports what would happen and writes nothing. `sync` applies it.
     Run sync with -WhatIf first on anything you care about.
 
-    Deletes go to the Recycle Bin. Conflicts keep both versions. A pass that
-    would delete more than the link's MaxDelete aborts without applying
-    anything.
+    Deletes go to the Recycle Bin (or a .driverelay-deleted folder where the
+    volume has none). Conflicts keep both versions. A pass that would delete
+    more than the link's MaxDelete aborts without applying anything.
 
-    Usage:
-      DriveRelay add    <local> <remote> [-Seed Local|Remote]
-      DriveRelay list
-      DriveRelay rm     <id>
-      DriveRelay pause  <id>
-      DriveRelay resume <id>
-      DriveRelay check  [<id>] [-Detailed]
-      DriveRelay sync   [<id>] [-WhatIf]
-      DriveRelay status [<id>]
-      DriveRelay start  [-IntervalMinutes 10]
-      DriveRelay stop
+    Usage (from the DriveRelay folder):
+      .\DriveRelay.ps1 add    <local> <remote> [-Seed Local|Remote]
+      .\DriveRelay.ps1 list
+      .\DriveRelay.ps1 rm     <id>
+      .\DriveRelay.ps1 pause  <id>
+      .\DriveRelay.ps1 resume <id>
+      .\DriveRelay.ps1 check  [<id>] [-Detailed]
+      .\DriveRelay.ps1 sync   [<id>] [-WhatIf]
+      .\DriveRelay.ps1 run
+      .\DriveRelay.ps1 status [<id>]
+      .\DriveRelay.ps1 start  [-IntervalMinutes 10]
+      .\DriveRelay.ps1 stop
+      .\DriveRelay.ps1 config [-LogLevel DEBUG] [-IntervalMinutes 10] ...
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -444,6 +446,17 @@ function Invoke-StartCommand {
     Write-Log ("scheduled task installed, every {0} minutes" -f $minutes)
     "Installed scheduled task '{0}', running every {1} minutes while you are logged in." -f $script:TaskName, $minutes
     "Passes that overlap are skipped, so a slow run cannot pile up."
+
+    # Setup installs the tray agent, which already runs passes on its own timer;
+    # the scheduled task is meant for machines without it. Both together are
+    # safe (the pass lock) but redundant -- say so rather than double up quietly.
+    $trayShortcut = Join-Path ([Environment]::GetFolderPath('Startup')) 'DriveRelay.lnk'
+    if (Test-Path -LiteralPath $trayShortcut) {
+        ''
+        "Note: the DriveRelay tray agent is also set to start with Windows and runs its own passes."
+        "      The two never overlap, but one is enough. Run 'DriveRelay stop' to remove this task,"
+        "      or turn off 'Start with Windows' in the dashboard to rely on the task alone."
+    }
 }
 
 function Invoke-StopCommand {

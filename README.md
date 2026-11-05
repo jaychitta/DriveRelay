@@ -142,17 +142,18 @@ dashboard all call the same code, so nothing behaves differently unattended.
 ### Command line
 
 ```
-DriveRelay add    <local> <remote>    Register a new link pair
-DriveRelay list                       Show all registered links
-DriveRelay rm     <id>                Unregister a link (no files touched)
-DriveRelay pause  <id>                Disable a link
-DriveRelay resume <id>                Re-enable a paused link
-DriveRelay check  [<id>]              Report what a sync would do. Writes nothing
-DriveRelay sync   [<id>]              Apply it
-DriveRelay status [<id>]              Per-link state and outstanding work
-DriveRelay start                      Install scheduled background task
-DriveRelay stop                       Remove scheduled task
-DriveRelay config                     View or update global settings
+.\DriveRelay.ps1 add    <local> <remote>   Register a new link pair
+.\DriveRelay.ps1 list                      Show all registered links
+.\DriveRelay.ps1 rm     <id>               Unregister a link (no files touched)
+.\DriveRelay.ps1 pause  <id>               Disable a link
+.\DriveRelay.ps1 resume <id>               Re-enable a paused link
+.\DriveRelay.ps1 check  [<id>]             Report what a sync would do. Writes nothing
+.\DriveRelay.ps1 sync   [<id>]             Apply it (runs even while syncing is paused)
+.\DriveRelay.ps1 run                       Quiet pass for automation; honours the pause
+.\DriveRelay.ps1 status [<id>]             Per-link state and outstanding work
+.\DriveRelay.ps1 start                     Install scheduled background task
+.\DriveRelay.ps1 stop                      Remove scheduled task
+.\DriveRelay.ps1 config                    View or update global settings
 ```
 
 A first run seeds: `-Seed Local` or `-Seed Remote` decides which side is
@@ -200,6 +201,15 @@ the shapes.
 | `HydrateBeforeDelete` | true | Download placeholders before deleting, so the Recycle Bin holds real content |
 | `StartWithWindows` | true | Start the tray agent at logon; the dashboard's setting creates or removes the Startup shortcut |
 | `StartDelaySeconds` | 90 | Wait after logon before the first pass, so cloud clients can mount |
+| `LogLevel` | INFO | `DEBUG`, `INFO`, `WARN` or `ERROR`; INFO records what changed |
+| `LogMaxSizeMB` | 1 | Size at which `driverelay.log` rotates |
+| `LogKeepFiles` | 3 | Rotated generations kept (`driverelay.1.log` ..) |
+| `LogMaxAgeDays` | 60 | Rotated generations older than this are deleted; `0` turns the age limit off |
+| `Paused` | false | Set by the tray's Pause; automatic passes skip while true, an explicit `sync` still runs |
+
+Each value is checked on its own: an invalid one falls back to its default
+without affecting the others. Change settings with `config`, the dashboard or
+the tray rather than by hand while DriveRelay is running.
 
 `config/excludes.txt` holds wildcard patterns matched against file names —
 Office lock files, `*.tmp`, `Thumbs.db` and so on.

@@ -45,6 +45,7 @@ $script:LogAgeCapDays = 60
 function Set-LogPath {
     param([Parameter(Mandatory)][string] $Path)
     $script:LogPath = $Path
+    $script:LogLastPurge = [datetime]::MinValue
 }
 
 function Get-LogPath { return $script:LogPath }
@@ -81,30 +82,55 @@ function Set-LogRotation {
     if ($MaxSizeMB -gt 0)  { $script:LogMaxBytes   = [long]($MaxSizeMB * 1MB) }
     if ($Keep -ge 0)       { $script:LogKeep       = $Keep }
     if ($MaxAgeDays -ge 0) { $script:LogAgeCapDays = $MaxAgeDays }
+    # A changed policy applies at the next write, not up to an hour later.
+    $script:LogLastPurge = [datetime]::MinValue
+}
+
+# Rotation renames files several processes share (the tray, the dashboard, the
+# child CLI). Two of them rotating at once used to shift the generations twice
+# and delete one. A named lock serialises rotation; whoever gets it second
+# re-checks the size and finds nothing to do.
+$script:LogRotationMutexName = 'Global\DriveRelayLogRotation'
+$script:LogLastPurge = [datetime]::MinValue
+
+function Get-LogGenerations {
+    # Every rotated generation on disk (driverelay.<n>.log), whatever Keep is
+    # now -- lowering LogKeepFiles must not strand the higher-numbered ones.
+    $dir  = Split-Path -Parent $script:LogPath
+    $base = [IO.Path]::GetFileNameWithoutExtension($script:LogPath)
+    $ext  = [IO.Path]::GetExtension($script:LogPath)
+    if (-not $dir) { $dir = '.' }
+    if (-not (Test-Path -LiteralPath $dir)) { return @() }
+    $pattern = '^' + [regex]::Escape($base) + '\.(\d+)' + [regex]::Escape($ext) + '$'
+    $found = foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -Force -ErrorAction SilentlyContinue)) {
+        $m = [regex]::Match($f.Name, $pattern, 'IgnoreCase')
+        if ($m.Success) { [pscustomobject]@{ N = [int]$m.Groups[1].Value; Path = $f.FullName; Item = $f } }
+    }
+    return @($found | Sort-Object N)
 }
 
 function Invoke-LogAgePurge {
     <#
-        Deletes rotated generations (driverelay.1.log ..) whose last write is
-        older than LogMaxAgeDays, regardless of how many generations that is.
+        Deletes rotated generations older than LogMaxAgeDays, and any numbered
+        above LogKeepFiles. Only ever touches rotated generations -- the active
+        log is not a candidate.
 
-        This runs on every write, not just when a rotation just happened: a
-        quiet link can sit under the size cap for months, and the age cap has
-        to catch that generation eventually too. Only ever touches rotated
-        generations -- the active log is not a candidate.
+        A quiet link can sit under the size cap for months, so this cannot run
+        only when a rotation happens. It runs at most once an hour per process
+        (and always as part of a rotation): a directory listing on every log
+        line is not worth it.
     #>
-    if ($script:LogAgeCapDays -le 0) { return }
+    param([switch] $Force)
+    if (-not $Force -and ((Get-Date) - $script:LogLastPurge).TotalMinutes -lt 60) { return }
+    $script:LogLastPurge = Get-Date
 
     try {
-        $dir  = Split-Path -Parent $script:LogPath
-        $base = [IO.Path]::GetFileNameWithoutExtension($script:LogPath)
-        $ext  = [IO.Path]::GetExtension($script:LogPath)
         $cutoff = (Get-Date).AddDays(-$script:LogAgeCapDays)
-
-        for ($n = 1; $n -le $script:LogKeep; $n++) {
-            $path = Join-Path $dir ("{0}.{1}{2}" -f $base, $n, $ext)
-            if ((Test-Path -LiteralPath $path) -and (Get-Item -LiteralPath $path).LastWriteTime -lt $cutoff) {
-                Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        foreach ($g in (Get-LogGenerations)) {
+            $tooOld  = ($script:LogAgeCapDays -gt 0 -and $g.Item.LastWriteTime -lt $cutoff)
+            $surplus = ($g.N -gt $script:LogKeep)
+            if ($tooOld -or $surplus) {
+                Remove-Item -LiteralPath $g.Path -Force -ErrorAction SilentlyContinue
             }
         }
     }
@@ -114,14 +140,26 @@ function Invoke-LogAgePurge {
 function Invoke-LogRotation {
     <#
         Rename the active log aside and shift the older generations down one.
-
-        Best-effort throughout: if another DriveRelay process is rotating at the
-        same moment one of the two loses a rename and the next call retries.
-        Losing a rotation is harmless; failing a sync over one is not.
+        Best-effort throughout: failing a sync over a log rotation is worse
+        than an oversized log.
     #>
     Invoke-LogAgePurge
 
     try {
+        if (-not (Test-Path -LiteralPath $script:LogPath)) { return }
+        if ((Get-Item -LiteralPath $script:LogPath).Length -le $script:LogMaxBytes) { return }
+    }
+    catch { return }
+
+    $mutex = $null
+    $held  = $false
+    try {
+        $mutex = New-Object System.Threading.Mutex($false, $script:LogRotationMutexName)
+        try   { $held = $mutex.WaitOne(2000) }
+        catch [System.Threading.AbandonedMutexException] { $held = $true }
+        if (-not $held) { return }   # someone else is rotating; the next write re-checks
+
+        # Re-check under the lock: another process may have just rotated.
         if (-not (Test-Path -LiteralPath $script:LogPath)) { return }
         if ((Get-Item -LiteralPath $script:LogPath).Length -le $script:LogMaxBytes) { return }
 
@@ -132,24 +170,28 @@ function Invoke-LogRotation {
 
         if ($script:LogKeep -lt 1) {
             Remove-Item -LiteralPath $script:LogPath -Force -ErrorAction Stop
-            return
         }
-
-        # Oldest first, so nothing is overwritten before it has been shifted.
-        $oldest = & $gen $script:LogKeep
-        if (Test-Path -LiteralPath $oldest) {
-            Remove-Item -LiteralPath $oldest -Force -ErrorAction SilentlyContinue
-        }
-        for ($n = $script:LogKeep - 1; $n -ge 1; $n--) {
-            $from = & $gen $n
-            if (Test-Path -LiteralPath $from) {
-                Move-Item -LiteralPath $from -Destination (& $gen ($n + 1)) -Force -ErrorAction SilentlyContinue
+        else {
+            # Oldest first, so nothing is overwritten before it has been shifted.
+            $oldest = & $gen $script:LogKeep
+            if (Test-Path -LiteralPath $oldest) {
+                Remove-Item -LiteralPath $oldest -Force -ErrorAction SilentlyContinue
             }
+            for ($n = $script:LogKeep - 1; $n -ge 1; $n--) {
+                $from = & $gen $n
+                if (Test-Path -LiteralPath $from) {
+                    Move-Item -LiteralPath $from -Destination (& $gen ($n + 1)) -Force -ErrorAction SilentlyContinue
+                }
+            }
+            Move-Item -LiteralPath $script:LogPath -Destination (& $gen 1) -Force -ErrorAction Stop
         }
-
-        Move-Item -LiteralPath $script:LogPath -Destination (& $gen 1) -Force -ErrorAction Stop
+        Invoke-LogAgePurge -Force
     }
     catch { }
+    finally {
+        if ($held -and $mutex) { try { $mutex.ReleaseMutex() } catch { } }
+        if ($mutex) { $mutex.Dispose() }
+    }
 }
 
 function Write-Log {

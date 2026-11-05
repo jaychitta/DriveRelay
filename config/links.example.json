@@ -8,7 +8,7 @@
         "SettleMinutes":  3,
         "MaxDelete":  50,
         "Dehydrate":  true,
-        "HydrateBeforeDelete":  false,
+        "HydrateBeforeDelete":  true,
         "Enabled":  true,
         "Seeded":  false,
         "LastRun":  null,

@@ -149,21 +149,32 @@ file and an atomic `File.Replace`; an unparseable file is copied aside before be
 **R3. Manifest write collides with the dashboard's reads — medium — partly fixed.** The
 replace now retries; a reader could still hold the file through all retries.
 
-**R4. A deferred-forever file is invisible at INFO — low — open.** A future last-write time
-never settles, and deferrals do not break the idle streak. Per-link `SettleMinutes` and
-`MaxDelete` are stored without range checks in `Add-Link`.
+**R4. A deferred-forever file is invisible at INFO — low — fixed.** A future last-write time
+never settled, deferrals did not break the idle streak, and per-link `SettleMinutes` and
+`MaxDelete` were stored without range checks. *Fix:* a last-write time more than a minute in
+the future counts as settled (the held-open check still applies); the hourly idle heartbeat
+names how many files are waiting; `Add-Link` rejects negative values.
 
-**R5. A single-link `sync <id>` overwrites the tray's whole-pass summary — low — open.**
+**R5. A single-link `sync <id>` overwrites the tray's whole-pass summary — low — fixed.**
+`lastpass.json` now keeps per-link results; a single-link sync replaces only its own entry,
+keeps the other enabled links', and leaves the idle streak alone. `sync <id>` on a paused link
+now says it is paused rather than "no enabled links".
 
-**R8. Registry lock falls back to unlocked — low — open.** If the mutex cannot be created
-(for example across elevation levels) writes proceed unlocked; the pass lock fails closed.
+**R8. Registry lock falls back to unlocked — low — fixed.** If the mutex could not be created
+(for example across elevation levels) writes proceeded unlocked. It now fails closed, like the
+pass lock, with a message about the elevated window.
 
-**R9. Log rotation races; orphaned generations — low — open.** Two writers rotating at once
-can lose a generation; lowering `LogKeepFiles` leaves higher-numbered files forever.
+**R9. Log rotation races; orphaned generations — low — fixed.** Two writers rotating at once
+could lose a generation; lowering `LogKeepFiles` left higher-numbered files forever. *Fix:*
+rotation runs under a `Global\DriveRelayLogRotation` lock and re-checks the size once held; the
+purge removes any generation numbered above `LogKeepFiles` as well as those past
+`LogMaxAgeDays`, across every generation on disk, at most hourly per process and after each
+rotation.
 
-**R11. OneDriveGate — low — open.** In the resumed phase a quit OneDrive is relaunched every
-30 seconds; `-ResumeTime 17` parses as 17 days and never resumes; the process check matches
-other users' sessions.
+**R11. OneDriveGate — low — fixed.** In the resumed phase a quit OneDrive was relaunched every
+30 seconds; `-ResumeTime 17` parsed as 17 days and never resumed; the process check matched
+other users' sessions. *Fix:* OneDrive is started once on entering the resumed phase;
+`ResumeTime` must be `HH:mm` under 24 hours; only the current session's processes count.
 
 ### UI, tray and CLI
 
@@ -190,9 +201,10 @@ recursive conflict-copy scan of every link and live availability checks. *Fix:* 
 runspace probe (availability and duplicate count) runs at start, every minute, after each pass
 and on menu open; the menu shows the latest completed result and never waits for it.
 
-**U7. Unhandled errors in some dashboard handlers — low — partly fixed.** "Sync all now" now
-re-enables its buttons if the sync cannot start. Edit, pause and remove handlers still lack
-`try/catch`.
+**U7. Unhandled errors in some dashboard handlers — low — fixed.** "Sync all now" re-enables
+its buttons if the sync cannot start; Edit/Save, Pause/Resume and Remove show a message when
+the registry change fails (for example a lock timeout). The Add dialog's Recycle Bin option now
+starts from the global default, as the CLI does.
 
 **U8. `StartWithWindows` has no effect — medium — fixed.** Only the installer created or
 removed the Startup shortcut. *Fix:* `lib/Startup.ps1` holds the shortcut logic for both the
@@ -205,10 +217,13 @@ the change, and saves the setting only after the shortcut matches it.
 unquoted.
 
 **S2. Uninstall deleted a tracked file and left the dashboard running — medium — fixed.** It
-removed `DriveRelayTray.vbs` and stopped only the tray. (Waiting for an in-flight pass before
-`-AlsoRemoveSettings` deletes `state\` remains open.)
+removed `DriveRelayTray.vbs` and stopped only the tray. `-AlsoRemoveSettings` now waits up to
+two minutes for the pass lock and holds it while removing `state\`, or keeps everything and
+says to retry.
 
-**S3. Partial-extraction guard checks two files — low — open.**
+**S3. Partial-extraction guard checks two files — low — fixed.** `Install.ps1` now checks
+every file it needs (entry scripts, all `lib` modules, launcher sources, `excludes.txt`) before
+changing anything and names what is missing; `Setup.cmd` keeps its two quick checks.
 
 **S6. Install echoes an invalid interval — low — fixed.** `-IntervalMinutes 0` was saved and
 reported, but read back as 10. Install now refuses an interval below 1.
@@ -216,17 +231,20 @@ reported, but read back as 10. Install now refuses an interval below 1.
 **S7. Install saves settings before steps that can fail — low — fixed.** Settings are now
 saved after the launcher and shortcuts exist, through `Update-AppSettings`.
 
-**S9. `start` re-creates the scheduled task alongside the tray — low — open.** Safe because of
-the mutex, but redundant.
+**S9. `start` re-creates the scheduled task alongside the tray — low — fixed.** Still safe
+because of the pass lock; `start` now says so when the tray's Startup shortcut exists and how
+to keep only one, and the operations doc says the task is for machines without the tray.
 
 ### Documentation
 
-**D1. Drift — low — partly fixed.** Updated for this change: README safety model and seeding,
-architecture safety rules, runbook recovery, `CLAUDE.md` module notes. Still stale: the README
-settings table (log settings, `Paused`), the CLI quick reference's bare `DriveRelay` form and
-missing `run`, `config` usage in operations, the manager-window status table, the Files table,
-`links.example.json`'s `HydrateBeforeDelete`, and the `CLAUDE.md` file list (`tools/New-Icons.ps1`,
-two tracked `.ico` files).
+**D1. Drift — low — fixed.** Brought in line with the code: README safety model, seeding,
+settings table (log settings, `Paused`, per-field validation) and CLI reference (`.\DriveRelay.ps1`
+form, `run`); architecture safety rules and component list (`Invoke-LinkSync`, `OneDriveGate`,
+`Setup.cmd`/`Uninstall.cmd`, `Clear-BuildOutput`); operations tray menu, manager-window statuses
+and buttons, full `config` usage including `-HydrateBeforeDelete:$false`, Files table
+(`settings.json`, `onedrivegate.log`, `.driverelay-deleted`); runbook recovery; the CLI's own
+usage header; Uninstall's header; `settings.example.json` (`Paused`); `links.example.json`
+(`HydrateBeforeDelete` true, as CLI-added links inherit); `CLAUDE.md` file list and module notes.
 
 ---
 
@@ -236,7 +254,7 @@ two tracked `.ico` files).
 | --- | --- | --- | --- | --- |
 | High | 5 | 5 (E1–E5) | 0 | 0 |
 | Medium | 11 | 10 (E6, E7, E8, R2, U1, U2, U5, U6, U8, S2) | 1 (R3) | 0 |
-| Low | 15 | 6 (R1, U3, U4, S1, S6, S7) | 2 (U7, D1) | 7 (R4, R5, R8, R9, R11, S3, S9) |
+| Low | 15 | 15 | 0 | 0 |
 
 The five high findings share one theme: each was a way for the engine to act on a picture of
 the folders that was incomplete (E1), stale (E2, E3), or overstated in what it promised (E4,
@@ -256,3 +274,6 @@ anything it replaces or removes.
    an unreachable network remote (U5, U6).
 6. Dashboard Settings: toggling "Start with Windows" creates and removes
    `Startup\DriveRelay.lnk` (U8).
+7. Two processes logging past the size cap at once leave consecutive generations (R9);
+   `OneDriveGate.ps1 -ResumeTime 17` is refused, and a OneDrive quit after resume stays quit (R11).
+8. `Install.ps1` from a folder missing a `lib` module refuses and names it (S3).

@@ -15,12 +15,15 @@ means the inventory could not be read; its tooltip gives the error.
 | *(top line)* | Current state — up to date, syncing, or needs attention |
 | Sync now | Runs a pass immediately, even while automatic syncing is paused (the pause stays on) |
 | Pause syncing | Stops automatic passes until resumed |
-| Open Dashboard... | Opens the manager window |
-| View Log | Opens `driverelay.log` |
+| Open dashboard | Opens the manager window |
+| Settings | Opens the dashboard; its **Settings** button holds the global settings |
+| View log | Opens `driverelay.log` |
 | Exit | Stops the agent until next logon |
 
-A balloon appears only when something needs a person — a conflict, a failure, or an aborted
-pass. Routine syncs are silent.
+A balloon appears only when something needs a person — a conflict, a failure, an aborted
+pass, or a sync that did not complete (the tray then reads **Last sync failed - see View log**).
+Routine syncs are silent. While paused, the icon and the top line stay **Paused** even after a
+**Sync now**.
 
 **Windows 11 hides new tray icons.** If it is not by the clock, click the chevron. Drag it onto
 the taskbar to keep it there, or turn it on under
@@ -32,13 +35,21 @@ Lists every linked pair with the drive it detected and a status:
 
 | Status | Meaning |
 |---|---|
-| Ready | Linked and seeded |
-| Not copied yet | Registered, first sync not run |
-| Needs attention | Last pass aborted — usually the delete cap |
+| Checking folders... | The background check has not finished yet |
+| Up to date | Linked and seeded, nothing outstanding |
+| Not synced yet | Registered, first sync not run |
+| Ready to sync | A raised delete limit is saved; the next sync retries the link |
+| *the abort reason* | The last pass stopped, for example "120 deletions exceeds MaxDelete of 50" |
+| *n* deletion conflict(s) | Use **Review** on the card |
+| *n* duplicate(s) | Conflict copies to look at; use **Duplicates** on the card |
+| *an availability message* | A drive, folder or cloud client is unavailable; the tooltip says what to do |
+| Status check failed | The background check could not read the link; the tooltip gives the error |
 | Paused | Link disabled |
 
-Double-click a row to open that folder. **Add Folder...** takes two folders and a direction.
-**Remove** unregisters a link; both folders keep all their files.
+Double-click a card, or use **Open folder**, to open the local folder. **+ Add folder pair**
+takes two folders and a direction. **Edit** changes a link's settings and holds **Remove folder
+pair**, which unregisters it; both folders keep all their files. **Sync all now** runs a sync
+even while automatic syncing is paused.
 
 ## Command line
 
@@ -59,15 +70,21 @@ DriveRelay.ps1 status  [-Id <id>]
 DriveRelay.ps1 start   [-IntervalMinutes 10]      installs the scheduled background task
 DriveRelay.ps1 stop                               removes the scheduled background task
 
-DriveRelay.ps1 config  [-LogLevel DEBUG]
+DriveRelay.ps1 config  [-IntervalMinutes 10] [-SettleMinutes 3] [-MaxDelete 50]
+                       [-HydrateBeforeDelete[:$false]] [-LogLevel DEBUG]
                        [-LogMaxSizeMB 1] [-LogKeepFiles 3] [-LogMaxAgeDays 60]
                                                    shows or changes global settings
 ```
 
+`-HydrateBeforeDelete` is a switch: pass it to turn the option on, and
+`-HydrateBeforeDelete:$false` to turn it off. `sync <id>` on a paused link says the link is
+paused; resume it first.
+
 `start` and `stop` register and unregister a Windows scheduled task named `DriveRelay`, which
 runs `DriveRelay.ps1 run` every `IntervalMinutes` while you are logged in. Neither one starts
 or stops the tray agent — that is the tray's own **Exit** menu item and the Startup shortcut
-`Install.ps1` creates.
+`Install.ps1` creates. The task is for machines without the tray: Setup removes it, and
+`start` warns when the tray's Startup shortcut exists, since one timer is enough.
 
 Three things are not CLI commands, and are reached elsewhere:
 
@@ -215,10 +232,13 @@ Set it with `config -LogMaxAgeDays 60`, or `0` to turn the age limit off and rel
 | Path | |
 |---|---|
 | `config\links.json` | The links. Editable by hand; keep a copy first. |
+| `config\settings.json` | Global settings (see the README's table). Prefer `config` or the dashboard to editing it by hand |
 | `config\excludes.txt` | Never-sync patterns, one per line |
 | `state\<id>\manifest.json` | Sync baseline. **Deleting this loses history** and the next pass treats everything as new. |
 | `state\lastpass.json` | Last pass summary, read by the tray |
 | `driverelay.log` | Active log. Rotates to `driverelay.1.log` .. `.3.log` at 1 MB |
+| `onedrivegate.log` | Log of `OneDriveGate.ps1`, when that is used; trimmed to its last 2000 lines at 1 MB |
+| `<link root>\.driverelay-deleted\` | Hidden; deletes on volumes with no Recycle Bin (network, removable) |
 
 ## Install and uninstall
 
