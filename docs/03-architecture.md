@@ -196,9 +196,14 @@ Observed working on live data: with TallyPrime running, a pass deferred `TSTATE.
   does not know read as new, never as deleted.
 - **One pass at a time.** A named mutex plus the scheduler's own guard. Two passes copying the
   same file in opposite directions is the failure this prevents.
-- **Stale baselines set aside.** Re-registering a link whose id already has a manifest moves
-  that manifest, and its `.bak`/`.tmp` copies, aside — a baseline for different folders
-  becomes wrong deletions.
+- **Stale baselines set aside.** Re-registering a link whose id already has history renames
+  `state\<id>\` to `state\<id>.superseded-<timestamp>\` — manifest and `.bak`/`.tmp`
+  together — because a baseline for a different registration becomes wrong deletions. It
+  happens inside `Add-Link`, under the registry lock and before the link is saved, so no pass
+  can see the new link with the old history; if the rename fails, nothing is registered. When
+  there is history to move, `Add-Link` first takes the pass lock (pass lock before registry
+  lock, the order a pass uses), so a still-running pass of the removed link cannot write the
+  old manifest back. If a pass is running, the add is refused with a retry message.
 
 ## Components
 

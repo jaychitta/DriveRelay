@@ -2,6 +2,19 @@
 
 All notable changes to DriveRelay (formerly SyncOrchestrator) will be documented in this file.
 
+## [Audit] - 2026-11-05 — E8: re-added links and earlier history
+
+- `Add-Link -StateRoot` now sets aside an earlier registration's `state\<id>\`
+  (renamed to `<id>.superseded-<timestamp>`, manifest and `.bak`/`.tmp`
+  together) inside the registry lock and before saving the link. A failed
+  rename registers nothing. When there is history to move it holds the pass
+  lock first, so a still-running pass of the removed link cannot write the old
+  manifest back; an add during a running pass is refused with a retry message.
+  The CLI and dashboard pass `-StateRoot`; their post-add move is removed.
+- Tests: re-add sets history aside before save and keeps it; a held-open
+  history file refuses the add and registers nothing. Not run (no PowerShell
+  in the sandbox). Docs: architecture, CLAUDE.md, 07-audit (E8 fixed).
+
 ## [Audit] - 2026-11-05 — audit report and items 1-4
 
 - Wrote [07-audit.md](07-audit.md): method, prior-resolution status, findings

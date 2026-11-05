@@ -31,12 +31,12 @@ DriveRelay relays files between a high-speed local NTFS working folder and a clo
     for. Dot-sourced into the entry scripts, so its state variables are deliberately named to
     avoid colliding with their parameters (`$script:LogThreshold`, not `$script:LogLevel`).
   - `LogViewer.ps1`: Read-only log viewer used by the tray and dashboard.
-  - `Manifest.ps1`: Metadata-only snapshots and change tracking. Loads `FileIdentity.ps1`; records optional per-side NTFS IDs and pairs unchanged tracked moves into `MoveLocal`/`MoveRemote`. Produces `DeletionConflict` for a tracked deletion versus changed survivor, and records destination parents for queued-copy/move checks. Never hashes cloud content. Snapshots walk folder by folder, throw on any listing error (except `-AllowPartial`), skip junctions/symbolic links and `.driverelay-deleted`; paths under a skipped link get no action. Writes are flushed and swapped with `File.Replace`, keeping `.bak`; `Repair-LinkManifest`/`Move-ManifestAside` handle recovery and re-registration.
+  - `Manifest.ps1`: Metadata-only snapshots and change tracking. Loads `FileIdentity.ps1`; records optional per-side NTFS IDs and pairs unchanged tracked moves into `MoveLocal`/`MoveRemote`. Produces `DeletionConflict` for a tracked deletion versus changed survivor, and records destination parents for queued-copy/move checks. Never hashes cloud content. Snapshots walk folder by folder, throw on any listing error (except `-AllowPartial`), skip junctions/symbolic links and `.driverelay-deleted`; paths under a skipped link get no action. Writes are flushed and swapped with `File.Replace`, keeping `.bak`; `Repair-LinkManifest` handles recovery.
   - `FileIdentity.ps1`: Zero-access Windows metadata handles for NTFS file IDs (volume, file index, creation time), excluding hard links and unsupported filesystems. Native same-volume rename refuses overwrites and copying across volumes. Loaded by `Manifest.ps1` in every engine/inventory host.
   - `Pass.ps1`: Sync pass orchestration logic. Collapses runs of no-op passes into one
     hourly heartbeat line, tracking the streak in `state/lastpass.json`.
   - `Provider.ps1`: Cloud provider detection and label resolution.
-  - `Registry.ps1`: Link registration and persistence.
+  - `Registry.ps1`: Link registration and persistence. `Add-Link -StateRoot` sets aside an earlier registration's `state\<id>\` (`Move-LinkStateAside`) inside the registry lock and before the save, holding the pass lock (taken first) when there is history to move; a failed set-aside registers nothing.
   - `Settle.ps1`: Settle time detection for in-flight file writes.
   - `Settings.ps1`: Centralized configuration management (get/save/update settings).
 - `config/`:

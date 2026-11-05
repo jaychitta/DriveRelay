@@ -19,6 +19,10 @@ $script:ConfigPath  = Join-Path $script:DefaultRoot 'config\links.json'
 # makes each read-modify-write cycle exclusive.
 $script:RegistryMutexName = 'Global\DriveRelayRegistry'
 
+# The pass lock's name, as Pass.ps1 defines it ($script:PassMutexName). Add-Link
+# takes it when it must set aside an earlier registration's history.
+$script:PassLockName = 'Global\DriveRelayPass'
+
 function Set-RegistryPath {
     param([Parameter(Mandatory)][string] $Path)
     $script:ConfigPath = $Path
@@ -167,13 +171,39 @@ function Add-Link {
         [int] $SettleMinutes = 3,
         [int] $MaxDelete = 50,
         [bool] $Dehydrate = $true,
-        [bool] $HydrateBeforeDelete = $false
+        [bool] $HydrateBeforeDelete = $false,
+
+        # The engine's state folder. When given, sync history left under the
+        # new link's id by an earlier registration is set aside before the
+        # link is saved -- see Move-LinkStateAside. Callers that register real
+        # links (the CLI and the dashboard) must pass it.
+        [string] $StateRoot
     )
 
     if (Test-PathOverlap -A $Local -B $Remote) {
         throw 'The two sides of a link must not contain one another.'
     }
 
+    # Ids come from the folder name, so removing a pair and adding it again
+    # reuses the id -- and state\<id>\ still holds the old pair's manifest. If a
+    # sync of the removed link is still finishing, it can write that manifest
+    # back after we move it aside. Hold the pass lock for the whole add when
+    # there is old history; take it before the registry lock, the same order a
+    # pass takes them, so the two can never wait on each other.
+    $passLock = $null
+    $passHeld = $false
+    $prospective = if ($StateRoot) { New-LinkId -LocalPath $Local } else { $null }
+    if ($prospective -and (Test-Path -LiteralPath (Join-Path $StateRoot $prospective))) {
+        $passLock = New-Object System.Threading.Mutex($false, $script:PassLockName)
+        try   { $passHeld = $passLock.WaitOne(3000) }
+        catch [System.Threading.AbandonedMutexException] { $passHeld = $true }
+        if (-not $passHeld) {
+            $passLock.Dispose()
+            throw ("A sync is running and '{0}' has history from an earlier registration that must be set aside first. Nothing was changed; add the folder again when the sync finishes." -f $prospective)
+        }
+    }
+
+    try {
     return Invoke-RegistryTransaction {
 
     $links = @(Get-LinkRegistry)
@@ -225,12 +255,53 @@ function Add-Link {
     }
 
     if ($PSCmdlet.ShouldProcess($link.Id, 'register link')) {
+        if ($StateRoot -and (Test-Path -LiteralPath (Join-Path $StateRoot $link.Id))) {
+            # The id can differ from the one checked above if another add won
+            # a race; never set aside history without the pass lock.
+            if (-not $passHeld) {
+                throw ("'{0}' has history from an earlier registration and another change raced this one. Nothing was changed; add the folder again." -f $link.Id)
+            }
+            # Before the save, inside the lock: the link never exists while
+            # its folder still holds another registration's history, and if
+            # this fails, nothing is registered.
+            $null = Move-LinkStateAside -StateRoot $StateRoot -LinkId $link.Id
+        }
         Save-LinkRegistry -Links (@($links) + $link)
     }
 
     return $link
 
     }   # end Invoke-RegistryTransaction
+    }
+    finally {
+        if ($passLock) {
+            if ($passHeld) { try { $passLock.ReleaseMutex() } catch { } }
+            $passLock.Dispose()
+        }
+    }
+}
+
+function Move-LinkStateAside {
+    <#
+        Rename state\<id>\ to state\<id>.superseded-<timestamp>\, taking the
+        manifest and its .bak/.tmp recovery copies with it, so a new link with
+        a reused id starts with no history -- which seeds -- rather than with a
+        different pair's history, which would read as deletions. Nothing is
+        deleted. Throws if the folder cannot be renamed (for example, a file in
+        it is open). Returns the new path.
+    #>
+    param([Parameter(Mandatory)][string] $StateRoot,
+          [Parameter(Mandatory)][string] $LinkId)
+    $dir = Join-Path $StateRoot $LinkId
+    $aside = "{0}.superseded-{1}" -f $dir, (Get-Date -Format 'yyyyMMdd-HHmmss')
+    try { Move-Item -LiteralPath $dir -Destination $aside -ErrorAction Stop }
+    catch {
+        throw ("Could not set aside the earlier sync history in {0} ({1}). Nothing was changed; close anything using that folder and add the pair again." -f $dir, $_.Exception.Message)
+    }
+    if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
+        Write-Log ("set aside earlier sync history for {0}: {1}" -f $LinkId, $aside) 'WARN'
+    }
+    return $aside
 }
 
 function Remove-Link {

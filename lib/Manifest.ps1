@@ -264,27 +264,6 @@ function Write-Manifest {
     }
 }
 
-function Move-ManifestAside {
-    <#
-        A re-added link reuses its old id and so its old state folder. Its
-        history -- the manifest and the .bak/.tmp copies that Repair-LinkManifest
-        would restore from -- belongs to the previous registration and must
-        not be read as this one's. Returns the set-aside manifest path, or $null.
-    #>
-    param([Parameter(Mandatory)][string] $Path)
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $aside = $null
-    foreach ($suffix in @('', '.bak', '.tmp')) {
-        $p = "$Path$suffix"
-        if (Test-Path -LiteralPath $p) {
-            $dest = "$Path.superseded-$stamp$suffix"
-            Move-Item -LiteralPath $p -Destination $dest -Force
-            if (-not $suffix) { $aside = $dest }
-        }
-    }
-    return $aside
-}
-
 function Test-ManifestFile {
     # True when the file exists, is not empty, and parses as JSON.
     param([Parameter(Mandatory)][string] $Path)

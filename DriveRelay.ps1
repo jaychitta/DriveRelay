@@ -191,12 +191,8 @@ function Invoke-AddCommand {
     $l = Add-Link -Local $localPath -Remote $remotePath -Seed $seedSide -Provider $Provider `
                   -SettleMinutes $actualSettle -MaxDelete $actualMaxDel `
                   -Dehydrate (-not $NoDehydrate) `
-                  -HydrateBeforeDelete $actualHydrate
+                  -HydrateBeforeDelete $actualHydrate -StateRoot $script:StateRoot
     Write-Log ("link added: {0}  {1} <-> {2}  seed={3}" -f $l.Id, $l.LocalPath, $l.RemotePath, $l.Seed)
-
-    $mf = Get-ManifestPath -LinkId $l.Id -StateRoot $script:StateRoot
-    $aside = Move-ManifestAside -Path $mf
-    if ($aside) { Write-Log ("set aside stale manifest for {0}: {1}" -f $l.Id, $aside) 'WARN' }
     "Registered '{0}'" -f $l.Id
     "  local     {0}" -f $l.LocalPath
     "  remote    {0}   ({1})" -f $l.RemotePath, (Get-ProviderLabel -Path $l.RemotePath)

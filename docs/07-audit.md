@@ -123,10 +123,14 @@ deletions and turn differences into conflicts. *Fix:* writes are flushed and swa
 `File.Replace`, keeping `.bak`; `Repair-LinkManifest` restores a seeded link from `.tmp` then
 `.bak`, or stops it with recovery guidance. Re-registration also sets the `.bak`/`.tmp` aside.
 
-**E8. Stale manifest set aside outside the registry lock — medium — open.**
-`add` and the dashboard register the link, then move the old manifest. A failed move, or a pass
-starting in between, seeds against a previous registration's history. Fix: set aside inside
-the `Add-Link` transaction, or give links a GUID-named state folder.
+**E8. Stale manifest set aside outside the registry lock — medium — fixed.**
+`add` and the dashboard registered the link, then moved the old manifest. A failed move, or a
+pass starting in between, seeded against a previous registration's history, which can propose
+deletes. *Fix:* `Add-Link -StateRoot` renames the whole `state\<id>\` folder aside inside the
+registry transaction and before the save, so a failure registers nothing. When there is history
+to move it first holds the pass lock, so a pass of the removed link that is still finishing
+cannot write the old manifest back; an add during a running pass is refused with a retry
+message. Lock order (pass, then registry) matches the pass, so they cannot deadlock.
 
 ### State and concurrency
 
@@ -218,7 +222,7 @@ two tracked `.ico` files).
 | Severity | Found | Fixed here | Partly fixed | Open |
 | --- | --- | --- | --- | --- |
 | High | 5 | 5 (E1–E5) | 0 | 0 |
-| Medium | 11 | 5 (E6, E7, U1, U2, S2) | 1 (R3) | 5 (E8, R2, U5, U6, U8) |
+| Medium | 11 | 6 (E6, E7, E8, U1, U2, S2) | 1 (R3) | 4 (R2, U5, U6, U8) |
 | Low | 15 | 4 (R1, U3, U4, S1) | 1 (D1) | 10 |
 
 The five high findings share one theme: each was a way for the engine to act on a picture of

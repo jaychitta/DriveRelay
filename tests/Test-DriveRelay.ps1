@@ -103,6 +103,31 @@ Remove-Link -Id $link.Id
 $allLinks = @(Get-LinkRegistry)
 Assert-Equal $allLinks.Count 0 "Remove-Link successfully removed link"
 
+# Re-adding a pair reuses its id; the old registration's history must be set
+# aside before the link exists, together with its recovery copies.
+$tmpState = Join-Path $testDir 'scratch_state'
+if (Test-Path $tmpState) { Remove-Item -LiteralPath $tmpState -Recurse -Force }
+$oldHistory = Join-Path $tmpState $link.Id
+New-Item -ItemType Directory -Path $oldHistory -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $oldHistory 'manifest.json') -Value '[]' -Encoding utf8
+Set-Content -LiteralPath (Join-Path $oldHistory 'manifest.json.bak') -Value '[]' -Encoding utf8
+$readded = Add-Link -Local $tmpLocal -Remote $tmpRemote -Seed 'Local' -StateRoot $tmpState
+Assert-Equal $readded.Id $link.Id "A re-added pair reuses its id"
+Assert-True (-not (Test-Path -LiteralPath $oldHistory)) "The earlier registration's history is set aside before the link is saved"
+Assert-Equal @(Get-ChildItem -LiteralPath $tmpState -Directory -Filter "$($link.Id).superseded-*").Count 1 "The set-aside history is kept, not deleted"
+Remove-Link -Id $readded.Id
+
+# If the history cannot be set aside, nothing is registered.
+New-Item -ItemType Directory -Path $oldHistory -Force | Out-Null
+$holdOpen = [IO.File]::Open((Join-Path $oldHistory 'manifest.json'), [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+try {
+    $refused = $false
+    try { $null = Add-Link -Local $tmpLocal -Remote $tmpRemote -Seed 'Local' -StateRoot $tmpState } catch { $refused = $true }
+} finally { $holdOpen.Dispose() }
+Assert-True $refused "Add-Link refuses when the earlier history cannot be set aside"
+Assert-Equal @(Get-LinkRegistry).Count 0 "A refused add registers nothing"
+if (Test-Path $tmpState) { Remove-Item -LiteralPath $tmpState -Recurse -Force }
+
 if (Test-Path $tmpLocal) { Remove-Item -LiteralPath $tmpLocal -Recurse -Force }
 if (Test-Path $tmpRemote) { Remove-Item -LiteralPath $tmpRemote -Recurse -Force }
 if (Test-Path $tmpRegistryPath) { Remove-Item -LiteralPath $tmpRegistryPath -Force }
