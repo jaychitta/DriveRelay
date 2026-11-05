@@ -116,14 +116,57 @@ function Get-LinkCount {
     } catch { return 0 }
 }
 
-function Get-LiveConflictCopyCount {
-    $count = 0
-    try {
-        foreach ($link in @(Get-LinkRegistry)) {
-            $count += @(Get-LinkConflictCopies -Link $link).Count
+# Availability and the conflict-copy count need filesystem work: a recursive
+# listing of every link, and Test-Path against drives and shares that can take
+# many seconds to time out. Done on the UI thread -- as it was on every menu
+# open -- that froze the tray. A background runspace collects them instead and
+# the menu shows the latest completed result.
+$script:Probe        = $null    # { Worker; Handle } while a probe is running
+$script:ProbeResult  = $null    # { Unavailable; Duplicates; When } once one has finished
+$script:NextProbe    = [datetime]::MinValue
+$script:ProbeSeconds = 60
+
+function Start-StatusProbe {
+    if ($script:Probe) { return }
+    $script:NextProbe = (Get-Date).AddSeconds($script:ProbeSeconds)
+    $worker = [PowerShell]::Create()
+    [void]$worker.AddScript({
+        param($Root)
+        $ErrorActionPreference = 'Stop'
+        foreach ($module in @('Provider', 'Registry', 'Availability', 'Conflicts')) {
+            . (Join-Path $Root "lib\$module.ps1")
         }
-    } catch { }
-    return $count
+        Set-RegistryPath (Join-Path $Root 'config\links.json')
+        $links = @(Get-LinkRegistry)
+        $unavailable = @()
+        try { $unavailable = @(Get-UnavailableLinks -Links $links) } catch { }
+        $duplicates = 0
+        foreach ($l in @($links | Where-Object { $_.Enabled })) {
+            try { $duplicates += @(Get-LinkConflictCopies -Link $l).Count } catch { }
+        }
+        [pscustomobject]@{ Unavailable = $unavailable; Duplicates = $duplicates; When = Get-Date }
+    }).AddArgument($root)
+    try { $script:Probe = [pscustomobject]@{ Worker = $worker; Handle = $worker.BeginInvoke() } }
+    catch { $worker.Dispose() }
+}
+
+function Receive-StatusProbe {
+    # Returns $true when a finished probe changed what the tray should show.
+    if (-not $script:Probe -or -not $script:Probe.Handle.IsCompleted) { return $false }
+    $probe = $script:Probe
+    $script:Probe = $null
+    $before = if ($script:ProbeResult) {
+        "{0}|{1}" -f $script:ProbeResult.Duplicates, (@($script:ProbeResult.Unavailable | ForEach-Object { "$($_.Id)=$($_.State)" }) -join ',')
+    } else { '' }
+    try {
+        $out = @($probe.Worker.EndInvoke($probe.Handle))
+        if ($out.Count -gt 0) { $script:ProbeResult = $out[-1] }
+    }
+    catch { }
+    finally { $probe.Worker.Dispose() }
+    if (-not $script:ProbeResult) { return $false }
+    $after = "{0}|{1}" -f $script:ProbeResult.Duplicates, (@($script:ProbeResult.Unavailable | ForEach-Object { "$($_.Id)=$($_.State)" }) -join ',')
+    return ($after -ne $before)
 }
 
 # ------------------------------------------------------------------- menu ---
@@ -185,11 +228,19 @@ $notify.ContextMenuStrip = $menu
 # ----------------------------------------------------------------- actions ---
 
 function Update-StatusLine {
-    # Checked live rather than read from the last pass summary, so an unplugged
-    # drive shows immediately -- including before the first pass of a session,
-    # when there is no summary to read at all.
+    # Never touches the filesystem beyond the small summary file: availability
+    # and duplicates come from the latest background probe, which runs every
+    # minute and when the menu opens, so an unplugged drive still shows within
+    # moments -- including before the first pass of a session.
+    Update-StatusLineCore
+    if ($script:Paused) {
+        if ($miStatus.Text -notlike 'Paused*') { $miStatus.Text = "Paused - {0}" -f $miStatus.Text }
+    }
+}
+
+function Update-StatusLineCore {
     $unavailable = @()
-    try { $unavailable = @(Get-UnavailableLinks) } catch { }
+    if ($script:ProbeResult) { $unavailable = @($script:ProbeResult.Unavailable) }
 
     if ($unavailable.Count -gt 0) {
         $miStatus.Text = if ($unavailable.Count -eq 1) { $unavailable[0].Summary }
@@ -208,7 +259,9 @@ function Update-StatusLine {
         if (-not $script:Paused) { Set-TrayState -State 'warn' -Tip ("DriveRelay - {0} deletion conflict(s) to review" -f $deletionCount) }
         return
     }
-    $duplicateCount = Get-LiveConflictCopyCount
+    $duplicateCount = if ($script:ProbeResult) { [int]$script:ProbeResult.Duplicates }
+                      elseif ($s -and $s.PSObject.Properties['ConflictCopies']) { @($s.ConflictCopies).Count }
+                      else { 0 }
     if ($duplicateCount -gt 0) {
         $miStatus.Text = "{0} conflict duplicate(s) - open Dashboard" -f $duplicateCount
         if (-not $script:Paused) { Set-TrayState -State 'warn' -Tip ("DriveRelay - {0} duplicate(s) to review" -f $duplicateCount) }
@@ -223,11 +276,18 @@ function Update-StatusLine {
 }
 
 function Start-Pass {
+    <#
+        -Manual is a person clicking "Sync now": that runs `sync`, which works
+        even while automatic syncing is paused and waits for a pass already in
+        progress. The timers run `run`, which honours the pause.
+    #>
+    param([switch] $Manual)
     if ($script:Child -and -not $script:Child.HasExited) { return }
 
+    $verb = if ($Manual) { 'sync -WaitForPass' } else { 'run' }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName        = 'powershell.exe'
-    $psi.Arguments       = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" run' -f $script:Cli)
+    $psi.Arguments       = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" {1}' -f $script:Cli, $verb)
     $psi.WindowStyle     = 'Hidden'
     $psi.CreateNoWindow  = $true
     $psi.UseShellExecute = $false
@@ -244,7 +304,46 @@ function Start-Pass {
 }
 
 function Complete-Pass {
+    $exitCode = try { [int]$script:Child.ExitCode } catch { 0 }
     $script:Child = $null
+
+    # The pause may have been changed elsewhere (the dashboard, `config`, the
+    # CLI) while the pass ran; show what is actually in force.
+    try {
+        $filePaused = [bool](Get-AppSettings).Paused
+        if ($filePaused -ne $script:Paused) { Set-PausedState -Paused $filePaused -NoSave }
+    } catch { }
+
+    if ($exitCode -ne 0) {
+        # The child died before writing a summary -- an unreadable registry,
+        # for instance. Showing the previous summary as "up to date" would hide
+        # that nothing is syncing.
+        Set-TrayState -State 'warn' -Tip 'DriveRelay - last sync failed'
+        $miStatus.Text = 'Last sync failed - see View log'
+        $stamp = "FAILED|$exitCode"
+        if ($stamp -ne $script:LastSeen) {
+            $script:LastSeen = $stamp
+            Write-Log ("tray: pass exited with code {0}; see the error logged before it" -f $exitCode) 'WARN'
+            $notify.BalloonTipTitle = 'DriveRelay - sync failed'
+            $notify.BalloonTipText  = 'The last sync did not complete. Right-click the tray icon and choose View log for the error.'
+            $notify.BalloonTipIcon  = 'Warning'
+            $notify.ShowBalloonTip(10000)
+        }
+    }
+    else {
+        Complete-PassCore
+    }
+
+    # A sync a person asked for while paused must not leave the tray looking
+    # resumed.
+    if ($script:Paused) {
+        Set-TrayState -State 'warn' -Tip 'DriveRelay - paused'
+        if ($miStatus.Text -notlike 'Paused*') { $miStatus.Text = "Paused - {0}" -f $miStatus.Text }
+    }
+    Start-StatusProbe
+}
+
+function Complete-PassCore {
     $s = Read-Summary
     if (-not $s) {
         Set-TrayState -State 'idle' -Tip 'DriveRelay'
@@ -329,7 +428,7 @@ function Complete-Pass {
     }
 }
 
-$miSync.Add_Click({ Start-Pass })
+$miSync.Add_Click({ Start-Pass -Manual })
 
 function Set-PausedState {
     <#
@@ -340,7 +439,9 @@ function Set-PausedState {
         expectation. Failing to write it must not leave the UI lying about the
         in-memory state, so the write is attempted and any failure is logged.
     #>
-    param([Parameter(Mandatory)][bool] $Paused)
+    param([Parameter(Mandatory)][bool] $Paused,
+          # Display only: the state was read from settings, not changed here.
+          [switch] $NoSave)
 
     $script:Paused = $Paused
 
@@ -354,6 +455,7 @@ function Set-PausedState {
         Set-TrayState -State 'idle' -Tip 'DriveRelay'
     }
 
+    if ($NoSave) { return }
     try   { $null = Set-AppSetting -Key 'Paused' -Value $Paused }
     catch { Write-Log ("could not persist paused={0}: {1}" -f $Paused, $_.Exception.Message) 'WARN' }
 }
@@ -393,7 +495,9 @@ $miExit.Add_Click({
 # Refresh on open, so the status line is current when someone actually looks at
 # it rather than as of the last pass.
 $menu.Add_Opening({
+    # Cached only; a fresh probe is started for the next look.
     if (-not ($script:Child -and -not $script:Child.HasExited)) { Update-StatusLine }
+    Start-StatusProbe
 })
 
 $notify.Add_MouseDoubleClick({ $miFolders.PerformClick() })
@@ -405,6 +509,9 @@ $watch = New-Object System.Windows.Forms.Timer
 $watch.Interval = 1000
 $watch.Add_Tick({
     if ($script:Child -and $script:Child.HasExited) { Complete-Pass }
+    $idle = -not ($script:Child -and -not $script:Child.HasExited)
+    if ((Receive-StatusProbe) -and $idle) { Update-StatusLine }
+    if ((Get-Date) -ge $script:NextProbe) { Start-StatusProbe }
 })
 $watch.Start()
 
@@ -427,6 +534,7 @@ $cycle.Start()
 
 Write-Log ("tray started, pass every {0} minute(s)" -f $script:CurrentInterval)
 Update-StatusLine
+Start-StatusProbe
 
 # A pause restored from settings has to be reflected in the menu and the icon,
 # or the tray would show "Pause syncing" and an idle icon while silently
@@ -449,6 +557,8 @@ try {
     [System.Windows.Forms.Application]::Run()
 }
 finally {
+    # BeginStop, not Stop: a probe stuck on an unreachable share must not hold up exit.
+    if ($script:Probe) { try { $null = $script:Probe.Worker.BeginStop($null, $null) } catch { } }
     $notify.Visible = $false
     $notify.Dispose()
     foreach ($i in @($script:IconIdle, $script:IconSync, $script:IconWarn)) {

@@ -5,7 +5,7 @@ DriveRelay relays files between a high-speed local NTFS working folder and a clo
 ## Project Structure
 
 - `DriveRelay.ps1`: Primary CLI and sync engine. Modern verb-based commands: `add`, `list`, `rm`, `pause`, `resume`, `check`, `sync`, `status`, `start`, `stop`.
-- `DriveRelayTray.ps1`: System tray agent. Runs periodic background passes, handles tray icon state, right-click menu, and balloon notifications.
+- `DriveRelayTray.ps1`: System tray agent. Runs periodic background passes (`run`; "Sync now" runs `sync`), handles tray icon state, right-click menu, and balloon notifications. Availability and duplicate counts come from a background runspace probe; the UI thread never scans folders. A child pass's non-zero exit code is shown as a failed sync.
 - `DriveRelayUI.ps1`: Modern dark-mode popup dashboard. Card-style folder link status, inline pause/resume toggles, folder adding dialog, and manual sync triggering.
 - `DriveRelay.exe`: Generated branded windowless launcher for the tray agent; the Startup shortcut targets it so Task Manager identifies the app as DriveRelay.
 - `tools/DriveRelayLauncher.cs` / `tools/New-Launcher.ps1`: Launcher source and build script, using the Windows .NET Framework compiler (no extra SDK).
@@ -38,7 +38,8 @@ DriveRelay relays files between a high-speed local NTFS working folder and a clo
   - `Provider.ps1`: Cloud provider detection and label resolution.
   - `Registry.ps1`: Link registration and persistence. `Add-Link -StateRoot` sets aside an earlier registration's `state\<id>\` (`Move-LinkStateAside`) inside the registry lock and before the save, holding the pass lock (taken first) when there is history to move; a failed set-aside registers nothing.
   - `Settle.ps1`: Settle time detection for in-flight file writes.
-  - `Settings.ps1`: Centralized configuration management (get/save/update settings).
+  - `Settings.ps1`: Centralized configuration management. `Get-AppSettings` never writes and validates each field on its own; change settings with `Update-AppSettings -Change { param($s) ... }` (read-modify-write under the `Global\DriveRelaySettings` mutex, atomic replace, unparseable file kept aside).
+  - `Startup.ps1`: The Startup-folder shortcut that starts the tray at logon (`Set-StartupShortcut`, `Test-StartupShortcut`). Used by `Install.ps1` and the dashboard's "Start with Windows" setting.
 - `config/`:
   - `settings.json`: Centralized application and timing configuration. Generated at runtime; gitignored.
   - `links.json`: Registered link pairings between local and cloud directories. Generated at runtime; gitignored (contains real user paths).

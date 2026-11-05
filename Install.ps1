@@ -31,14 +31,16 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 . (Join-Path $root 'lib\Settings.ps1')
+. (Join-Path $root 'lib\Startup.ps1')
 Set-SettingsPath (Join-Path $root 'config\settings.json')
 
-$appSettings = Get-AppSettings
-if ($PSBoundParameters.ContainsKey('IntervalMinutes')) {
-    $appSettings.IntervalMinutes = $IntervalMinutes
+# Settings are saved at the end, once the launcher and shortcuts exist, so a
+# failed install does not leave StartWithWindows claiming a shortcut that was
+# never made. Only an explicitly typed interval is written.
+$typedInterval = $PSBoundParameters.ContainsKey('IntervalMinutes')
+if ($typedInterval -and $IntervalMinutes -lt 1) {
+    throw ("-IntervalMinutes must be at least 1 (got {0}); nothing was installed." -f $IntervalMinutes)
 }
-$appSettings.StartWithWindows = (-not $NoAutoStart)
-Save-AppSettings -Settings $appSettings
 
 $appName    = 'DriveRelay'
 $assets     = Join-Path $root 'assets'
@@ -76,19 +78,8 @@ function New-Shortcut {
         [string] $Icon,
         [string] $Description
     )
-
-    $dir = Split-Path -Parent $Path
-    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-
-    $ws = New-Object -ComObject WScript.Shell
-    $sc = $ws.CreateShortcut($Path)
-    $sc.TargetPath       = $Target
-    $sc.Arguments        = $Arguments
-    $sc.WorkingDirectory = $root
-    $sc.WindowStyle      = 7
-    if ($Icon)        { $sc.IconLocation = "$Icon,0" }
-    if ($Description) { $sc.Description  = $Description }
-    $sc.Save()
+    New-DriveRelayShortcut -Path $Path -Target $Target -WorkingDirectory $root `
+                           -Arguments $Arguments -Icon $Icon -Description $Description
 }
 
 $startupDir   = [Environment]::GetFolderPath('Startup')
@@ -113,17 +104,10 @@ New-Shortcut -Path (Join-Path $startMenuDir "$appName Dashboard.lnk") `
              -Icon $iconPath -Description 'Manage synced folders'
 Write-Host ("  Start Menu: {0}" -f (Join-Path $startMenuDir "$appName Dashboard.lnk"))
 
-if (-not $NoAutoStart) {
-    New-Shortcut -Path (Join-Path $startupDir "$appName.lnk") `
-                 -Target $launcher `
-                 -Icon $iconPath -Description 'Start DriveRelay with Windows'
-    Write-Host ("  Startup:    {0}" -f (Join-Path $startupDir "$appName.lnk"))
-}
-else {
-    $startupShortcut = Join-Path $startupDir "$appName.lnk"
-    if (Test-Path -LiteralPath $startupShortcut) { Remove-Item -LiteralPath $startupShortcut -Force }
-    Write-Host '  Startup:    skipped (-NoAutoStart)'
-}
+# Same helper the dashboard's "Start with Windows" setting uses.
+$startupShortcut = Set-StartupShortcut -Enabled (-not $NoAutoStart) -Root $root
+if (-not $NoAutoStart) { Write-Host ("  Startup:    {0}" -f $startupShortcut) }
+else                   { Write-Host '  Startup:    skipped (-NoAutoStart)' }
 
 # --- 4. retire the scheduled task -----------------------------------------
 
@@ -133,6 +117,12 @@ foreach ($tname in @('DriveRelay', 'SyncOrchestrator')) {
         Unregister-ScheduledTask -TaskName $tname -Confirm:$false
         Write-Host "Removed old scheduled task ($tname) -- the tray agent runs passes now."
     }
+}
+
+$appSettings = Update-AppSettings -Change {
+    param($st)
+    if ($typedInterval) { $st.IntervalMinutes = $IntervalMinutes }
+    $st.StartWithWindows = (-not $NoAutoStart)
 }
 
 Write-Host ''

@@ -44,91 +44,139 @@ function Get-DefaultSettings {
     }
 }
 
-function Get-AppSettings {
+# Every settings change is read-modify-write, made by the CLI, the tray (pause)
+# and the dashboard. Without a lock one process's change is lost when another
+# writes the copy it read earlier.
+$script:SettingsMutexName = 'Global\DriveRelaySettings'
+
+function ConvertTo-SettingInt {
+    # Accept a whole number at or above $Min; anything else -- a string such as
+    # "ten", a fraction, a negative -- falls back to that one field's default.
+    param($Value, [int] $Default, [int] $Min = 0)
+    $n = 0
+    if ($null -ne $Value -and
+        [int]::TryParse([string]$Value, [Globalization.NumberStyles]::Integer,
+                        [Globalization.CultureInfo]::InvariantCulture, [ref]$n) -and
+        $n -ge $Min) { return $n }
+    return $Default
+}
+
+function ConvertTo-SettingDouble {
+    param($Value, [double] $Default, [double] $MinExclusive = 0)
+    $n = 0.0
+    if ($null -ne $Value -and
+        [double]::TryParse([string]$Value, [Globalization.NumberStyles]::Float,
+                           [Globalization.CultureInfo]::InvariantCulture, [ref]$n) -and
+        $n -gt $MinExclusive) { return $n }
+    return $Default
+}
+
+function ConvertTo-SettingBool {
+    # [bool]"false" is $true in PowerShell; a hand-edited "false" must not
+    # switch a safety option on, or "Paused": "false" pause syncing.
+    param($Value, [bool] $Default)
+    if ($Value -is [bool]) { return $Value }
+    if ($Value -is [string]) {
+        if ($Value.Trim() -ieq 'true')  { return $true }
+        if ($Value.Trim() -ieq 'false') { return $false }
+    }
+    return $Default
+}
+
+function Read-AppSettingsFile {
+    <#
+        Read without writing. Returns the validated settings and whether the
+        file existed but could not be parsed (so a writer can keep a copy of it
+        rather than silently replacing it). Each field is validated on its
+        own: one bad value costs that value, not the whole file.
+    #>
     $defaults = Get-DefaultSettings
+    $result = [pscustomobject]@{ Settings = $defaults; Exists = $false; Corrupt = $false }
+    if (-not (Test-Path -LiteralPath $script:SettingsPath)) { return $result }
+    $result.Exists = $true
 
-    if (-not (Test-Path -LiteralPath $script:SettingsPath)) {
-        Save-AppSettings -Settings $defaults
-        return $defaults
+    # Another process's atomic replace can briefly hold the file. Retry rather
+    # than read "not there" -- which would mean "not paused".
+    $raw = $null
+    for ($attempt = 1; $attempt -le 10; $attempt++) {
+        try {
+            $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($script:SettingsPath)
+            $raw = [IO.File]::ReadAllText($full, [Text.Encoding]::UTF8); break
+        }
+        catch {
+            if ($attempt -eq 10) { throw ("Could not read settings file {0}: {1}" -f $script:SettingsPath, $_.Exception.Message) }
+            Start-Sleep -Milliseconds 200
+        }
     }
+    if ([string]::IsNullOrWhiteSpace($raw)) { $result.Corrupt = $true; return $result }
 
+    try { $parsed = ConvertFrom-Json -InputObject $raw }
+    catch { $result.Corrupt = $true; return $result }
+    if ($null -eq $parsed -or $parsed -is [System.Array]) { $result.Corrupt = $true; return $result }
+
+    $get = { param($name) if ($parsed.PSObject.Properties[$name]) { $parsed.$name } else { $null } }
+
+    # An unrecognised level falls back to the default rather than being
+    # passed through: a typo must not silently switch the log off.
+    $level = ([string](& $get 'LogLevel')).Trim().ToUpperInvariant()
+    if (@('DEBUG', 'INFO', 'WARN', 'ERROR') -notcontains $level) { $level = $defaults.LogLevel }
+
+    $result.Settings = [pscustomobject]@{
+        IntervalMinutes     = ConvertTo-SettingInt    (& $get 'IntervalMinutes')     $defaults.IntervalMinutes 1
+        SettleMinutes       = ConvertTo-SettingInt    (& $get 'SettleMinutes')       $defaults.SettleMinutes 0
+        MaxDelete           = ConvertTo-SettingInt    (& $get 'MaxDelete')           $defaults.MaxDelete 0
+        HydrateBeforeDelete = ConvertTo-SettingBool   (& $get 'HydrateBeforeDelete') $defaults.HydrateBeforeDelete
+        StartWithWindows    = ConvertTo-SettingBool   (& $get 'StartWithWindows')    $defaults.StartWithWindows
+        StartDelaySeconds   = ConvertTo-SettingInt    (& $get 'StartDelaySeconds')   $defaults.StartDelaySeconds 0
+        LogLevel            = $level
+        LogMaxSizeMB        = ConvertTo-SettingDouble (& $get 'LogMaxSizeMB')        $defaults.LogMaxSizeMB 0
+        LogKeepFiles        = ConvertTo-SettingInt    (& $get 'LogKeepFiles')        $defaults.LogKeepFiles 0
+        # 0 disables the age cap (Keep is then the only limit).
+        LogMaxAgeDays       = ConvertTo-SettingInt    (& $get 'LogMaxAgeDays')       $defaults.LogMaxAgeDays 0
+        # Absent in files written before pausing was persisted: "not paused".
+        Paused              = ConvertTo-SettingBool   (& $get 'Paused')              $defaults.Paused
+    }
+    return $result
+}
+
+function Get-AppSettings {
+    <#
+        The current settings, validated field by field. Never writes: a missing
+        or unreadable file reads as defaults and is left as it is.
+    #>
+    return (Read-AppSettingsFile).Settings
+}
+
+function Invoke-SettingsTransaction {
+    # Run $Body holding the settings lock. Re-entrant for the owning thread.
+    param([Parameter(Mandatory)][scriptblock] $Body, [int] $TimeoutMs = 5000)
+    $mutex = New-Object System.Threading.Mutex($false, $script:SettingsMutexName)
+    $held = $false
     try {
-        $raw = Get-Content -LiteralPath $script:SettingsPath -Raw -Encoding UTF8
-        if ([string]::IsNullOrWhiteSpace($raw)) {
-            Save-AppSettings -Settings $defaults
-            return $defaults
-        }
-
-        $parsed = ConvertFrom-Json -InputObject $raw
-
-        # Ensure all required properties are present with fallbacks.
-        $intervalMinutes = if ($parsed.PSObject.Properties['IntervalMinutes'] -and $parsed.IntervalMinutes -gt 0) {
-            [int]$parsed.IntervalMinutes
-        } else { $defaults.IntervalMinutes }
-
-        $settleMinutes = if ($parsed.PSObject.Properties['SettleMinutes'] -and $parsed.SettleMinutes -ge 0) {
-            [int]$parsed.SettleMinutes
-        } else { $defaults.SettleMinutes }
-
-        $maxDelete = if ($parsed.PSObject.Properties['MaxDelete'] -and $parsed.MaxDelete -ge 0) {
-            [int]$parsed.MaxDelete
-        } else { $defaults.MaxDelete }
-
-        $hydrateBeforeDelete = if ($parsed.PSObject.Properties['HydrateBeforeDelete'] -ne $null) {
-            [bool]$parsed.HydrateBeforeDelete
-        } else { $defaults.HydrateBeforeDelete }
-
-        $startWithWindows = if ($parsed.PSObject.Properties['StartWithWindows'] -ne $null) {
-            [bool]$parsed.StartWithWindows
-        } else { $defaults.StartWithWindows }
-
-        $startDelaySeconds = if ($parsed.PSObject.Properties['StartDelaySeconds'] -and $parsed.StartDelaySeconds -ge 0) {
-            [int]$parsed.StartDelaySeconds
-        } else { $defaults.StartDelaySeconds }
-
-        # An unrecognised level falls back to the default rather than being
-        # passed through: a typo must not silently switch the log off.
-        $logLevel = if ($parsed.PSObject.Properties['LogLevel'] -and
-                        @('DEBUG', 'INFO', 'WARN', 'ERROR') -contains ([string]$parsed.LogLevel).Trim().ToUpperInvariant()) {
-            ([string]$parsed.LogLevel).Trim().ToUpperInvariant()
-        } else { $defaults.LogLevel }
-
-        $logMaxSizeMB = if ($parsed.PSObject.Properties['LogMaxSizeMB'] -and $parsed.LogMaxSizeMB -gt 0) {
-            [double]$parsed.LogMaxSizeMB
-        } else { $defaults.LogMaxSizeMB }
-
-        $logKeepFiles = if ($parsed.PSObject.Properties['LogKeepFiles'] -and $parsed.LogKeepFiles -ge 0) {
-            [int]$parsed.LogKeepFiles
-        } else { $defaults.LogKeepFiles }
-
-        # 0 disables the age cap (Keep is then the only limit); anything else
-        # negative or absent falls back to the default rather than being kept.
-        $logMaxAgeDays = if ($parsed.PSObject.Properties['LogMaxAgeDays'] -and $parsed.LogMaxAgeDays -ge 0) {
-            [int]$parsed.LogMaxAgeDays
-        } else { $defaults.LogMaxAgeDays }
-
-        # Absent in settings files written before pausing was persisted, which
-        # must read as "not paused" rather than as missing.
-        $paused = if ($null -ne $parsed.PSObject.Properties['Paused']) {
-            [bool]$parsed.Paused
-        } else { $defaults.Paused }
-
-        return [pscustomobject]@{
-            IntervalMinutes     = $intervalMinutes
-            SettleMinutes       = $settleMinutes
-            MaxDelete           = $maxDelete
-            HydrateBeforeDelete = $hydrateBeforeDelete
-            StartWithWindows    = $startWithWindows
-            StartDelaySeconds   = $startDelaySeconds
-            LogLevel            = $logLevel
-            LogMaxSizeMB        = $logMaxSizeMB
-            LogKeepFiles        = $logKeepFiles
-            LogMaxAgeDays       = $logMaxAgeDays
-            Paused              = $paused
-        }
+        try   { $held = $mutex.WaitOne($TimeoutMs) }
+        catch [System.Threading.AbandonedMutexException] { $held = $true }
+        if (-not $held) { throw 'Timed out waiting for the settings lock; nothing was changed.' }
+        return (& $Body)
     }
-    catch {
-        return $defaults
+    finally {
+        if ($held) { try { $mutex.ReleaseMutex() } catch { } }
+        $mutex.Dispose()
+    }
+}
+
+function Update-AppSettings {
+    <#
+        The way to change settings: read the current file, apply $Change to it,
+        and save, all under the settings lock. $Change receives the settings
+        object and edits it in place. Returns the saved settings.
+    #>
+    param([Parameter(Mandatory)][scriptblock] $Change)
+    return Invoke-SettingsTransaction {
+        $current = Read-AppSettingsFile
+        $settings = $current.Settings
+        $null = & $Change $settings
+        Save-AppSettings -Settings $settings -Replacing:$current.Corrupt
+        $settings
     }
 }
 
@@ -150,17 +198,38 @@ function Initialize-LoggingFromSettings {
 }
 
 function Save-AppSettings {
-    param([Parameter(Mandatory)][object] $Settings)
+    <#
+        Write the whole settings object, atomically, under the settings lock.
+        Prefer Update-AppSettings for changes: this replaces every field.
+        -Replacing keeps a copy of an unparseable file before overwriting it.
+    #>
+    param([Parameter(Mandatory)][object] $Settings,
+          [switch] $Replacing)
 
-    $dir = Split-Path -Parent $script:SettingsPath
-    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
-        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $null = Invoke-SettingsTransaction {
+        $dir = Split-Path -Parent $script:SettingsPath
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($script:SettingsPath)
+
+        if ($Replacing -and [IO.File]::Exists($full)) {
+            $kept = "{0}.unreadable-{1}" -f $full, (Get-Date -Format 'yyyyMMdd-HHmmss')
+            [IO.File]::Copy($full, $kept, $true)
+            if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
+                Write-Log ("settings file could not be parsed; kept a copy as {0}" -f $kept) 'WARN'
+            }
+        }
+
+        $json = ConvertTo-Json -InputObject $Settings -Depth 4
+        # A per-writer temp name: two writers never share one half-written file.
+        $tmp = "{0}.{1}.tmp" -f $full, [guid]::NewGuid().ToString('N')
+        [IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding -ArgumentList $true))
+        # Replace is atomic: a reader never sees the file missing, which would
+        # read as defaults -- including "not paused".
+        if ([IO.File]::Exists($full)) { [IO.File]::Replace($tmp, $full, $null) }
+        else                          { [IO.File]::Move($tmp, $full) }
     }
-
-    $json = ConvertTo-Json -InputObject $Settings -Depth 4
-    $tmp = "$script:SettingsPath.tmp"
-    Set-Content -LiteralPath $tmp -Value $json -Encoding UTF8
-    Move-Item -LiteralPath $tmp -Destination $script:SettingsPath -Force
 }
 
 function Set-AppSetting {
@@ -169,13 +238,9 @@ function Set-AppSetting {
         [Parameter(Mandatory)]$Value
     )
 
-    $current = Get-AppSettings
-    if ($current.PSObject.Properties[$Key]) {
-        $current.$Key = $Value
-    }
-    else {
-        $current | Add-Member -NotePropertyName $Key -NotePropertyValue $Value
-    }
-    Save-AppSettings -Settings $current
-    return $current
+    return Update-AppSettings -Change {
+        param($s)
+        if ($s.PSObject.Properties[$Key]) { $s.$Key = $Value }
+        else { $s | Add-Member -NotePropertyName $Key -NotePropertyValue $Value }
+    }.GetNewClosure()
 }

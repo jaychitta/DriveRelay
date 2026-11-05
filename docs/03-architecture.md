@@ -230,6 +230,8 @@ lib\Settle.ps1      lock and quiescence tests
 lib\Hydration.ps1   placeholder control
 lib\Actions.ps1     copy, delete, conflict fork, seed, the pass itself
 lib\Pass.ps1        single-instance pass runner shared by CLI, tray and scheduler
+lib\Settings.ps1    settings.json: per-field validation, locked Update-AppSettings
+lib\Startup.ps1     the Startup shortcut, shared by Install.ps1 and the dashboard
 tools\New-Icons.ps1 writes the .ico files
 tools\New-Launcher.ps1 builds DriveRelay.exe from DriveRelayLauncher.cs
 ```

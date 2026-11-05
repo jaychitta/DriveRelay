@@ -137,11 +137,14 @@ message. Lock order (pass, then registry) matches the pass, so they cannot deadl
 **R1. Provider auto-detection listed the whole tree — low — fixed.** A `foreach` over a
 parenthesised `Get-ChildItem` collects everything before the 200-item `break`.
 
-**R2. `settings.json` has no lock and resets on one bad value — medium — open.** A
-non-numeric value passes the `-gt 0` check as a string, the cast throws, and the whole file
-reads as defaults (including `Paused = false`), which the next tray toggle saves. The read
-function also writes defaults when the file is missing, through a shared temp name. Fix:
-per-field `TryParse`, a settings mutex, no writes from the reader.
+**R2. `settings.json` has no lock and resets on one bad value — medium — fixed.** A
+non-numeric value passed the `-gt 0` check as a string, the cast threw, and the whole file
+read as defaults (including `Paused = false`), which the next tray toggle saved; `[bool]"false"`
+read as true; the reader wrote defaults when the file was missing, through a shared temp name.
+*Fix:* each field is validated on its own (`TryParse`, explicit `true`/`false`); the reader never
+writes and retries a briefly locked file instead of reading "not paused"; changes go through
+`Update-AppSettings` under a `Global\DriveRelaySettings` mutex; writes use a per-writer temp
+file and an atomic `File.Replace`; an unparseable file is copied aside before being replaced.
 
 **R3. Manifest write collides with the dashboard's reads — medium — partly fixed.** The
 replace now retries; a reader could still hold the file through all retries.
@@ -174,18 +177,27 @@ dropping log level and retention and reverting a pause made from the tray meanwh
 
 **U4. Dashboard scan failed for every link without `excludes.txt` — low — fixed.**
 
-**U5. Tray status misreports — medium — open.** "Sync now" and "Sync all now" run the silent
-`run` verb, which does nothing while paused, yet the tray then shows "up to date"; a failed
-pass (non-zero exit, no new summary) also shows as up to date.
+**U5. Tray status misreports — medium — fixed.** "Sync now" and "Sync all now" ran the silent
+`run` verb, which does nothing while paused, yet the tray then showed "up to date"; a failed
+pass (non-zero exit, no new summary) also showed as up to date. *Fix:* both buttons run
+`sync -WaitForPass` (an explicit sync, which works while paused); the tray and dashboard check
+the child's exit code and show "last sync failed" with a once-per-state balloon; the CLI logs
+any unhandled error before exiting non-zero; the tray re-reads the pause from settings after
+each pass and keeps the paused icon and status.
 
-**U6. Tray menu scans folders on the UI thread — medium — open.** Opening the menu runs a
-recursive conflict-copy scan of every link.
+**U6. Tray menu scans folders on the UI thread — medium — fixed.** Opening the menu ran a
+recursive conflict-copy scan of every link and live availability checks. *Fix:* a background
+runspace probe (availability and duplicate count) runs at start, every minute, after each pass
+and on menu open; the menu shows the latest completed result and never waits for it.
 
-**U7. Unhandled errors in some dashboard handlers — low — open.** Edit, pause, remove and
-start-CLI handlers lack `try/catch`; a failure can leave buttons disabled.
+**U7. Unhandled errors in some dashboard handlers — low — partly fixed.** "Sync all now" now
+re-enables its buttons if the sync cannot start. Edit, pause and remove handlers still lack
+`try/catch`.
 
-**U8. `StartWithWindows` has no effect — medium — open.** Only the installer creates or
-removes the Startup shortcut; the setting is stored and displayed only.
+**U8. `StartWithWindows` has no effect — medium — fixed.** Only the installer created or
+removed the Startup shortcut. *Fix:* `lib/Startup.ps1` holds the shortcut logic for both the
+installer and the dashboard; the dashboard's checkbox shows whether the shortcut exists, applies
+the change, and saves the setting only after the shortcut matches it.
 
 ### Setup and uninstall
 
@@ -198,10 +210,11 @@ removed `DriveRelayTray.vbs` and stopped only the tray. (Waiting for an in-fligh
 
 **S3. Partial-extraction guard checks two files — low — open.**
 
-**S6. Install echoes an invalid interval — low — open.** `-IntervalMinutes 0` is saved and
-reported, but reads back as 10.
+**S6. Install echoes an invalid interval — low — fixed.** `-IntervalMinutes 0` was saved and
+reported, but read back as 10. Install now refuses an interval below 1.
 
-**S7. Install saves settings before steps that can fail — low — open.**
+**S7. Install saves settings before steps that can fail — low — fixed.** Settings are now
+saved after the launcher and shortcuts exist, through `Update-AppSettings`.
 
 **S9. `start` re-creates the scheduled task alongside the tray — low — open.** Safe because of
 the mutex, but redundant.
@@ -222,8 +235,8 @@ two tracked `.ico` files).
 | Severity | Found | Fixed here | Partly fixed | Open |
 | --- | --- | --- | --- | --- |
 | High | 5 | 5 (E1–E5) | 0 | 0 |
-| Medium | 11 | 6 (E6, E7, E8, U1, U2, S2) | 1 (R3) | 4 (R2, U5, U6, U8) |
-| Low | 15 | 4 (R1, U3, U4, S1) | 1 (D1) | 10 |
+| Medium | 11 | 10 (E6, E7, E8, R2, U1, U2, U5, U6, U8, S2) | 1 (R3) | 0 |
+| Low | 15 | 6 (R1, U3, U4, S1, S6, S7) | 2 (U7, D1) | 7 (R4, R5, R8, R9, R11, S3, S9) |
 
 The five high findings share one theme: each was a way for the engine to act on a picture of
 the folders that was incomplete (E1), stale (E2, E3), or overstated in what it promised (E4,
@@ -238,3 +251,8 @@ anything it replaces or removes.
    large tree is not materially slower.
 3. Confirm `Test-RecycleBinVolume` on a mapped network drive, a UNC remote and a USB stick (E5).
 4. Open the log viewer from the tray and dashboard (U2).
+5. Tray: "Sync now" while paused syncs and stays paused; a pass that fails (for example with
+   `config\links.json` made unreadable) shows "last sync failed"; the menu opens instantly with
+   an unreachable network remote (U5, U6).
+6. Dashboard Settings: toggling "Start with Windows" creates and removes
+   `Startup\DriveRelay.lnk` (U8).

@@ -74,6 +74,33 @@ $null = Set-AppSetting -Key 'SettleMinutes' -Value 7
 $reloaded2 = Get-AppSettings
 Assert-Equal $reloaded2.SettleMinutes 7 "Set-AppSetting updated SettleMinutes to 7"
 
+# One bad value costs that value only; strings are not truthy booleans.
+Set-Content -LiteralPath $tmpSettingsPath -Encoding utf8 -Value '{ "IntervalMinutes": "ten", "SettleMinutes": 4, "MaxDelete": -5, "Paused": "false", "HydrateBeforeDelete": "false", "LogLevel": "debug", "LogMaxAgeDays": 0 }'
+$mixed = Get-AppSettings
+Assert-Equal $mixed.IntervalMinutes 10 "A non-numeric interval falls back to its own default"
+Assert-Equal $mixed.SettleMinutes 4 "Valid values next to a bad one are kept"
+Assert-Equal $mixed.MaxDelete 50 "A negative MaxDelete falls back to the default"
+Assert-Equal $mixed.Paused $false "The string 'false' does not read as paused"
+Assert-Equal $mixed.HydrateBeforeDelete $false "The string 'false' reads as false"
+Assert-Equal $mixed.LogLevel 'DEBUG' "Log level is case-insensitive"
+Assert-Equal $mixed.LogMaxAgeDays 0 "LogMaxAgeDays 0 (age cap off) is kept"
+
+# Reading never writes; changing keeps everything the change did not touch.
+Remove-Item -LiteralPath $tmpSettingsPath -Force
+$null = Get-AppSettings
+Assert-True (-not (Test-Path -LiteralPath $tmpSettingsPath)) "Reading settings does not create the file"
+$null = Update-AppSettings -Change { param($st) $st.LogLevel = 'DEBUG'; $st.Paused = $true }
+$null = Update-AppSettings -Change { param($st) $st.IntervalMinutes = 20 }
+$kept = Get-AppSettings
+Assert-True ($kept.LogLevel -eq 'DEBUG' -and $kept.Paused -and $kept.IntervalMinutes -eq 20) "Update-AppSettings changes only what it is given"
+
+# An unparseable file is kept aside, not silently replaced.
+Set-Content -LiteralPath $tmpSettingsPath -Encoding utf8 -Value '{ not json'
+$null = Set-AppSetting -Key 'Paused' -Value $true
+$aside = @(Get-ChildItem -LiteralPath $testDir -Filter 'test-settings.json.unreadable-*')
+Assert-Equal $aside.Count 1 "A settings file that could not be parsed is kept before being replaced"
+$aside | Remove-Item -Force
+
 if (Test-Path $tmpSettingsPath) { Remove-Item -LiteralPath $tmpSettingsPath -Force }
 
 # ------------------------------------------------------------- 2. Registry ---

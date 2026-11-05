@@ -13,7 +13,7 @@ means the inventory could not be read; its tooltip gives the error.
 | Menu item | What it does |
 |---|---|
 | *(top line)* | Current state — up to date, syncing, or needs attention |
-| Sync now | Runs a pass immediately |
+| Sync now | Runs a pass immediately, even while automatic syncing is paused (the pause stays on) |
 | Pause syncing | Stops automatic passes until resumed |
 | Open Dashboard... | Opens the manager window |
 | View Log | Opens `driverelay.log` |

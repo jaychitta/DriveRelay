@@ -198,7 +198,7 @@ the shapes.
 | `SettleMinutes` | 3 | How long a file must be quiet before it is eligible |
 | `MaxDelete` | 50 | Deletions in one pass above which the pass aborts entirely |
 | `HydrateBeforeDelete` | true | Download placeholders before deleting, so the Recycle Bin holds real content |
-| `StartWithWindows` | true | Start the tray agent at logon |
+| `StartWithWindows` | true | Start the tray agent at logon; the dashboard's setting creates or removes the Startup shortcut |
 | `StartDelaySeconds` | 90 | Wait after logon before the first pass, so cloud clients can mount |
 
 `config/excludes.txt` holds wildcard patterns matched against file names —
@@ -238,7 +238,8 @@ Install.ps1           The install itself (shortcuts, launcher, startup entry)
 Uninstall.ps1         Reverses it
 lib/                  Actions, Availability, Conflicts, DashboardScan,
                       FileIdentity, Hydration, Icons, Logging, LogViewer,
-                      Manifest, Pass, Provider, Registry, Settings, Settle
+                      Manifest, Pass, Provider, Registry, Settings, Settle,
+                      Startup
 config/               settings, links, exclude patterns
 docs/                 rationale, architecture, operations, runbook, audit
 tests/                regression suite

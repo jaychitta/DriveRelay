@@ -461,6 +461,7 @@ function Invoke-StopCommand {
 function Invoke-SettingsCommand {
     $current = Get-AppSettings
     $changed = $false
+    # Collected here, applied below under the settings lock (Update-AppSettings).
 
     if ($script:Typed.ContainsKey('IntervalMinutes')) {
         $current.IntervalMinutes = [int]$IntervalMinutes
@@ -496,7 +497,14 @@ function Invoke-SettingsCommand {
     }
 
     if ($changed) {
-        Save-AppSettings -Settings $current
+        $edited = $current
+        $current = Update-AppSettings -Change {
+            param($st)
+            foreach ($name in @('IntervalMinutes','SettleMinutes','MaxDelete','HydrateBeforeDelete',
+                                'LogLevel','LogMaxSizeMB','LogKeepFiles','LogMaxAgeDays')) {
+                if ($script:Typed.ContainsKey($name)) { $st.$name = $edited.$name }
+            }
+        }
         Write-Log ("settings updated via CLI: Interval={0}m Settle={1}m MaxDelete={2}" -f $current.IntervalMinutes, $current.SettleMinutes, $current.MaxDelete)
         "Updated global settings."
         ''
@@ -588,6 +596,9 @@ function Invoke-StatusCommand {
 
 # ----------------------------------------------------------- command router ---
 
+# An error nothing else handled is logged before the process exits non-zero,
+# so a pass the tray started in the background is never a silent failure.
+try {
 switch ($Command) {
     'add'                 { Invoke-AddCommand }
     'list'                { Invoke-ListCommand }
@@ -602,4 +613,9 @@ switch ($Command) {
     'stop'                { Invoke-StopCommand }
     { $_ -in 'config','settings' } { Invoke-SettingsCommand }
     default               { Show-Help }
+}
+}
+catch {
+    try { Write-Log ("command '{0}' failed: {1}" -f $Command, $_.Exception.Message) 'ERROR' } catch { }
+    throw
 }

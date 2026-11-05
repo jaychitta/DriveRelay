@@ -30,6 +30,7 @@ Add-Type -AssemblyName System.Drawing
 . (Join-Path $root 'lib\Icons.ps1')
 . (Join-Path $root 'lib\Registry.ps1')
 . (Join-Path $root 'lib\Settings.ps1')
+. (Join-Path $root 'lib\Startup.ps1')
 . (Join-Path $root 'lib\DashboardScan.ps1')
 
 Set-LogPath      (Join-Path $root 'driverelay.log')
@@ -484,7 +485,9 @@ function Show-SettingsDialog {
     $cbStartup.Text = 'Start DriveRelay background agent when Windows starts'
     $cbStartup.ForeColor = $script:TextPrimary; $cbStartup.BackColor = [System.Drawing.Color]::Transparent
     $cbStartup.Location = New-Object System.Drawing.Point -ArgumentList 24, 292; $cbStartup.Size = New-Object System.Drawing.Size -ArgumentList 480, 22
-    $cbStartup.Checked = [bool]$current.StartWithWindows
+    # Shows whether the Startup shortcut actually exists -- that, not the
+    # stored flag, decides what happens at the next logon.
+    $cbStartup.Checked = Test-StartupShortcut
     $f.Controls.Add($cbStartup)
 
     # Apply-to-all, opt in.
@@ -515,16 +518,38 @@ function Show-SettingsDialog {
     $f.CancelButton = $cancel
 
     $ok.Add_Click({
-        # Start from what is saved now, not a hand-built object: anything this
-        # dialog does not show (log level and retention, the start delay, a
-        # pause set from the tray while the dialog was open) must survive.
-        $newSettings = Get-AppSettings
-        $newSettings.IntervalMinutes     = [int]$numInterval.Value
-        $newSettings.SettleMinutes       = [int]$numSettle.Value
-        $newSettings.MaxDelete           = [int]$numMaxDelete.Value
-        $newSettings.HydrateBeforeDelete = [bool]$cbSafe.Checked
-        $newSettings.StartWithWindows    = [bool]$cbStartup.Checked
-        Save-AppSettings -Settings $newSettings
+        # Make the startup change first: the setting is saved only once the
+        # shortcut really matches it, so the two cannot disagree.
+        $startup = [bool]$cbStartup.Checked
+        if ($startup -ne (Test-StartupShortcut)) {
+            try { $null = Set-StartupShortcut -Enabled $startup -Root $root }
+            catch {
+                [System.Windows.Forms.MessageBox]::Show($f, ("Could not change Start with Windows: {0}" -f $_.Exception.Message),
+                    'DriveRelay', 'OK', 'Warning') | Out-Null
+                $startup = Test-StartupShortcut
+                $cbStartup.Checked = $startup
+                return
+            }
+        }
+
+        # Change only what this dialog shows, under the settings lock: the log
+        # level and retention, the start delay and a pause set from the tray
+        # while the dialog was open all survive.
+        try {
+            $newSettings = Update-AppSettings -Change {
+                param($st)
+                $st.IntervalMinutes     = [int]$numInterval.Value
+                $st.SettleMinutes       = [int]$numSettle.Value
+                $st.MaxDelete           = [int]$numMaxDelete.Value
+                $st.HydrateBeforeDelete = [bool]$cbSafe.Checked
+                $st.StartWithWindows    = $startup
+            }
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show($f, ("Could not save settings: {0}" -f $_.Exception.Message),
+                'DriveRelay', 'OK', 'Warning') | Out-Null
+            return
+        }
 
         # Only on request -- see the note by the checkbox.
         $applied = 0
@@ -1188,10 +1213,16 @@ $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 1000
 $timer.Add_Tick({
     if ($script:Child -and $script:Child.HasExited) {
+        $exitCode = try { $script:Child.ExitCode } catch { 0 }
         $script:Child = $null
         $btnSync.Enabled = $true; $btnAdd.Enabled = $true
         $timer.Stop()
         Update-Cards
+        # A sync that died (for example on an unreadable registry) writes no
+        # summary; without this the cards would simply show the last good one.
+        if ($exitCode -ne 0) {
+            $statusLabel.Text = ("The sync did not complete (exit code {0}). See View log for the error." -f $exitCode)
+        }
     }
 })
 
@@ -1243,7 +1274,15 @@ $btnSync.Add_Click({
     $statusLabel.Text = 'Syncing...'
     # Wait for an existing scheduled or tray pass so an explicit dashboard
     # retry is not discarded merely because it arrived while one was finishing.
-    $script:Child = Start-Cli -CliArgs @('run', '-WaitForPass')
+    # `sync`, not `run`: a person asking for a sync gets one even while
+    # automatic syncing is paused (`run` is the unattended, pause-honouring verb).
+    try { $script:Child = Start-Cli -CliArgs @('sync', '-WaitForPass') }
+    catch {
+        $script:Child = $null
+        $btnSync.Enabled = $true; $btnAdd.Enabled = $true
+        $statusLabel.Text = ("Could not start a sync: {0}" -f $_.Exception.Message)
+        return
+    }
     $timer.Start()
 })
 

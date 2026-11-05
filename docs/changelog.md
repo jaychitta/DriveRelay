@@ -2,6 +2,33 @@
 
 All notable changes to DriveRelay (formerly SyncOrchestrator) will be documented in this file.
 
+## [Audit] - 2026-11-05 — remaining medium findings (R2, U5, U6, U8)
+
+- R2 settings: `Get-AppSettings` no longer writes, validates each field on
+  its own (`"ten"` costs only that value; `"false"` is false), and retries a
+  briefly locked file. Changes go through `Update-AppSettings` under a
+  `Global\DriveRelaySettings` mutex, with a per-writer temp file and atomic
+  `File.Replace`; an unparseable file is copied aside before replacement. The
+  CLI `config`, dashboard Settings, tray pause and Install all use it.
+- U5 tray/dashboard status: "Sync now" and "Sync all now" run
+  `sync -WaitForPass`, so an explicit sync works while paused; a non-zero exit
+  shows "last sync failed" (balloon once per state); the CLI logs unhandled
+  errors before exiting non-zero; the tray re-reads the pause after each pass
+  and keeps the paused icon. "Sync all now" re-enables its buttons if the sync
+  cannot start.
+- U6 tray responsiveness: availability and duplicate counts come from a
+  background runspace probe (start, every minute, after each pass, on menu
+  open). The menu shows the latest result and never scans on the UI thread.
+- U8 Start with Windows: new `lib/Startup.ps1` holds the Startup shortcut
+  logic for Install and the dashboard. The checkbox shows whether the shortcut
+  exists, applies the change, and saves the setting only once it matches.
+- Install: refuses `-IntervalMinutes` below 1 and saves settings only after
+  the launcher and shortcuts exist (S6, S7).
+- Tests: settings per-field validation, read-without-write, partial updates
+  and unparseable-file preservation. Tray, dashboard and shortcut behaviour
+  have no automated coverage; see the Windows checks in 07-audit.md. Not run
+  (no PowerShell in the sandbox).
+
 ## [Audit] - 2026-11-05 — E8: re-added links and earlier history
 
 - `Add-Link -StateRoot` now sets aside an earlier registration's `state\<id>\`
