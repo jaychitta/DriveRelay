@@ -1,0 +1,912 @@
+<#
+    Actions.ps1  --  the part that writes.
+
+    Everything here is reachable only through Invoke-LinkSync, and every step
+    honours -WhatIf. The rules that keep this safe:
+
+      * Copies land atomically. Content goes to a .tmp name that the snapshot
+        excludes, then moves into place, so a half-copied file is never visible
+        as a complete one.
+
+      * Deletes are never permanent, but the recovery path differs by side and
+        this was measured, not assumed:
+
+          - An ordinary file with content on disk goes to the Recycle Bin.
+          - A dehydrated placeholder cannot go to the Recycle Bin -- there is
+            no local content to put there. Deleting it propagates to the
+            service, where it lands in OneDrive's own online recycle bin.
+
+        Set HydrateBeforeDelete on a link to pull content down first so the
+        Recycle Bin holds a real copy. It costs a download per deleted file,
+        which is why it is not the default.
+
+      * A pass proposing more deletions than the link's MaxDelete aborts
+        entirely rather than partially applying.
+
+      * A folder the pass empties is removed with its files. The snapshot is
+        files-only, so nothing else would ever clean it up. Scoped to folders
+        this pass emptied -- an empty folder the user made by hand is left
+        alone, and the link root is never removed.
+
+      * Manifest entries are written only for paths whose action actually
+        succeeded. A deferred or failed file keeps its previous entry, so the
+        next pass re-evaluates it from the same baseline rather than mistaking
+        the divergence for a fresh conflict.
+
+      * Dehydration is requested, then confirmed by the Offline attribute
+        appearing. A file is never assumed uploaded.
+#>
+
+Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction SilentlyContinue
+$script:DefaultStateRoot = if ($PSScriptRoot) { Join-Path (Split-Path -Parent $PSScriptRoot) 'state' } else { 'state' }
+
+function Copy-FileAtomic {
+    <#
+        Copy preserving the last-write time, via a temp name so the destination
+        never briefly exists as a truncated file. The temp suffix matches an
+        excluded pattern, so a crash mid-copy leaves something the next
+        snapshot ignores.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][string] $Source,
+        [Parameter(Mandatory)][string] $Destination,
+        [switch] $CheckDestination,
+        [object] $ExpectedDestination,
+        [string] $ExpectedParent
+    )
+
+    if (-not $PSCmdlet.ShouldProcess($Destination, "copy from $Source")) { return $false }
+
+    if ($CheckDestination -and -not (Test-CopyDestinationState -Path $Destination -Expected $ExpectedDestination -ExpectedParent $ExpectedParent)) {
+        Write-Log ("copy deferred; destination changed or was deleted since planning: {0}" -f $Destination) 'WARN'
+        return $false
+    }
+
+    $dir = Split-Path -Parent $Destination
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        if ($CheckDestination -and -not (Test-CopyDestinationState -Path $Destination -Expected $ExpectedDestination -ExpectedParent $ExpectedParent)) {
+            Write-Log ("copy deferred; destination folder was deleted: {0}" -f $Destination) 'WARN'
+            return $false
+        }
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+
+    $tmp = "$Destination.driverelay.tmp"
+    try {
+        Copy-Item -LiteralPath $Source -Destination $tmp -Force
+        $src = Get-Item -LiteralPath $Source -Force
+        # Hydration and copying can take minutes. Check again before replacing
+        # the destination, not just when this action was initially planned.
+        if ($CheckDestination -and -not (Test-CopyDestinationState -Path $Destination -Expected $ExpectedDestination -ExpectedParent $ExpectedParent)) {
+            Remove-Item -LiteralPath $tmp -Force
+            Write-Log ("copy deferred; destination changed or was deleted while copying: {0}" -f $Destination) 'WARN'
+            return $false
+        }
+        Move-Item -LiteralPath $tmp -Destination $Destination -Force
+
+        # Keep the timestamps equal so the next pass sees the pair as in sync.
+        $dst = Get-Item -LiteralPath $Destination -Force
+        $dst.LastWriteTimeUtc = $src.LastWriteTimeUtc
+
+        if ($dst.Length -ne $src.Length) {
+            throw ("size mismatch after copy: {0} vs {1}" -f $src.Length, $dst.Length)
+        }
+        return $true
+    }
+    catch {
+        if (Test-Path -LiteralPath $tmp) {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        }
+        throw
+    }
+}
+
+function Test-CopyDestinationState {
+    param([string] $Path, [object] $Expected, [string] $ExpectedParent)
+    if ($ExpectedParent -and -not (Test-Path -LiteralPath $ExpectedParent -PathType Container)) { return $false }
+    $current = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $Expected) { return (-not $current) }
+    if (-not $current -or $current.PSIsContainer) { return $false }
+    return (Test-SameFileState $current.Length $current.LastWriteTimeUtc $Expected.Length $Expected.WriteUtc)
+}
+
+function Test-DeleteStillValid {
+    <#
+        A delete was planned at the start of the pass; copies, hydrations and
+        moves can run for a long time before it is applied (actions run in name
+        order, so every delete comes after every copy). Re-check both halves of
+        the proof just before deleting: the file being deleted is still exactly
+        the version that was planned, and its counterpart is still absent. A
+        restored counterpart or a fresh edit defers the delete to a later pass,
+        which then classifies it from scratch.
+    #>
+    param([Parameter(Mandatory)][object] $Target,
+          [Parameter(Mandatory)][string] $CounterpartPath)
+    if (-not $Target -or -not $Target.FullPath) { return $false }
+    if (Test-Path -LiteralPath $CounterpartPath) { return $false }
+    return (Test-CopyDestinationState -Path $Target.FullPath -Expected $Target)
+}
+
+function Get-CommittedEntry {
+    <#
+        The manifest entry to record for an action that succeeded.
+
+        The manifest must describe what was actually reconciled, not whatever
+        happens to be on disk when the pass ends. A file edited after it was
+        planned (or after it was copied) must not have that edit written into
+        the baseline: the next pass would then see "unchanged" and the edit
+        would never be relayed -- and a later edit on the other side would
+        overwrite it.
+
+        So the side that was the source of truth for the action is recorded as
+        it was planned, and the other side is recorded as it is now only if it
+        still holds that same version. When the source is unchanged this is
+        identical to recording the current state. Returns $null when the pair
+        cannot be vouched for; the caller then keeps the previous entry.
+    #>
+    param([Parameter(Mandatory)][object] $Item,
+          [object] $LocalNow,
+          [object] $RemoteNow)
+
+    $L = $null; $O = $null
+    $action = $Item.Action
+
+    if ($action -eq 'InSync') {
+        $L = $Item.Local; $O = $Item.Remote
+    }
+    elseif ($action -in @('CopyToRemote', 'Conflict', 'MoveRemote')) {
+        # Local was the source; the remote now holds the copied or moved file.
+        $L = $Item.Local
+        $expected = if ($action -eq 'MoveRemote') { $Item.MoveSource } else { $Item.Local }
+        if ($RemoteNow -and $expected -and
+            (Test-SameFileState $RemoteNow.Length $RemoteNow.WriteUtc $expected.Length $expected.WriteUtc)) {
+            $O = $RemoteNow
+        }
+    }
+    elseif ($action -in @('CopyToLocal', 'MoveLocal')) {
+        $O = $Item.Remote
+        $expected = if ($action -eq 'MoveLocal') { $Item.MoveSource } else { $Item.Remote }
+        if ($LocalNow -and $expected -and
+            (Test-SameFileState $LocalNow.Length $LocalNow.WriteUtc $expected.Length $expected.WriteUtc)) {
+            $L = $LocalNow
+        }
+    }
+
+    if (-not $L -or -not $O) { return $null }
+    return [pscustomobject]@{
+        RelPath       = $L.RelPath
+        LocalLength   = $L.Length
+        LocalWriteUtc = $L.WriteUtc
+        OdLength      = $O.Length
+        OdWriteUtc    = $O.WriteUtc
+        LocalFileId   = $L.FileId
+        OdFileId      = $O.FileId
+    }
+}
+
+function Test-MoveFileState {
+    param([object] $Expected)
+    if (-not $Expected -or -not $Expected.FileId) { return $false }
+    $current = Get-Item -LiteralPath $Expected.FullPath -Force -ErrorAction SilentlyContinue
+    if (-not $current -or $current.PSIsContainer) { return $false }
+    return ((Test-SameFileState $current.Length $current.LastWriteTimeUtc $Expected.Length $Expected.WriteUtc) -and
+            (Get-FileIdentity -Path $Expected.FullPath) -eq $Expected.FileId)
+}
+
+function Invoke-FileMove {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([Parameter(Mandatory)][object] $Item,
+          [Parameter(Mandatory)][object] $Link)
+
+    $toRemote = $Item.Action -eq 'MoveRemote'
+    $targetRoot = if ($toRemote) { Get-RemotePath -Link $Link } else { $Link.LocalPath }
+    $originRoot = if ($toRemote) { $Link.LocalPath } else { Get-RemotePath -Link $Link }
+    $origin = if ($toRemote) { $Item.Local } else { $Item.Remote }
+    $parent = if ($toRemote) { $Item.RemoteParent } else { $Item.LocalParent }
+    $destination = Join-Path $targetRoot $Item.RelPath
+    $oldOrigin = Join-Path $originRoot $Item.OldRelPath
+    if (-not $PSCmdlet.ShouldProcess($destination, "move from $($Item.MoveSource.FullPath)")) { return $false }
+
+    # Check the user's move, the counterpart, and the vacant destination again.
+    # Never replace a new file, recreate a deleted source, or copy on failure.
+    if (-not (Test-MoveFileState -Expected $origin) -or
+        -not (Test-MoveFileState -Expected $Item.MoveSource) -or
+        (Test-Path -LiteralPath $oldOrigin) -or
+        -not (Test-CopyDestinationState -Path $destination -ExpectedParent $parent)) {
+        Write-Log ("move deferred; paths changed since planning: {0} -> {1}" -f $Item.OldRelPath, $Item.RelPath) 'WARN'
+        return $false
+    }
+    $directory = Split-Path -Parent $destination
+    if (-not (Test-Path -LiteralPath $directory)) {
+        New-Item -ItemType Directory -Path $directory -Force -ErrorAction Stop | Out-Null
+    }
+    if (-not (Test-MoveFileState -Expected $origin) -or
+        -not (Test-MoveFileState -Expected $Item.MoveSource) -or
+        (Test-Path -LiteralPath $oldOrigin) -or
+        -not (Test-CopyDestinationState -Path $destination -ExpectedParent $parent)) { return $false }
+
+    [DriveRelay.FileIdentity]::Move($Item.MoveSource.FullPath, $destination)
+    Write-Log ("moved on {0} side: {1} -> {2}" -f $(if ($toRemote) { 'remote' } else { 'local' }), $Item.OldRelPath, $Item.RelPath)
+    return $true
+}
+
+function Remove-FileSafely {
+    <#
+        Delete recoverably, and say which recovery path applies.
+
+        Returns $true on success. The caller is told via the log whether the
+        file went to the local Recycle Bin or is recoverable only from
+        OneDrive's online recycle bin, because those are different promises and
+        conflating them would mislead at exactly the wrong moment.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [switch] $HydrateFirst,
+
+        # The link root on this side and the file's path under it. Needed only
+        # on volumes with no Recycle Bin, where the file is moved into
+        # <Root>\.driverelay-deleted\ instead -- see Test-RecycleBinVolume.
+        [string] $Root,
+        [string] $RelPath
+    )
+
+    $offline = $false
+    try { $offline = (Get-CloudState -Path $Path).IsOffline } catch { }
+
+    # A network share or a removable drive has no Recycle Bin: the shell
+    # deletes there permanently, silently. Never let "deleted" mean that.
+    $recycle = $offline -or (Test-RecycleBinVolume -Path $Path)
+    if (-not $recycle -and (-not $Root -or -not $RelPath)) {
+        Write-Log ("no Recycle Bin on this volume and no holding folder given, deferring delete: {0}" -f $Path) 'WARN'
+        return $false
+    }
+
+    $target = if ($offline)     { 'delete placeholder (recoverable from the cloud service online recycle bin)' }
+              elseif ($recycle) { 'delete (to Recycle Bin)' }
+              else              { "move to $script:DeletedFolderName (this volume has no Recycle Bin)" }
+
+    if (-not $PSCmdlet.ShouldProcess($Path, $target)) { return $false }
+
+    # Pulling the content down first means the Recycle Bin has something real
+    # to keep, at the cost of a download.
+    if ($offline -and $HydrateFirst) {
+        if (Wait-Hydrated -Path $Path -TimeoutSeconds 1800 -Confirm:$false) {
+            $offline = $false
+        }
+        else {
+            Write-Log ("could not hydrate before delete, deferring: {0}" -f $Path) 'WARN'
+            return $false
+        }
+    }
+
+    # A file another program holds open makes the shell show a modal "file in
+    # use" dialog, which would stall an unattended pass until someone answers
+    # it. Defer instead; a placeholder is reported unlocked without opening it.
+    if (Test-FileLocked -Path $Path) {
+        Write-Log ("delete deferred, file is held open: {0}" -f $Path) 'DEBUG'
+        return $false
+    }
+
+    if (-not $recycle) {
+        try {
+            $stamp = Get-Date -Format 'yyyy-MM-dd HHmmss'
+            $holding = Join-Path (Join-Path $Root $script:DeletedFolderName) $stamp
+            $kept = Join-Path $holding $RelPath
+            $keptDir = Split-Path -Parent $kept
+            if (-not (Test-Path -LiteralPath $keptDir)) {
+                New-Item -ItemType Directory -Path $keptDir -Force -ErrorAction Stop | Out-Null
+                $top = Get-Item -LiteralPath (Join-Path $Root $script:DeletedFolderName) -Force
+                $top.Attributes = $top.Attributes -bor [IO.FileAttributes]::Hidden
+            }
+            # Same-volume rename only: it refuses to overwrite and never falls
+            # back to a copy, so a failure leaves the file where it was.
+            [DriveRelay.FileIdentity]::Move($Path, $kept)
+            Write-Log ("deleted {0} -- no Recycle Bin on this volume; kept as {1}" -f $Path, $kept)
+            return $true
+        }
+        catch {
+            Write-Log ("could not move {0} to {1}, deferring delete: {2}" -f $Path, $script:DeletedFolderName, $_.Exception.Message) 'WARN'
+            return $false
+        }
+    }
+
+    try {
+        [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(
+            $Path,
+            [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
+            [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)
+
+        if ($offline) {
+            Write-Log ("deleted placeholder {0} -- recover from the cloud service's online recycle bin, not the local one" -f $Path) 'WARN'
+        }
+        else {
+            Write-Log ("deleted {0} -- in the Recycle Bin" -f $Path)
+        }
+        return $true
+    }
+    catch {
+        Write-Log ("delete failed for {0}: {1}" -f $Path, $_.Exception.Message) 'WARN'
+        return $false
+    }
+}
+
+function Test-RecycleBinVolume {
+    <#
+        True only where Windows keeps deleted files: a fixed local volume
+        (including external disks that report as fixed). UNC paths, mapped
+        network drives and removable media have no Recycle Bin, and deleting
+        there through the shell is permanent. When the answer is unknown the
+        safe answer is "no".
+    #>
+    param([Parameter(Mandatory)][string] $Path)
+    if ($Path -match '^\\\\') { return $false }
+    try {
+        $qualifier = Split-Path -Qualifier $Path -ErrorAction Stop
+        $drive = New-Object System.IO.DriveInfo -ArgumentList $qualifier
+        return ($drive.DriveType -eq [IO.DriveType]::Fixed)
+    }
+    catch { return $false }
+}
+
+function Remove-EmptiedDirectory {
+    <#
+        Remove directories that this pass emptied, walking upward.
+
+        The engine tracks files, not folders -- the snapshot is -File only, and
+        nothing in the manifest describes a directory. Left alone that means a
+        deleted folder's files vanish and the folder itself stays behind as an
+        empty shell on the other side.
+
+        Scoped deliberately to the parents of files deleted in this pass rather
+        than "every empty folder under the root". An empty folder the user made
+        by hand is invisible to the sync model, and deleting it would be a
+        change nobody asked for. Only folders this pass emptied are removed.
+
+        Deepest-first, so a folder whose only child is a subfolder emptied by
+        the same pass is itself removed on the same run. The walk stops at the
+        link root, which is never removed even if it ends up empty.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [string[]] $Paths,
+        [Parameter(Mandatory)][string] $StopAt
+    )
+
+    $removed = 0
+    if (-not $Paths -or $Paths.Count -eq 0) { return $removed }
+
+    $root = try { [IO.Path]::GetFullPath($StopAt).TrimEnd('\') } catch { $StopAt.TrimEnd('\') }
+
+    # Deepest first: an emptied child must go before its parent is judged.
+    $ordered = $Paths |
+        Where-Object { $_ } |
+        Sort-Object -Unique |
+        Sort-Object -Property { ($_ -split '\\').Count } -Descending
+
+    foreach ($start in $ordered) {
+        $dir = try { [IO.Path]::GetFullPath($start).TrimEnd('\') } catch { $start.TrimEnd('\') }
+
+        while ($dir -and $dir.Length -gt $root.Length -and $dir.StartsWith($root, 'OrdinalIgnoreCase')) {
+            if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+                $dir = Split-Path -Parent $dir
+                continue
+            }
+
+            # Any child at all -- file, placeholder, or subfolder -- means this
+            # folder is still carrying something and must stay.
+            $children = @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue)
+            if ($children.Count -gt 0) { break }
+
+            $parent = Split-Path -Parent $dir
+            if (-not $PSCmdlet.ShouldProcess($dir, 'remove emptied folder')) { break }
+
+            try {
+                Remove-Item -LiteralPath $dir -Force -ErrorAction Stop
+                Write-Log ("removed emptied folder {0}" -f $dir)
+                $removed++
+            }
+            catch {
+                Write-Log ("could not remove emptied folder {0}: {1}" -f $dir, $_.Exception.Message) 'WARN'
+                break
+            }
+
+            $dir = $parent
+        }
+    }
+
+    return $removed
+}
+
+function Request-Dehydration {
+    <#
+        Ask for the OneDrive-side copy to be freed, then look for the receipt.
+
+        A short wait on purpose: if the upload has not finished yet the file is
+        simply left alone and housekeeping retries on a later pass. Blocking a
+        whole pass on one large upload helps nobody.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [int] $WaitSeconds = 45
+    )
+
+    if (-not $PSCmdlet.ShouldProcess($Path, 'dehydrate and confirm')) { return $false }
+
+    $ok = Wait-UploadReceipt -Path $Path -TimeoutSeconds $WaitSeconds -PollSeconds 5 -Confirm:$false
+    if ($ok) { Write-Log ("dehydrated (upload confirmed): {0}" -f $Path) }
+    else     { Write-Log ("dehydration pending, will retry: {0}" -f $Path) }
+    return $ok
+}
+
+function Get-ConflictName {
+    param(
+        [Parameter(Mandatory)][string] $RelPath,
+        [string] $Tag = 'remote'
+    )
+    $dir  = Split-Path -Parent $RelPath
+    $base = [IO.Path]::GetFileNameWithoutExtension($RelPath)
+    $ext  = [IO.Path]::GetExtension($RelPath)
+    $when = Get-Date -Format 'yyyy-MM-dd HHmmss'
+    $name = "$base (conflict from $Tag $when)$ext"
+    if ($dir) { return (Join-Path $dir $name) }
+    return $name
+}
+
+function Invoke-CopyToRemote {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][object] $Item,
+        [Parameter(Mandatory)][object] $Link,
+        [bool] $Dehydrate = $true
+    )
+
+    $src = $Item.Local.FullPath
+    $dst = Join-Path (Get-RemotePath -Link $Link) $Item.RelPath
+
+    if (-not (Copy-FileAtomic -Source $src -Destination $dst -CheckDestination -ExpectedDestination $Item.Remote -ExpectedParent $Item.RemoteParent)) { return $false }
+    Write-Log ("copied to remote side: {0}" -f $Item.RelPath)
+
+    if ($Dehydrate) { $null = Request-Dehydration -Path $dst }
+    return $true
+}
+
+function Invoke-CopyToLocal {
+    <#
+        The OneDrive-side file may be a placeholder. Pull the content down,
+        copy it out, then put it back the way we found it.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][object] $Item,
+        [Parameter(Mandatory)][object] $Link,
+        [bool] $Dehydrate = $true
+    )
+
+    $src = $Item.Remote.FullPath
+    $dst = Join-Path $Link.LocalPath $Item.RelPath
+
+    $wasOffline = $Item.Remote.IsOffline
+
+    if ($wasOffline) {
+        if (-not $PSCmdlet.ShouldProcess($src, 'hydrate before copying out')) { return $false }
+        if (-not (Wait-Hydrated -Path $src -TimeoutSeconds 1800 -Confirm:$false)) {
+            Write-Log ("hydration timed out, deferring: {0}" -f $Item.RelPath) 'WARN'
+            return $false
+        }
+    }
+
+    if (-not (Copy-FileAtomic -Source $src -Destination $dst -CheckDestination -ExpectedDestination $Item.Local -ExpectedParent $Item.LocalParent)) { return $false }
+    Write-Log ("copied to local: {0}" -f $Item.RelPath)
+
+    # Restore the placeholder state we found it in.
+    if ($wasOffline -and $Dehydrate) { $null = Request-Dehydration -Path $src }
+    return $true
+}
+
+function Invoke-ConflictFork {
+    <#
+        Both sides changed. Keep both, decide nothing.
+
+        The OneDrive version is brought down beside the local one under a
+        conflict name; the local file is then pushed up as the current version.
+        The conflict copy has no manifest entry, so the next pass sees it as a
+        new local file and carries it to the OneDrive side on its own.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][object] $Item,
+        [Parameter(Mandatory)][object] $Link,
+        [bool] $Dehydrate = $true
+    )
+
+    $odPath   = $Item.Remote.FullPath
+    $forkRel  = Get-ConflictName -RelPath $Item.RelPath -Tag (Get-ProviderLabel -Path $odPath)
+    $forkPath = Join-Path $Link.LocalPath $forkRel
+
+    $wasOffline = $Item.Remote.IsOffline
+    if (-not (Test-CopyDestinationState -Path (Join-Path $Link.LocalPath $Item.RelPath) -Expected $Item.Local -ExpectedParent $Item.LocalParent)) {
+        Write-Log ("conflict fork deferred; local destination changed or was deleted: {0}" -f $Item.RelPath) 'WARN'
+        return $false
+    }
+    if ($wasOffline) {
+        if (-not (Wait-Hydrated -Path $odPath -TimeoutSeconds 1800 -Confirm:$false)) {
+            Write-Log ("hydration timed out during conflict fork, deferring: {0}" -f $Item.RelPath) 'WARN'
+            return $false
+        }
+    }
+
+    if (-not (Test-CopyDestinationState -Path (Join-Path $Link.LocalPath $Item.RelPath) -Expected $Item.Local -ExpectedParent $Item.LocalParent)) { return $false }
+    if (-not (Copy-FileAtomic -Source $odPath -Destination $forkPath -CheckDestination -ExpectedParent $Item.LocalParent)) { return $false }
+    Write-Log ("conflict: kept OneDrive version as {0}" -f $forkRel) 'WARN'
+
+    if (-not (Copy-FileAtomic -Source $Item.Local.FullPath -Destination $odPath -CheckDestination -ExpectedDestination $Item.Remote -ExpectedParent $Item.RemoteParent)) { return $false }
+    Write-Log ("conflict: local version is now current for {0}" -f $Item.RelPath) 'WARN'
+
+    if ($Dehydrate) { $null = Request-Dehydration -Path $odPath }
+    return $true
+}
+
+function Invoke-LinkSeed {
+    <#
+        First run for a link. The authoritative side is copied over anything
+        missing or different on the other; nothing is deleted. Seeding
+        establishes the baseline, it does not reconcile.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][object] $Link,
+        [string[]] $ExcludePatterns,
+        [string] $StateRoot
+    )
+
+    $remote   = Get-RemotePath -Link $Link
+    $seedLocal = ($Link.Seed -eq 'Local')
+    $fromRoot = if ($seedLocal) { $Link.LocalPath } else { $remote }
+    $toRoot   = if ($seedLocal) { $remote }         else { $Link.LocalPath }
+
+    Write-Log ("seeding link {0} from {1}: {2} -> {3}" -f $Link.Id, $Link.Seed, $fromRoot, $toRoot)
+
+    # A junction or symbolic link on either side hides what lies behind it from
+    # that side's snapshot -- it does not stop a write going through it. Skip
+    # every path under a link found on either side, exactly as
+    # Compare-LinkState does, or a seed would copy through a destination
+    # junction and overwrite files outside the link root without a conflict copy.
+    $skippedLinks = New-Object 'System.Collections.Generic.List[string]'
+    $from = Get-SideSnapshot -Root $fromRoot -ExcludePatterns $ExcludePatterns -SkippedLinks $skippedLinks
+    $to   = Get-SideSnapshot -Root $toRoot   -ExcludePatterns $ExcludePatterns -SkippedLinks $skippedLinks
+
+    $copied = 0; $skipped = 0
+    foreach ($k in $from.Keys) {
+        if (Test-UnderSkippedLink -Key $k -Prefixes $skippedLinks) { continue }
+        $s = $from[$k]
+        $d = $to[$k]
+
+        if ($d -and (Test-SameFileState $s.Length $s.WriteUtc $d.Length $d.WriteUtc)) { continue }
+
+        if (-not (Test-FileSettled -Path $s.FullPath -SettleMinutes $Link.SettleMinutes) -or
+                 (Test-FileLocked  -Path $s.FullPath)) {
+            $skipped++
+            continue
+        }
+
+        # Seeding out of OneDrive means the content may not be here yet.
+        if ($s.IsOffline) {
+            if (-not (Wait-Hydrated -Path $s.FullPath -TimeoutSeconds 1800 -Confirm:$false)) {
+                $skipped++; continue
+            }
+        }
+
+        $dest = Join-Path $toRoot $s.RelPath
+        try {
+            # A differing file on the other side is a version nobody has chosen
+            # to discard. Seeding decides which version is current, not which
+            # one survives: rename the replaced version to a conflict copy
+            # first. A rename on the same volume never reads content, so a
+            # cloud placeholder is not downloaded, and it refuses to overwrite.
+            if ($d) {
+                $tag = if ($seedLocal) { Get-ProviderLabel -Path $toRoot } else { 'local' }
+                $keptRel  = Get-ConflictName -RelPath $d.RelPath -Tag $tag
+                $keptPath = Join-Path $toRoot $keptRel
+                if (-not $PSCmdlet.ShouldProcess($d.FullPath, "keep replaced version as $keptRel")) { $skipped++; continue }
+                if (Test-Path -LiteralPath $keptPath) { $skipped++; continue }
+                [DriveRelay.FileIdentity]::Move($d.FullPath, $keptPath)
+                Write-Log ("seed: kept the replaced {0} version as {1}" -f $tag, $keptRel) 'WARN'
+            }
+            # No per-file dehydration during a seed: it can run to tens of
+            # thousands of files. The whole tree is dehydrated once at the end
+            # of the pass instead.
+            if (Copy-FileAtomic -Source $s.FullPath -Destination $dest) { $copied++ }
+        }
+        catch {
+            Write-Log ("seed copy failed for {0}: {1}" -f $s.RelPath, $_.Exception.Message) 'ERROR'
+            $skipped++
+        }
+    }
+
+    Write-Log ("seed complete for {0}: {1} copied, {2} deferred" -f $Link.Id, $copied, $skipped)
+    return [pscustomobject]@{ Copied = $copied; Deferred = $skipped }
+}
+
+function Get-LinkOption {
+    <#
+        Read an optional link setting, tolerating links written before that
+        setting existed.
+    #>
+    param(
+        [Parameter(Mandatory)][object] $Link,
+        [Parameter(Mandatory)][string] $Name,
+        $Default
+    )
+
+    if ($null -eq $Link.PSObject.Properties[$Name]) { return $Default }
+    if ($null -eq $Link.$Name) { return $Default }
+    return $Link.$Name
+}
+
+function Get-LinkDehydrate {
+    param([Parameter(Mandatory)][object] $Link)
+    return [bool] (Get-LinkOption -Link $Link -Name 'Dehydrate' -Default $true)
+}
+
+function Invoke-LinkSync {
+    <#
+        One pass over one link.
+
+        Order matters: the delete cap is checked before anything is applied, so
+        a pass that looks like mass deletion never gets halfway through.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][object] $Link,
+        [string[]] $ExcludePatterns,
+        [string] $StateRoot = $script:DefaultStateRoot
+    )
+
+    $result = [pscustomobject]@{
+        LinkId           = $Link.Id
+        Applied          = 0
+        Moved            = 0
+        Deferred         = 0
+        Failed           = 0
+        Conflicts        = 0
+        DeletionConflicts = @()
+        Deleted          = 0
+        CloudOnlyDeletes = 0
+        Aborted          = $false
+        Message          = ''
+        # Ready | DriveOffline | FolderMissing | ClientNotRunning | NoRemote
+        State            = 'Ready'
+        Detail           = ''
+    }
+
+    # Availability first, and specifically: an unmounted drive, a deleted folder
+    # and a stopped cloud client all look like "path missing" to Test-Path but
+    # need different things done about them.
+    $avail = Get-LinkAvailability -Link $Link
+    if ($avail.Blocking) {
+        $result.Aborted = $true
+        $result.State   = $avail.State
+        $result.Message = $avail.Summary
+        $result.Detail  = $avail.Detail
+        Write-Log ("link {0} skipped [{1}]: {2}" -f $Link.Id, $avail.State, $avail.Detail) 'WARN'
+        return $result
+    }
+    if ($avail.State -ne 'Ready') {
+        # Not blocking, but the operator should know the pass is running degraded.
+        $result.State  = $avail.State
+        $result.Detail = $avail.Detail
+        Write-Log ("link {0} degraded [{1}]: {2}" -f $Link.Id, $avail.State, $avail.Detail) 'WARN'
+    }
+
+    # Placeholder handling only applies where the remote side actually has
+    # placeholders. On a plain folder -- Google Drive in Mirror mode, a network
+    # share, another disk -- these steps are skipped entirely.
+    # A seeded link without intact history must not run: every file would read
+    # as new, undoing deletions. Restore from .tmp/.bak where possible.
+    $history = Repair-LinkManifest -Link $Link -StateRoot $StateRoot
+    if (-not $history.Ok) {
+        $result.Aborted = $true
+        $result.Message = $history.Message
+        Write-Log ("link {0} ABORTED: {1}" -f $Link.Id, $history.Message) 'ERROR'
+        return $result
+    }
+    if ($history.Message) { Write-Log ("link {0}: {1}" -f $Link.Id, $history.Message) 'WARN' }
+
+    $provider             = Resolve-LinkProvider -Link $Link
+    $isCloud              = ($provider -eq 'CloudFiles')
+    $dehydrate            = $isCloud -and (Get-LinkDehydrate -Link $Link)
+    $hydrateBeforeDelete  = $isCloud -and (Get-LinkOption -Link $Link -Name 'HydrateBeforeDelete' -Default $false)
+    $settleMinutes        = [int] (Get-LinkOption -Link $Link -Name 'SettleMinutes' -Default 3)
+    $maxDelete            = [int] (Get-LinkOption -Link $Link -Name 'MaxDelete' -Default 50)
+    $remotePath           = Get-RemotePath -Link $Link
+    $manifestPath         = Get-ManifestPath -LinkId $Link.Id -StateRoot $StateRoot
+
+    if (-not $Link.Seeded) {
+        $seed = Invoke-LinkSeed -Link $Link -ExcludePatterns $ExcludePatterns -StateRoot $StateRoot
+        $result.Applied  = $seed.Copied
+        $result.Deferred = $seed.Deferred
+        $result.Message  = 'seeded'
+        # Fall through: the comparison below records the resulting baseline.
+    }
+
+    $skippedLinks = New-Object 'System.Collections.Generic.List[string]'
+    $items = Compare-LinkState -Link $Link -ExcludePatterns $ExcludePatterns -StateRoot $StateRoot -SkippedLinks $skippedLinks
+    foreach ($s in ($skippedLinks | Sort-Object -Unique)) {
+        # DEBUG: repeated every pass; `check` and `status` report these too.
+        Write-Log ("link {0}: not following junction/symbolic link {1}" -f $Link.Id, $s.TrimEnd('\')) 'DEBUG'
+    }
+
+    # --- delete cap, checked before anything is applied ---
+    $deleteItems = @($items | Where-Object { $_.Action -like 'Delete*' })
+    if ($deleteItems.Count -gt $maxDelete) {
+        $result.Aborted = $true
+        $result.Message = ("{0} deletions exceeds MaxDelete of {1}; nothing applied" -f $deleteItems.Count, $maxDelete)
+        Write-Log ("link {0} ABORTED: {1}" -f $Link.Id, $result.Message) 'ERROR'
+        return $result
+    }
+
+    $manifest = Read-Manifest -Path $manifestPath
+    $succeeded = @{}   # relpath key -> $true, for entries to refresh
+    $forgotten = @{}   # relpath key -> $true, for entries to drop
+    $emptiedLocal  = @()   # parents of deleted local files, pruned after the loop
+    $emptiedRemote = @()   # same on the remote side
+
+    foreach ($item in $items) {
+        $key = $item.RelPath.ToLowerInvariant()
+
+        # Plain conditionals, not a switch: `continue` inside a switch does not
+        # reliably continue the enclosing loop in PowerShell.
+        if ($item.Action -eq 'InSync') {
+            $succeeded[$key] = $item
+            # Space reclamation happens once for the whole tree after the loop,
+            # not per file -- see the Set-TreeDehydrated call below.
+            continue
+        }
+
+        if ($item.Action -eq 'Forget') {
+            $forgotten[$key] = $true
+            continue
+        }
+
+        if ($item.Action -eq 'DeletionConflict') {
+            $result.Conflicts++
+            $result.DeletionConflicts += (New-DeletionConflict -Item $item -Link $Link)
+            Write-Log ("deletion conflict: {0} | {1}; surviving copy preserved, deletion not undone" -f $item.RelPath, $item.Reason) 'WARN'
+            # Keep the old baseline so the conflict remains visible next pass.
+            continue
+        }
+
+        $ready = Test-ActionReady -Item $item -SettleMinutes $settleMinutes
+        if (-not $ready.Ready) {
+            $result.Deferred++
+            # DEBUG: a file held open by Tally or Excel is deferred again on
+            # every pass for as long as it stays open, so at INFO one open
+            # workbook writes a line every ten minutes all day. The deferred
+            # count on the link summary and `DriveRelay status` both report the
+            # backlog; naming each file every pass only crowds out the copies
+            # and deletes the log exists to record.
+            Write-Log ("deferred ({0}): {1}" -f $ready.Reason, $item.RelPath) 'DEBUG'
+            continue
+        }
+
+        try {
+            Write-Log ("decision {0}: {1} | {2}" -f $item.Action, $item.RelPath, $item.Reason)
+            $ok = $false
+            switch ($item.Action) {
+                'CopyToRemote' { $ok = Invoke-CopyToRemote -Item $item -Link $Link -Dehydrate $dehydrate }
+                'CopyToLocal'    { $ok = Invoke-CopyToLocal    -Item $item -Link $Link -Dehydrate $dehydrate }
+                { $_ -in @('MoveLocal', 'MoveRemote') } {
+                    $ok = Invoke-FileMove -Item $item -Link $Link
+                    if ($ok) {
+                        $result.Moved++
+                        $forgotten[$item.OldRelPath.ToLowerInvariant()] = $true
+                        if ($item.Action -eq 'MoveLocal') { $emptiedLocal += (Split-Path -Parent $item.MoveSource.FullPath) }
+                        else { $emptiedRemote += (Split-Path -Parent $item.MoveSource.FullPath) }
+                    }
+                }
+                'Conflict'       {
+                    $ok = Invoke-ConflictFork -Item $item -Link $Link -Dehydrate $dehydrate
+                    if ($ok) { $result.Conflicts++ }
+                }
+                'DeleteLocal'    {
+                    # Always a real file with content, so the Recycle Bin holds it.
+                    if (-not (Test-DeleteStillValid -Target $item.Local -CounterpartPath (Join-Path $remotePath $item.RelPath))) {
+                        Write-Log ("delete deferred; file or counterpart changed since planning: {0}" -f $item.RelPath) 'WARN'
+                        $ok = $false
+                    }
+                    else { $ok = Remove-FileSafely -Path $item.Local.FullPath -Root $Link.LocalPath -RelPath $item.Local.RelPath }
+                    if ($ok) {
+                        $result.Deleted++
+                        $forgotten[$key] = $true
+                        $emptiedLocal += (Split-Path -Parent $item.Local.FullPath)
+                    }
+                }
+                'DeleteRemote' {
+                    if (-not (Test-DeleteStillValid -Target $item.Remote -CounterpartPath (Join-Path $Link.LocalPath $item.RelPath))) {
+                        Write-Log ("delete deferred; file or counterpart changed since planning: {0}" -f $item.RelPath) 'WARN'
+                        $ok = $false
+                    }
+                    else { $ok = Remove-FileSafely -Path $item.Remote.FullPath -HydrateFirst:$hydrateBeforeDelete -Root $remotePath -RelPath $item.Remote.RelPath }
+                    if ($ok) {
+                        $result.Deleted++
+                        $forgotten[$key] = $true
+                        $emptiedRemote += (Split-Path -Parent $item.Remote.FullPath)
+                        if ($item.Remote.IsOffline -and -not $hydrateBeforeDelete) {
+                            $result.CloudOnlyDeletes++
+                        }
+                    }
+                }
+            }
+
+            if ($ok) {
+                $result.Applied++
+                if ($item.Action -notlike 'Delete*') { $succeeded[$key] = $item }
+            }
+            else {
+                # WhatIf, or a step that chose to defer.
+                $result.Deferred++
+            }
+        }
+        catch {
+            $result.Failed++
+            Write-Log ("action {0} failed for {1}: {2}" -f $item.Action, $item.RelPath, $_.Exception.Message) 'ERROR'
+        }
+    }
+
+    # --- remove folders this pass emptied ---
+    # After the deletes, not during: a folder is only judged once every file
+    # the pass was going to remove from it is gone. Deferred files still sit
+    # on disk, so a folder that is not finished emptying is simply left for a
+    # later pass to revisit.
+    $prunedDirs = 0
+    if ($emptiedLocal.Count -gt 0) {
+        $prunedDirs += Remove-EmptiedDirectory -Paths $emptiedLocal -StopAt $Link.LocalPath
+    }
+    if ($emptiedRemote.Count -gt 0) {
+        $prunedDirs += Remove-EmptiedDirectory -Paths $emptiedRemote -StopAt $remotePath
+    }
+    if ($prunedDirs -gt 0) {
+        Write-Log ("link {0}: removed {1} emptied folder(s)" -f $Link.Id, $prunedDirs)
+    }
+
+    # --- reclaim space on the OneDrive side, once for the whole tree ---
+    # One attrib call rather than one per file. Files OneDrive has not finished
+    # uploading simply stay on disk and are picked up by a later pass.
+    if ($dehydrate) {
+        $null = Set-TreeDehydrated -Root $remotePath
+    }
+
+    # --- commit the manifest ---
+    # Only paths whose action succeeded are refreshed. Anything deferred or
+    # failed keeps its previous entry so the next pass compares against the
+    # same baseline instead of seeing a phantom conflict.
+    if ($PSCmdlet.ShouldProcess($Link.Id, 'commit manifest')) {
+        # Partial listings are acceptable here: a path missing from them simply
+        # keeps its previous entry, which the next pass re-evaluates.
+        $localNow = Get-SideSnapshot -Root $Link.LocalPath -ExcludePatterns $ExcludePatterns -AllowPartial
+        $odNow    = Get-SideSnapshot -Root $remotePath     -ExcludePatterns $ExcludePatterns -AllowPartial
+
+        foreach ($key in @($succeeded.Keys)) {
+            $entry = Get-CommittedEntry -Item $succeeded[$key] -LocalNow $localNow[$key] -RemoteNow $odNow[$key]
+            if ($entry) { $manifest[$key] = $entry }
+        }
+        foreach ($key in $forgotten.Keys) { $manifest.Remove($key) }
+
+        Write-Manifest -Path $manifestPath -Entries @($manifest.Values)
+    }
+
+    if (-not $result.Message) {
+        $result.Message = ("applied {0}, deferred {1}, conflicts {2}, deleted {3}, failed {4}, moved {5}" -f `
+                            $result.Applied, $result.Deferred, $result.Conflicts, $result.Deleted, $result.Failed, $result.Moved)
+    }
+    # A link that moved nothing is reported at DEBUG. With three links and a ten
+    # minute interval these were three lines of zeroes every pass -- more than
+    # half the log -- and the pass-level summary already covers a quiet run.
+    $quiet = ($result.Applied -eq 0 -and $result.Conflicts -eq 0 -and
+              $result.Deleted -eq 0 -and $result.Failed -eq 0 -and -not $result.Aborted)
+    Write-Log ("link {0}: {1}" -f $Link.Id, $result.Message) $(if ($quiet) { 'DEBUG' } else { 'INFO' })
+    return $result
+}

@@ -1,0 +1,1466 @@
+# Test-DriveRelay.ps1 -- Automated test harness for DriveRelay core and settings modules
+
+[CmdletBinding()]
+param()
+
+$ErrorActionPreference = 'Stop'
+$testDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$root = Split-Path -Parent $testDir
+
+# Redirect logging into the tests folder before anything else runs.
+#
+# The engine sections below exercise real copies and deletes, and Logging.ps1
+# defaults to the repository-root driverelay.log -- the production log of a live
+# install. Without this, a test run interleaves fake link ids and scratch paths
+# into the operator's actual sync history, which is the record you go to when
+# something has gone wrong.
+. (Join-Path $root 'lib\Logging.ps1')
+$script:TestLog = Join-Path $testDir 'test-run.log'
+if (Test-Path $script:TestLog) { Remove-Item -LiteralPath $script:TestLog -Force -ErrorAction SilentlyContinue }
+Set-LogPath $script:TestLog
+
+Write-Host "=== DriveRelay Automated Test Harness ===" -ForegroundColor Cyan
+Write-Host "Root: $root"
+Write-Host "Log:  $script:TestLog  (never the production log)"
+Write-Host ''
+
+$script:Passed = 0
+$script:Failed = 0
+
+function Assert-Equal($actual, $expected, [string]$testName) {
+    if ($actual -eq $expected) {
+        Write-Host "  [PASS] $testName" -ForegroundColor Green
+        $script:Passed++
+    } else {
+        Write-Host "  [FAIL] ${testName}: expected '$expected', got '$actual'" -ForegroundColor Red
+        $script:Failed++
+    }
+}
+
+function Assert-True([bool]$condition, [string]$testName) {
+    if ($condition) {
+        Write-Host "  [PASS] $testName" -ForegroundColor Green
+        $script:Passed++
+    } else {
+        Write-Host "  [FAIL] $testName" -ForegroundColor Red
+        $script:Failed++
+    }
+}
+
+# ------------------------------------------------------------- 1. Settings ---
+Write-Host "1. Testing lib/Settings.ps1" -ForegroundColor Yellow
+. (Join-Path $root 'lib\Settings.ps1')
+
+$tmpSettingsPath = Join-Path $testDir 'test-settings.json'
+if (Test-Path $tmpSettingsPath) { Remove-Item -LiteralPath $tmpSettingsPath -Force }
+Set-SettingsPath $tmpSettingsPath
+
+$defaultSettings = Get-AppSettings
+Assert-Equal $defaultSettings.IntervalMinutes 10 "Default IntervalMinutes is 10"
+Assert-Equal $defaultSettings.SettleMinutes 3 "Default SettleMinutes is 3"
+Assert-Equal $defaultSettings.MaxDelete 50 "Default MaxDelete is 50"
+Assert-Equal $defaultSettings.HydrateBeforeDelete $true "Default HydrateBeforeDelete is true"
+Assert-Equal $defaultSettings.LogMaxAgeDays 60 "Default LogMaxAgeDays is 60"
+
+$defaultSettings.SettleMinutes = 5
+$defaultSettings.IntervalMinutes = 15
+Save-AppSettings -Settings $defaultSettings
+
+$reloaded = Get-AppSettings
+Assert-Equal $reloaded.SettleMinutes 5 "Persisted SettleMinutes is 5"
+Assert-Equal $reloaded.IntervalMinutes 15 "Persisted IntervalMinutes is 15"
+
+$null = Set-AppSetting -Key 'SettleMinutes' -Value 7
+$reloaded2 = Get-AppSettings
+Assert-Equal $reloaded2.SettleMinutes 7 "Set-AppSetting updated SettleMinutes to 7"
+
+# One bad value costs that value only; strings are not truthy booleans.
+Set-Content -LiteralPath $tmpSettingsPath -Encoding utf8 -Value '{ "IntervalMinutes": "ten", "SettleMinutes": 4, "MaxDelete": -5, "Paused": "false", "HydrateBeforeDelete": "false", "LogLevel": "debug", "LogMaxAgeDays": 0 }'
+$mixed = Get-AppSettings
+Assert-Equal $mixed.IntervalMinutes 10 "A non-numeric interval falls back to its own default"
+Assert-Equal $mixed.SettleMinutes 4 "Valid values next to a bad one are kept"
+Assert-Equal $mixed.MaxDelete 50 "A negative MaxDelete falls back to the default"
+Assert-Equal $mixed.Paused $false "The string 'false' does not read as paused"
+Assert-Equal $mixed.HydrateBeforeDelete $false "The string 'false' reads as false"
+Assert-Equal $mixed.LogLevel 'DEBUG' "Log level is case-insensitive"
+Assert-Equal $mixed.LogMaxAgeDays 0 "LogMaxAgeDays 0 (age cap off) is kept"
+
+# Reading never writes; changing keeps everything the change did not touch.
+Remove-Item -LiteralPath $tmpSettingsPath -Force
+$null = Get-AppSettings
+Assert-True (-not (Test-Path -LiteralPath $tmpSettingsPath)) "Reading settings does not create the file"
+$null = Update-AppSettings -Change { param($st) $st.LogLevel = 'DEBUG'; $st.Paused = $true }
+$null = Update-AppSettings -Change { param($st) $st.IntervalMinutes = 20 }
+$kept = Get-AppSettings
+Assert-True ($kept.LogLevel -eq 'DEBUG' -and $kept.Paused -and $kept.IntervalMinutes -eq 20) "Update-AppSettings changes only what it is given"
+
+# An unparseable file is kept aside, not silently replaced.
+Set-Content -LiteralPath $tmpSettingsPath -Encoding utf8 -Value '{ not json'
+$null = Set-AppSetting -Key 'Paused' -Value $true
+$aside = @(Get-ChildItem -LiteralPath $testDir -Filter 'test-settings.json.unreadable-*')
+Assert-Equal $aside.Count 1 "A settings file that could not be parsed is kept before being replaced"
+$aside | Remove-Item -Force
+
+if (Test-Path $tmpSettingsPath) { Remove-Item -LiteralPath $tmpSettingsPath -Force }
+
+# ------------------------------------------------------------- 2. Registry ---
+Write-Host "2. Testing lib/Registry.ps1" -ForegroundColor Yellow
+. (Join-Path $root 'lib\Provider.ps1')
+. (Join-Path $root 'lib\Registry.ps1')
+
+$tmpRegistryPath = Join-Path $testDir 'test-links.json'
+if (Test-Path $tmpRegistryPath) { Remove-Item -LiteralPath $tmpRegistryPath -Force }
+Set-RegistryPath $tmpRegistryPath
+
+$tmpLocal = Join-Path $testDir 'scratch_local'
+$tmpRemote = Join-Path $testDir 'scratch_remote'
+if (-not (Test-Path $tmpLocal)) { New-Item -ItemType Directory -Path $tmpLocal -Force | Out-Null }
+if (-not (Test-Path $tmpRemote)) { New-Item -ItemType Directory -Path $tmpRemote -Force | Out-Null }
+
+$link = Add-Link -Local $tmpLocal -Remote $tmpRemote -Seed 'Local' -SettleMinutes 5 -MaxDelete 100 -HydrateBeforeDelete $true
+Assert-Equal $link.SettleMinutes 5 "Add-Link custom SettleMinutes is 5"
+Assert-Equal $link.MaxDelete 100 "Add-Link custom MaxDelete is 100"
+Assert-Equal $link.HydrateBeforeDelete $true "Add-Link custom HydrateBeforeDelete is true"
+
+$updated = Set-LinkSettings -Id $link.Id -SettleMinutes 2 -MaxDelete 25
+Assert-Equal $updated.SettleMinutes 2 "Set-LinkSettings updated SettleMinutes to 2"
+Assert-Equal $updated.MaxDelete 25 "Set-LinkSettings updated MaxDelete to 25"
+
+Remove-Link -Id $link.Id
+$allLinks = @(Get-LinkRegistry)
+Assert-Equal $allLinks.Count 0 "Remove-Link successfully removed link"
+
+# Re-adding a pair reuses its id; the old registration's history must be set
+# aside before the link exists, together with its recovery copies.
+$tmpState = Join-Path $testDir 'scratch_state'
+if (Test-Path $tmpState) { Remove-Item -LiteralPath $tmpState -Recurse -Force }
+$oldHistory = Join-Path $tmpState $link.Id
+New-Item -ItemType Directory -Path $oldHistory -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $oldHistory 'manifest.json') -Value '[]' -Encoding utf8
+Set-Content -LiteralPath (Join-Path $oldHistory 'manifest.json.bak') -Value '[]' -Encoding utf8
+$readded = Add-Link -Local $tmpLocal -Remote $tmpRemote -Seed 'Local' -StateRoot $tmpState
+Assert-Equal $readded.Id $link.Id "A re-added pair reuses its id"
+Assert-True (-not (Test-Path -LiteralPath $oldHistory)) "The earlier registration's history is set aside before the link is saved"
+Assert-Equal @(Get-ChildItem -LiteralPath $tmpState -Directory -Filter "$($link.Id).superseded-*").Count 1 "The set-aside history is kept, not deleted"
+Remove-Link -Id $readded.Id
+
+# History retention: unusable history goes to the Recycle Bin. The bin action
+# is replaced for the rest of the suite, so passes over test folders never
+# fill the real Recycle Bin.
+$script:BinnedForTest = New-Object System.Collections.ArrayList
+$script:StateBinAction = { param($Path) [void]$script:BinnedForTest.Add($Path); Remove-Item -LiteralPath $Path -Recurse -Force; $true }
+Assert-Equal (Send-StateFolderToRecycleBin -Path '\\no-such-server\share\state\x') $false 'History on a network share is never deleted (no Recycle Bin there)'
+try {
+    $retState = Join-Path $testDir 'retention_state'
+    if (Test-Path $retState) { Remove-Item -LiteralPath $retState -Recurse -Force }
+    foreach ($name in 'Live', 'Gone', 'Live.superseded-20261001-120000', 'Live.superseded-20261101-120000', 'Other', 'trace-folder') {
+        New-Item -ItemType Directory -Path (Join-Path $retState $name) -Force | Out-Null
+    }
+    foreach ($name in 'Live', 'Gone') { Set-Content -LiteralPath (Join-Path $retState "$name\manifest.json") -Value '[]' }
+    Set-Content -LiteralPath (Join-Path $retState 'Gone\manifest.json.bak') -Value '[]'
+    Set-Content -LiteralPath (Join-Path $retState 'Other\notes.txt') -Value 'not history'
+    $liveLinks = @([pscustomobject]@{ Id = 'Live' })
+    $retNow = [datetime]'2026-11-05 12:00:00'
+
+    # With no links listed (a lost links file), no link's history is touched;
+    # only set-aside history past 30 days goes, as it is never live.
+    $none = @(Clear-StaleLinkState -StateRoot $retState -Links @() -Now $retNow)
+    Assert-Equal $none.Count 1 'With no links listed, only old set-aside history is cleared'
+    Assert-True (Test-Path (Join-Path $retState 'Live\manifest.json')) 'With no links listed, link history is kept'
+    Assert-True (Test-Path (Join-Path $retState 'Gone\manifest.json')) 'With no links listed, unregistered history is kept too'
+    Assert-True (-not (Test-Path (Join-Path $retState 'Live.superseded-20261001-120000'))) 'History set aside 35 days ago is cleared'
+    $cleared = @(Clear-StaleLinkState -StateRoot $retState -Links $liveLinks -Now $retNow)
+    Assert-Equal $cleared.Count 1 "With links listed, the removed link's history is cleared"
+    Assert-True (-not (Test-Path (Join-Path $retState 'Gone'))) "A removed link's history is cleared"
+    Assert-True (Test-Path (Join-Path $retState 'Live.superseded-20261101-120000')) 'History set aside 4 days ago is kept'
+    Assert-True (Test-Path (Join-Path $retState 'Live\manifest.json')) "A registered link's history is kept"
+    Assert-True (Test-Path (Join-Path $retState 'Other\notes.txt')) 'A folder holding anything but history is left alone'
+    Assert-True (Test-Path (Join-Path $retState 'trace-folder')) 'An empty or unrelated folder is left alone'
+
+    # Removing a link sends its history to the bin at once when no sync runs.
+    $script:BinnedForTest.Clear()
+    $rmLink = Add-Link -Local $tmpLocal -Remote $tmpRemote -Seed 'Local' -StateRoot $retState
+    New-Item -ItemType Directory -Path (Join-Path $retState $rmLink.Id) -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $retState "$($rmLink.Id)\manifest.json") -Value '[]'
+    Remove-Link -Id $rmLink.Id -StateRoot $retState
+    Assert-True (-not (Test-Path (Join-Path $retState $rmLink.Id))) "Removing a link sends its history to the Recycle Bin"
+    Assert-Equal $script:BinnedForTest.Count 1 'Exactly one folder was sent when the link was removed'
+    Assert-Equal @(Get-LinkRegistry).Count 0 'The removed link is unregistered'
+}
+finally { if (Test-Path $retState) { Remove-Item -LiteralPath $retState -Recurse -Force } }
+
+# Per-link limits are range-checked at registration.
+$badRange = $false
+try { $null = Add-Link -Local $tmpLocal -Remote $tmpRemote -Seed 'Local' -SettleMinutes -1 } catch { $badRange = $true }
+Assert-True $badRange "Add-Link refuses a negative SettleMinutes"
+Assert-Equal @(Get-LinkRegistry).Count 0 "A refused add registers nothing"
+
+# If the history cannot be set aside, nothing is registered.
+New-Item -ItemType Directory -Path $oldHistory -Force | Out-Null
+$holdOpen = [IO.File]::Open((Join-Path $oldHistory 'manifest.json'), [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+try {
+    $refused = $false
+    try { $null = Add-Link -Local $tmpLocal -Remote $tmpRemote -Seed 'Local' -StateRoot $tmpState } catch { $refused = $true }
+} finally { $holdOpen.Dispose() }
+Assert-True $refused "Add-Link refuses when the earlier history cannot be set aside"
+Assert-Equal @(Get-LinkRegistry).Count 0 "A refused add registers nothing"
+if (Test-Path $tmpState) { Remove-Item -LiteralPath $tmpState -Recurse -Force }
+
+if (Test-Path $tmpLocal) { Remove-Item -LiteralPath $tmpLocal -Recurse -Force }
+if (Test-Path $tmpRemote) { Remove-Item -LiteralPath $tmpRemote -Recurse -Force }
+if (Test-Path $tmpRegistryPath) { Remove-Item -LiteralPath $tmpRegistryPath -Force }
+
+# ------------------------------------------------------------- 3. Icons ---
+Write-Host "3. Testing lib/Icons.ps1" -ForegroundColor Yellow
+. (Join-Path $root 'lib\Icons.ps1')
+
+$icoIdle = New-SyncIcon -Size 32 -State 'idle'
+Assert-True ($null -ne $icoIdle) "New-SyncIcon generated idle icon"
+if ($icoIdle) { $icoIdle.Dispose() }
+
+$icoSync = New-SyncIcon -Size 32 -State 'sync'
+Assert-True ($null -ne $icoSync) "New-SyncIcon generated sync icon"
+if ($icoSync) { $icoSync.Dispose() }
+
+$icoWarn = New-SyncIcon -Size 32 -State 'warn'
+Assert-True ($null -ne $icoWarn) "New-SyncIcon generated warn icon"
+if ($icoWarn) { $icoWarn.Dispose() }
+
+$icoPaused = New-SyncIcon -Size 32 -State 'paused'
+Assert-True ($null -ne $icoPaused) "New-SyncIcon generated paused icon"
+if ($icoPaused) { $icoPaused.Dispose() }
+
+# Paused must look different from "needs attention": grey, not amber.
+$warnBmp = New-SyncIconBitmap -Size 32 -State 'warn'
+$pausedBmp = New-SyncIconBitmap -Size 32 -State 'paused'
+try {
+    $isGrey = { param($c) [Math]::Max([Math]::Abs($c.R - $c.G), [Math]::Abs($c.G - $c.B)) -le 12 }
+    $pausedPixels = @(for ($x = 0; $x -lt 32; $x += 2) { for ($y = 0; $y -lt 32; $y += 2) { $pausedBmp.GetPixel($x, $y) } }) | Where-Object { $_.A -gt 40 }
+    Assert-True ($pausedPixels.Count -gt 0) 'Paused icon is not blank'
+    Assert-Equal @($pausedPixels | Where-Object { -not (& $isGrey $_) }).Count 0 'Paused icon is grey throughout'
+    $warnPip = $warnBmp.GetPixel(26, 26)
+    Assert-True (-not (& $isGrey $warnPip)) 'Warning icon keeps its amber pip'
+} finally { $warnBmp.Dispose(); $pausedBmp.Dispose() }
+
+# ------------------------------------------------------------- 4. CLI Config ---
+Write-Host "4. Testing DriveRelay CLI config command" -ForegroundColor Yellow
+$cliPath = Join-Path $root 'DriveRelay.ps1'
+$cliOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cliPath config
+$cliOutStr = $cliOut -join "`n"
+Assert-True ($cliOutStr -match 'DriveRelay Configuration') "CLI config command displays configuration output"
+Assert-True ($cliOutStr -match 'LogLevel') "CLI config reports the log level"
+
+# `config -X <value>` must actually persist.
+#
+# It did not: the command functions read $PSBoundParameters, which inside a
+# function is that function's own and therefore empty, so every override was
+# dropped and the command printed the unchanged settings without complaint.
+# Separately, Logging.ps1's own $script:LogLevel shared a scope with the CLI's
+# -LogLevel parameter and overwrote it. Both were invisible from output alone,
+# so this test reads the file back.
+#
+# This exercises the real CLI, which hardcodes config\settings.json -- so it
+# moves a value away from whatever the operator has set and puts it back.
+$liveSettings = Join-Path $root 'config\settings.json'
+if (Test-Path -LiteralPath $liveSettings) {
+    $original = Get-Content -LiteralPath $liveSettings -Raw -Encoding UTF8 | ConvertFrom-Json
+    $origSettle = [int]$original.SettleMinutes
+    $origLevel  = if ($original.PSObject.Properties['LogLevel']) { [string]$original.LogLevel } else { 'INFO' }
+    $origMaxAge = if ($original.PSObject.Properties['LogMaxAgeDays']) { [int]$original.LogMaxAgeDays } else { 60 }
+    try {
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cliPath config `
+            -SettleMinutes ($origSettle + 1) -LogLevel DEBUG -LogMaxAgeDays ($origMaxAge + 1) | Out-Null
+        $after = Get-Content -LiteralPath $liveSettings -Raw -Encoding UTF8 | ConvertFrom-Json
+        Assert-Equal ([int]$after.SettleMinutes) ($origSettle + 1) "config -SettleMinutes is persisted, not silently dropped"
+        Assert-Equal ([string]$after.LogLevel) 'DEBUG' "config -LogLevel is persisted, not shadowed by Logging.ps1"
+        Assert-Equal ([int]$after.LogMaxAgeDays) ($origMaxAge + 1) "config -LogMaxAgeDays is persisted"
+    }
+    finally {
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cliPath config `
+            -SettleMinutes $origSettle -LogLevel $origLevel -LogMaxAgeDays $origMaxAge | Out-Null
+    }
+    $restored = Get-Content -LiteralPath $liveSettings -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-Equal ([int]$restored.SettleMinutes) $origSettle "The operator's SettleMinutes is restored after the test"
+    Assert-Equal ([string]$restored.LogLevel) $origLevel "The operator's LogLevel is restored after the test"
+    Assert-Equal ([int]$restored.LogMaxAgeDays) $origMaxAge "The operator's LogMaxAgeDays is restored after the test"
+}
+
+# ------------------------------------------------------- 5. Overlap guard ---
+# Regression test for the chain case: registering A <-> B and then B <-> C used
+# to be accepted, leaving two links driving folder B from two manifests.
+Write-Host "5. Testing link overlap rejection" -ForegroundColor Yellow
+
+$ovRegistry = Join-Path $testDir 'test-overlap.json'
+if (Test-Path $ovRegistry) { Remove-Item -LiteralPath $ovRegistry -Force }
+Set-RegistryPath $ovRegistry
+
+$ovBase = Join-Path $testDir 'scratch_overlap'
+$ovA = Join-Path $ovBase 'A'; $ovB = Join-Path $ovBase 'B'; $ovC = Join-Path $ovBase 'C'
+New-Item -ItemType Directory -Path $ovA, $ovB, $ovC -Force | Out-Null
+
+$null = Add-Link -Local $ovA -Remote $ovB -Seed 'Local'
+
+$chainRejected = $false
+try   { $null = Add-Link -Local $ovB -Remote $ovC -Seed 'Local' }
+catch { $chainRejected = $true }
+Assert-True $chainRejected "Chain A<->B then B<->C is rejected (new local vs existing remote)"
+
+$reverseRejected = $false
+try   { $null = Add-Link -Local $ovC -Remote $ovA -Seed 'Local' }
+catch { $reverseRejected = $true }
+Assert-True $reverseRejected "Chain C<->A is rejected (new remote vs existing local)"
+
+Assert-Equal @(Get-LinkRegistry).Count 1 "Only the first link survived the rejected attempts"
+
+$selfRejected = $false
+try   { $null = Add-Link -Local $ovBase -Remote $ovC -Seed 'Local' }
+catch { $selfRejected = $true }
+Assert-True $selfRejected "A parent folder of an existing link's side is rejected"
+
+Remove-Item -LiteralPath $ovBase -Recurse -Force -ErrorAction SilentlyContinue
+if (Test-Path $ovRegistry) { Remove-Item -LiteralPath $ovRegistry -Force }
+
+# --------------------------------------------------------- 6. Sync engine ---
+# The classification table in Compare-LinkState decides copy vs. delete vs.
+# conflict. It is the code that can lose data and had no coverage at all --
+# the DeleteRemote regression of 2026-08-07 would have been caught here.
+Write-Host "6. Testing sync engine classification (lib/Manifest.ps1)" -ForegroundColor Yellow
+
+. (Join-Path $root 'lib\Availability.ps1')   # Actions.ps1 calls Get-LinkAvailability
+. (Join-Path $root 'lib\Hydration.ps1')
+. (Join-Path $root 'lib\Settle.ps1')
+. (Join-Path $root 'lib\Manifest.ps1')
+. (Join-Path $root 'lib\Conflicts.ps1')
+. (Join-Path $root 'lib\Actions.ps1')
+
+# Logging.ps1 is deliberately not re-sourced here: it resets $script:LogPath to
+# the production log on load, which would undo the redirect set at the top.
+Set-LogPath $script:TestLog
+
+$engineRoot = Join-Path $testDir 'scratch_engine'
+
+function New-TestLink {
+    <#
+        A scratch link with both sides empty and no manifest.
+        SettleMinutes 0 so files are eligible the moment they are written.
+    #>
+    param([string] $Id = 'eng', [int] $MaxDelete = 50)
+
+    if (Test-Path $engineRoot) { Remove-Item -LiteralPath $engineRoot -Recurse -Force }
+    $L = Join-Path $engineRoot 'local'
+    $R = Join-Path $engineRoot 'remote'
+    $S = Join-Path $engineRoot 'state'
+    New-Item -ItemType Directory -Path $L, $R, $S -Force | Out-Null
+    # Seeded links must have a manifest (Repair-LinkManifest stops one without
+    # it); an empty one is the honest "no history yet" for these fixtures.
+    Write-Manifest -Path (Get-ManifestPath -LinkId $Id -StateRoot $S) -Entries @()
+
+    return [pscustomobject]@{
+        Link = [pscustomobject]@{
+            Id = $Id; LocalPath = $L; RemotePath = $R; Provider = 'Plain'
+            Seed = 'Local'; SettleMinutes = 0; MaxDelete = $MaxDelete
+            Dehydrate = $false; HydrateBeforeDelete = $false
+            Enabled = $true; Seeded = $true; LastRun = $null; LastResult = $null
+        }
+        Local = $L; Remote = $R; State = $S
+    }
+}
+
+function Set-TestFile {
+    param([string] $Path, [string] $Content, [datetime] $WriteUtc)
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    Set-Content -LiteralPath $Path -Value $Content -Encoding utf8 -NoNewline
+    if ($WriteUtc) { (Get-Item -LiteralPath $Path).LastWriteTimeUtc = $WriteUtc }
+    return (Get-Item -LiteralPath $Path)
+}
+
+function Write-TestManifest {
+    param([object] $Ctx, [object[]] $Entries)
+    Write-Manifest -Path (Get-ManifestPath -LinkId $Ctx.Link.Id -StateRoot $Ctx.State) -Entries $Entries
+}
+
+function Get-Action {
+    param([object] $Ctx, [string] $RelPath)
+    $items = Compare-LinkState -Link $Ctx.Link -ExcludePatterns @() -StateRoot $Ctx.State
+    $hit = $items | Where-Object { $_.RelPath -eq $RelPath }
+    if ($hit) { return $hit.Action }
+    return '<absent>'
+}
+
+# --- new on one side, no history ---
+$ctx = New-TestLink
+$null = Set-TestFile (Join-Path $ctx.Local 'a.txt') 'hello'
+Assert-Equal (Get-Action $ctx 'a.txt') 'CopyToRemote' "New local file classifies as CopyToRemote"
+
+$ctx = New-TestLink
+$null = Set-TestFile (Join-Path $ctx.Remote 'a.txt') 'hello'
+Assert-Equal (Get-Action $ctx 'a.txt') 'CopyToLocal' "New remote file classifies as CopyToLocal"
+
+# --- present both sides, identical, no history: adopt rather than conflict ---
+$ctx = New-TestLink
+$when = (Get-Date).ToUniversalTime().AddHours(-1)
+$null = Set-TestFile (Join-Path $ctx.Local  'a.txt') 'same' $when
+$null = Set-TestFile (Join-Path $ctx.Remote 'a.txt') 'same' $when
+Assert-Equal (Get-Action $ctx 'a.txt') 'InSync' "Identical files with no manifest are adopted as InSync"
+
+# --- present both sides, differing, no history: genuine disagreement ---
+$ctx = New-TestLink
+$null = Set-TestFile (Join-Path $ctx.Local  'a.txt') 'left'  $when
+$null = Set-TestFile (Join-Path $ctx.Remote 'a.txt') 'right' $when.AddMinutes(5)
+Assert-Equal (Get-Action $ctx 'a.txt') 'Conflict' "Differing files with no manifest classify as Conflict"
+
+# --- changed on both sides since the manifest ---
+$ctx = New-TestLink
+$lf = Set-TestFile (Join-Path $ctx.Local  'a.txt') 'local-new'  $when.AddMinutes(10)
+$rf = Set-TestFile (Join-Path $ctx.Remote 'a.txt') 'remote-new' $when.AddMinutes(20)
+Write-TestManifest $ctx @([pscustomobject]@{
+    RelPath = 'a.txt'
+    LocalLength = 3; LocalWriteUtc = $when
+    OdLength    = 3; OdWriteUtc    = $when
+})
+Assert-Equal (Get-Action $ctx 'a.txt') 'Conflict' "Both sides changed since manifest classifies as Conflict"
+
+# --- deleted locally, remote unchanged: DeleteRemote (the 2026-08-07 regression) ---
+$ctx = New-TestLink
+$rf = Set-TestFile (Join-Path $ctx.Remote 'a.txt') 'kept' $when
+Write-TestManifest $ctx @([pscustomobject]@{
+    RelPath = 'a.txt'
+    LocalLength = $rf.Length; LocalWriteUtc = $rf.LastWriteTimeUtc
+    OdLength    = $rf.Length; OdWriteUtc    = $rf.LastWriteTimeUtc
+})
+Assert-Equal (Get-Action $ctx 'a.txt') 'DeleteRemote' "Deleted locally + remote unchanged classifies as DeleteRemote"
+
+# and it must actually apply, with a real path -- this is the exact failure that
+# reached production: a renamed property left $null bound to -Path.
+$res = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+Assert-Equal $res.Failed 0 "DeleteRemote applies without a parameter-binding failure"
+Assert-Equal $res.Deleted 1 "DeleteRemote removed exactly one file"
+Assert-True (-not (Test-Path -LiteralPath (Join-Path $ctx.Remote 'a.txt'))) "Remote file is gone after DeleteRemote"
+
+# --- deleted remotely, local unchanged: DeleteLocal ---
+$ctx = New-TestLink
+$lf = Set-TestFile (Join-Path $ctx.Local 'a.txt') 'kept' $when
+Write-TestManifest $ctx @([pscustomobject]@{
+    RelPath = 'a.txt'
+    LocalLength = $lf.Length; LocalWriteUtc = $lf.LastWriteTimeUtc
+    OdLength    = $lf.Length; OdWriteUtc    = $lf.LastWriteTimeUtc
+})
+Assert-Equal (Get-Action $ctx 'a.txt') 'DeleteLocal' "Deleted remotely + local unchanged classifies as DeleteLocal"
+
+# --- deleted remotely but edited locally: the edit wins, nothing is destroyed ---
+$ctx = New-TestLink
+$lf = Set-TestFile (Join-Path $ctx.Local 'a.txt') 'edited since' $when.AddMinutes(30)
+Write-TestManifest $ctx @([pscustomobject]@{
+    RelPath = 'a.txt'
+    LocalLength = 4; LocalWriteUtc = $when
+    OdLength    = 4; OdWriteUtc    = $when
+})
+Assert-Equal (Get-Action $ctx 'a.txt') 'DeletionConflict' "Deleted remotely but edited locally requires review"
+$res = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+Assert-Equal $res.Conflicts 1 "Deletion versus local edit is reported as a conflict"
+Assert-True (-not (Test-Path -LiteralPath (Join-Path $ctx.Remote 'a.txt'))) "Remote deletion is not undone"
+Assert-Equal (Get-Content -LiteralPath $lf.FullName -Raw) 'edited since' "Surviving local edit is preserved"
+
+# A timestamp-only remote change must not resurrect a deleted working folder.
+$ctx = New-TestLink
+$rf = Set-TestFile (Join-Path $ctx.Remote 'Claude\a.txt') 'unchanged content' $when.AddSeconds(3)
+Write-TestManifest $ctx @([pscustomobject]@{
+    RelPath = 'Claude\a.txt'; LocalLength = $rf.Length; LocalWriteUtc = $when
+    OdLength = $rf.Length; OdWriteUtc = $when
+})
+Assert-Equal (Get-Action $ctx 'Claude\a.txt') 'DeletionConflict' "Timestamp-only remote change requires review after local deletion"
+$baselineBefore = Get-Content -LiteralPath (Get-ManifestPath -LinkId $ctx.Link.Id -StateRoot $ctx.State) -Raw
+$res = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+Assert-Equal $res.Applied 0 "Deletion conflict applies no copy or delete"
+Assert-Equal $res.Conflicts 1 "Deletion conflict counts as needs attention"
+Assert-True (-not (Test-Path -LiteralPath (Join-Path $ctx.Local 'Claude'))) "Deleted local folder stays deleted"
+Assert-Equal (Get-Content -LiteralPath $rf.FullName -Raw) 'unchanged content' "Remote content is preserved for review"
+Assert-Equal $res.DeletionConflicts[0].DeletedSide 'Local' "Review identifies the deleted side"
+Assert-Equal $res.DeletionConflicts[0].SurvivingPath $rf.FullName "Review includes the surviving file path"
+Assert-Equal (Get-Action $ctx 'Claude\a.txt') 'DeletionConflict' "Unresolved conflict persists across passes"
+Assert-Equal (Get-Content -LiteralPath (Get-ManifestPath -LinkId $ctx.Link.Id -StateRoot $ctx.State) -Raw) $baselineBefore "Conflict retains the previous baseline"
+Assert-Equal @(Get-LinkDeletionConflicts -Link $ctx.Link -StateRoot $ctx.State).Count 1 "Live dashboard inventory finds the deletion conflict"
+$null = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State -WhatIf
+Assert-Equal (Get-Content -LiteralPath (Get-ManifestPath -LinkId $ctx.Link.Id -StateRoot $ctx.State) -Raw) $baselineBefore "WhatIf preserves the conflict baseline"
+Assert-True (-not (Test-Path -LiteralPath (Join-Path $ctx.Local 'Claude'))) "WhatIf does not restore a deletion conflict"
+. (Join-Path $root 'lib\Pass.ps1')
+Write-PassSummary -Outcome ([pscustomobject]@{ Results=@($res) }) -StateRoot $ctx.State
+$conflictSummary = Read-PassSummary -StateRoot $ctx.State
+Assert-Equal @($conflictSummary.DeletionConflicts).Count 1 "Single deletion conflict survives summary JSON as an array"
+Assert-Equal $conflictSummary.DeletionConflicts[0].SurvivingPath $rf.FullName "Summary retains the review path"
+# Explicitly discarding the survivor resolves the conflict without recreation.
+Remove-Item -LiteralPath $rf.FullName -Force
+Assert-Equal (Get-Action $ctx 'Claude\a.txt') 'Forget' "Deleting the survivor resolves a deletion conflict"
+Assert-Equal @(Get-LinkDeletionConflicts -Link $ctx.Link -StateRoot $ctx.State).Count 0 "Resolved conflict leaves live review inventory"
+
+# Copies planned before a deletion must recheck the destination.
+$ctx = New-TestLink
+$lf = Set-TestFile (Join-Path $ctx.Local 'folder\a.txt') 'old' $when
+$rf = Set-TestFile (Join-Path $ctx.Remote 'folder\a.txt') 'remote edit' $when.AddMinutes(1)
+Write-TestManifest $ctx @([pscustomobject]@{
+    RelPath='folder\a.txt'; LocalLength=$lf.Length; LocalWriteUtc=$when
+    OdLength=$lf.Length; OdWriteUtc=$when
+})
+$planned = (Compare-LinkState -Link $ctx.Link -StateRoot $ctx.State)[0]
+Assert-Equal $planned.Action 'CopyToLocal' "Remote edit is planned while both sides still exist"
+Remove-Item -LiteralPath $lf.FullName -Force
+Assert-True (-not (Invoke-CopyToLocal -Item $planned -Link $ctx.Link -Dehydrate $false)) "Copy planned before local deletion is deferred"
+Assert-True (-not (Test-Path -LiteralPath $lf.FullName)) "Deferred copy does not resurrect deleted destination"
+
+# Delete a folder after planning an incoming new file in that folder.
+$lf = Set-TestFile (Join-Path $ctx.Local 'folder\keep.txt') 'keep' $when
+$null = Set-TestFile (Join-Path $ctx.Remote 'folder\new.txt') 'new remote file' $when
+$plannedItems = Compare-LinkState -Link $ctx.Link -StateRoot $ctx.State
+$planned = $plannedItems | Where-Object RelPath -eq 'folder\new.txt'
+$folderToDelete = [IO.Path]::GetFullPath((Join-Path $ctx.Local 'folder'))
+if (-not $folderToDelete.StartsWith(([IO.Path]::GetFullPath($engineRoot) + '\'), [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe test deletion' }
+Remove-Item -LiteralPath $folderToDelete -Recurse -Force
+Assert-True (-not (Invoke-CopyToLocal -Item $planned -Link $ctx.Link -Dehydrate $false)) "Incoming new file is deferred when its planned parent was deleted"
+Assert-True (-not (Test-Path -LiteralPath $folderToDelete)) "Deleted parent is not recreated for a queued new file"
+
+# Inject a deletion after the temp copy, before replacement.
+$ctx = New-TestLink
+$lf = Set-TestFile (Join-Path $ctx.Local 'a.txt') 'old' $when
+$rf = Set-TestFile (Join-Path $ctx.Remote 'a.txt') 'remote edit' $when.AddMinutes(1)
+Write-TestManifest $ctx @([pscustomobject]@{
+    RelPath='a.txt'; LocalLength=$lf.Length; LocalWriteUtc=$when
+    OdLength=$lf.Length; OdWriteUtc=$when
+})
+$planned = (Compare-LinkState -Link $ctx.Link -StateRoot $ctx.State)[0]
+$script:DeleteDuringCopy = $lf.FullName
+function Copy-Item {
+    param($LiteralPath, $Destination, [switch]$Force)
+    Microsoft.PowerShell.Management\Copy-Item -LiteralPath $LiteralPath -Destination $Destination -Force:$Force
+    Remove-Item -LiteralPath $script:DeleteDuringCopy -Force
+}
+try {
+    Assert-True (-not (Invoke-CopyToLocal -Item $planned -Link $ctx.Link -Dehydrate $false)) "Deletion during temp copy is detected before replacement"
+    Assert-True (-not (Test-Path -LiteralPath $lf.FullName)) "Deletion during copy stays deleted"
+    Assert-True (-not (Test-Path -LiteralPath ($lf.FullName + '.driverelay.tmp'))) "Deferred temp copy is cleaned up"
+} finally { Remove-Item Function:\Copy-Item; $script:DeleteDuringCopy = $null }
+
+# The same guard protects a deletion on the remote side.
+$ctx = New-TestLink
+$lf = Set-TestFile (Join-Path $ctx.Local 'a.txt') 'local edit' $when.AddMinutes(1)
+$rf = Set-TestFile (Join-Path $ctx.Remote 'a.txt') 'old' $when
+Write-TestManifest $ctx @([pscustomobject]@{
+    RelPath='a.txt'; LocalLength=$rf.Length; LocalWriteUtc=$when
+    OdLength=$rf.Length; OdWriteUtc=$when
+})
+$planned = (Compare-LinkState -Link $ctx.Link -StateRoot $ctx.State)[0]
+Remove-Item -LiteralPath $rf.FullName -Force
+Assert-True (-not (Invoke-CopyToRemote -Item $planned -Link $ctx.Link -Dehydrate $false)) "Copy planned before remote deletion is deferred"
+Assert-True (-not (Test-Path -LiteralPath $rf.FullName)) "Queued outgoing copy does not undo remote deletion"
+
+# Deliberately restoring the survivor resolves a deletion conflict.
+$null = Set-TestFile $rf.FullName 'old' $when
+Remove-Item -LiteralPath $lf.FullName -Force
+(Get-Item -LiteralPath $rf.FullName).LastWriteTimeUtc = $when.AddMinutes(1)
+Assert-Equal (Get-Action $ctx 'a.txt') 'DeletionConflict' "Changed survivor requires review"
+$null = Set-TestFile $lf.FullName 'old' $when.AddMinutes(1)
+$null = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+Assert-Equal (Get-Action $ctx 'a.txt') 'InSync' "Explicit restore resolves the deletion conflict after sync"
+
+# --- gone from both sides but still in the manifest ---
+$ctx = New-TestLink
+Write-TestManifest $ctx @([pscustomobject]@{
+    RelPath = 'a.txt'
+    LocalLength = 4; LocalWriteUtc = $when
+    OdLength    = 4; OdWriteUtc    = $when
+})
+Assert-Equal (Get-Action $ctx 'a.txt') 'Forget' "Absent from both sides classifies as Forget"
+
+# --- exclude patterns are honoured ---
+$ctx = New-TestLink
+$null = Set-TestFile (Join-Path $ctx.Local '~$book.xlsx') 'lock'
+$excluded = Compare-LinkState -Link $ctx.Link -ExcludePatterns @('~$*') -StateRoot $ctx.State
+Assert-Equal @($excluded).Count 0 "Excluded file is not classified at all"
+
+# ------------------------------------------------- 7. MaxDelete abort gate ---
+Write-Host "7. Testing MaxDelete abort (lib/Actions.ps1)" -ForegroundColor Yellow
+
+$ctx = New-TestLink -MaxDelete 2
+$entries = @()
+foreach ($n in 1..5) {
+    $f = Set-TestFile (Join-Path $ctx.Remote "f$n.txt") "content$n" $when
+    $entries += [pscustomobject]@{
+        RelPath = "f$n.txt"
+        LocalLength = $f.Length; LocalWriteUtc = $f.LastWriteTimeUtc
+        OdLength    = $f.Length; OdWriteUtc    = $f.LastWriteTimeUtc
+    }
+}
+Write-TestManifest $ctx $entries
+
+$res = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+Assert-True $res.Aborted "5 deletions against MaxDelete 2 aborts the pass"
+Assert-Equal $res.Deleted 0 "Aborted pass deleted nothing"
+Assert-Equal @(Get-ChildItem -LiteralPath $ctx.Remote -File).Count 5 "All 5 files still on disk after the abort"
+
+# The cap must be a whole-pass gate, not a per-file one: exactly at the limit
+# it proceeds.
+$ctx2 = New-TestLink -MaxDelete 5
+$entries2 = @()
+foreach ($n in 1..5) {
+    $f = Set-TestFile (Join-Path $ctx2.Remote "f$n.txt") "content$n" $when
+    $entries2 += [pscustomobject]@{
+        RelPath = "f$n.txt"
+        LocalLength = $f.Length; LocalWriteUtc = $f.LastWriteTimeUtc
+        OdLength    = $f.Length; OdWriteUtc    = $f.LastWriteTimeUtc
+    }
+}
+Write-TestManifest $ctx2 $entries2
+$res2 = Invoke-LinkSync -Link $ctx2.Link -ExcludePatterns @() -StateRoot $ctx2.State
+Assert-True (-not $res2.Aborted) "Exactly MaxDelete deletions is allowed to proceed"
+Assert-Equal $res2.Deleted 5 "All 5 deletions applied at the limit"
+
+# ----------------------------------------------------- 8. Conflict forking ---
+Write-Host "8. Testing conflict fork keeps both versions" -ForegroundColor Yellow
+
+$ctx = New-TestLink
+$null = Set-TestFile (Join-Path $ctx.Local  'doc.txt') 'LOCAL VERSION'  $when.AddMinutes(10)
+$null = Set-TestFile (Join-Path $ctx.Remote 'doc.txt') 'REMOTE VERSION' $when.AddMinutes(20)
+Write-TestManifest $ctx @([pscustomobject]@{
+    RelPath = 'doc.txt'
+    LocalLength = 3; LocalWriteUtc = $when
+    OdLength    = 3; OdWriteUtc    = $when
+})
+
+$res = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+Assert-Equal $res.Conflicts 1 "Conflict was forked, not resolved"
+
+$forks = @(Get-ChildItem -LiteralPath $ctx.Local -File | Where-Object { $_.Name -like '*conflict*' })
+Assert-Equal $forks.Count 1 "A conflict copy was written beside the local file"
+. (Join-Path $root 'lib\Conflicts.ps1')
+$actualForkCopies = @(Get-LinkConflictCopies -Link $ctx.Link)
+Assert-Equal $actualForkCopies.Count 1 "Duplicate inventory finds the copy created by the real conflict action"
+Assert-Equal $actualForkCopies[0].OriginalRelPath 'doc.txt' "Real conflict copy is paired with its original filename"
+if ($forks.Count -eq 1) {
+    Assert-Equal (Get-Content -LiteralPath $forks[0].FullName -Raw) 'REMOTE VERSION' "Conflict copy holds the remote version"
+}
+Assert-Equal (Get-Content -LiteralPath (Join-Path $ctx.Local 'doc.txt') -Raw) 'LOCAL VERSION' "Local file still holds the local version"
+Assert-Equal (Get-Content -LiteralPath (Join-Path $ctx.Remote 'doc.txt') -Raw) 'LOCAL VERSION' "Remote side now carries the local version"
+
+# ----------------------------------------- 8b. Emptied folders are removed ---
+# The snapshot is files-only, so without an explicit prune a deleted folder's
+# files vanish and the folder itself stays behind as an empty shell.
+Write-Host "8b. Testing emptied-folder cleanup (lib/Actions.ps1)" -ForegroundColor Yellow
+
+function New-RemoteFolderDeletion {
+    <#
+        Remote-only tree with a manifest saying every file was in sync, so the
+        next pass classifies all of them as DeleteRemote.
+    #>
+    param([string[]] $RelPaths)
+
+    $c = New-TestLink
+    $ents = @()
+    foreach ($rel in $RelPaths) {
+        $f = Set-TestFile (Join-Path $c.Remote $rel) "x" $when
+        $ents += [pscustomobject]@{
+            RelPath = $rel
+            LocalLength = $f.Length; LocalWriteUtc = $f.LastWriteTimeUtc
+            OdLength    = $f.Length; OdWriteUtc    = $f.LastWriteTimeUtc
+        }
+    }
+    Write-TestManifest $c $ents
+    return $c
+}
+
+$ctx = New-RemoteFolderDeletion @('company\a.txt', 'company\b.txt')
+$res = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+Assert-Equal $res.Deleted 2 "Both files in the folder were deleted"
+Assert-True (-not (Test-Path -LiteralPath (Join-Path $ctx.Remote 'company'))) "The emptied folder is removed, not left behind"
+Assert-True (Test-Path -LiteralPath $ctx.Remote) "The link root survives even when it ends up empty"
+
+# Nested: a parent whose only remaining child is a folder emptied by the same
+# pass must also go, which is why the prune runs deepest-first.
+$ctx = New-RemoteFolderDeletion @('2023\company\a.txt')
+$res = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+Assert-True (-not (Test-Path -LiteralPath (Join-Path $ctx.Remote '2023\company'))) "Emptied leaf folder is removed"
+Assert-True (-not (Test-Path -LiteralPath (Join-Path $ctx.Remote '2023'))) "Parent left empty by the same pass is removed too"
+
+# A folder still holding a file the pass did not delete must stay.
+$ctx = New-RemoteFolderDeletion @('company\a.txt')
+$null = Set-TestFile (Join-Path $ctx.Remote 'company\keep.txt') 'untracked'
+$res = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+Assert-True (Test-Path -LiteralPath (Join-Path $ctx.Remote 'company')) "Folder with a surviving file is kept"
+
+# An empty folder the user made by hand is not this pass's business.
+$ctx = New-RemoteFolderDeletion @('company\a.txt')
+$byHand = Join-Path $ctx.Remote 'made-by-hand'
+New-Item -ItemType Directory -Path $byHand -Force | Out-Null
+$res = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+Assert-True (Test-Path -LiteralPath $byHand) "A pre-existing empty folder is left alone"
+
+# --------------------------------------------------- 9. Manifest round-trip ---
+Write-Host "9. Testing manifest serialisation (lib/Manifest.ps1)" -ForegroundColor Yellow
+
+$mfPath = Join-Path $testDir 'test-manifest.json'
+if (Test-Path $mfPath) { Remove-Item -LiteralPath $mfPath -Force }
+if (Test-Path "$mfPath.bak") { Remove-Item -LiteralPath "$mfPath.bak" -Force }
+
+# Empty must serialise as [] and read back as nothing -- not as null, and not as
+# a file the next pass reads as "everything is new".
+Write-Manifest -Path $mfPath -Entries @()
+Assert-Equal (Get-Content -LiteralPath $mfPath -Raw).Trim() '[]' "Empty manifest serialises as []"
+Assert-Equal (Read-Manifest -Path $mfPath).Count 0 "Empty manifest reads back as zero entries"
+
+# A single entry must not collapse into a bare object that reloads wrongly.
+$stamp = [datetime]::SpecifyKind((Get-Date '2026-01-02 03:04:05'), 'Utc')
+Write-Manifest -Path $mfPath -Entries @([pscustomobject]@{
+    RelPath = 'one.txt'; LocalLength = 11; LocalWriteUtc = $stamp
+    OdLength = 11;       OdWriteUtc  = $stamp
+})
+$back = Read-Manifest -Path $mfPath
+Assert-Equal $back.Count 1 "Single-entry manifest reads back as one entry"
+Assert-Equal $back['one.txt'].LocalLength 11 "Round-tripped length survives"
+Assert-Equal $back['one.txt'].LocalWriteUtc.ToUniversalTime().ToString('s') $stamp.ToString('s') "Round-tripped timestamp survives"
+
+# Two entries, and lookup is case-insensitive on the key.
+Write-Manifest -Path $mfPath -Entries @(
+    [pscustomobject]@{ RelPath = 'Sub\Two.txt'; LocalLength = 1; LocalWriteUtc = $stamp; OdLength = 1; OdWriteUtc = $stamp }
+    [pscustomobject]@{ RelPath = 'three.txt';   LocalLength = 2; LocalWriteUtc = $stamp; OdLength = 2; OdWriteUtc = $stamp }
+)
+$back2 = Read-Manifest -Path $mfPath
+Assert-Equal $back2.Count 2 "Two-entry manifest reads back as two entries"
+Assert-True ($null -ne $back2['sub\two.txt']) "Manifest keys are lower-cased for lookup"
+
+if (Test-Path $mfPath) { Remove-Item -LiteralPath $mfPath -Force }
+if (Test-Path "$mfPath.bak") { Remove-Item -LiteralPath "$mfPath.bak" -Force }
+
+# ---------------------------------------------------------- 9b. Moves ---
+Write-Host '9b. Testing moves and renames without copying' -ForegroundColor Yellow
+
+function New-MoveTest {
+    $context = New-TestLink -MaxDelete 0
+    $null = Set-TestFile (Join-Path $context.Local 'old\a.txt') 'move me' ([datetime]::UtcNow.AddMinutes(-10))
+    $null = Invoke-LinkSync -Link $context.Link -StateRoot $context.State
+    return $context
+}
+
+foreach ($direction in @('Remote', 'Local')) {
+    $ctx = New-MoveTest
+    $origin = if ($direction -eq 'Remote') { $ctx.Local } else { $ctx.Remote }
+    $target = if ($direction -eq 'Remote') { $ctx.Remote } else { $ctx.Local }
+    $beforeId = Get-FileIdentity (Join-Path $target 'old\a.txt')
+    Assert-True ([bool]$beforeId) "NTFS identity is available for $direction move test"
+    New-Item -ItemType Directory -Path (Join-Path $origin 'new') | Out-Null
+    Move-Item -LiteralPath (Join-Path $origin 'old\a.txt') -Destination (Join-Path $origin 'new\renamed.txt')
+    $items = Compare-LinkState -Link $ctx.Link -StateRoot $ctx.State
+    Assert-Equal $items.Count 1 "$direction move replaces the copy/delete pair"
+    Assert-Equal $items[0].Action "Move$direction" "$direction move classifies in the correct direction"
+    Assert-Equal $items[0].OldRelPath 'old\a.txt' "$direction move reports its previous path"
+    $manifestPath = Get-ManifestPath -LinkId $ctx.Link.Id -StateRoot $ctx.State
+    $baseline = Get-Content -LiteralPath $manifestPath -Raw
+    $dry = Invoke-LinkSync -Link $ctx.Link -StateRoot $ctx.State -WhatIf
+    Assert-True (Test-Path -LiteralPath (Join-Path $target 'old\a.txt')) "$direction WhatIf preserves the old file"
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $target 'new'))) "$direction WhatIf creates no destination directory"
+    Assert-Equal (Get-Content -LiteralPath $manifestPath -Raw) $baseline "$direction WhatIf preserves the baseline"
+    $res = Invoke-LinkSync -Link $ctx.Link -StateRoot $ctx.State
+    Assert-True (-not $res.Aborted) "$direction move is allowed with MaxDelete zero"
+    Assert-Equal $res.Moved 1 "$direction move is applied once"
+    Assert-Equal $res.Deleted 0 "$direction move deletes no content"
+    Assert-Equal $res.Failed 0 "$direction move succeeds"
+    Write-PassSummary -Outcome ([pscustomobject]@{ Results = @($res) }) -StateRoot $ctx.State
+    Assert-Equal (Read-PassSummary -StateRoot $ctx.State).Moved 1 "$direction move count survives pass summary serialization"
+    Assert-Equal (Get-FileIdentity (Join-Path $target 'new\renamed.txt')) $beforeId "$direction counterpart keeps its ID, proving it was moved rather than copied"
+    Assert-Equal (Get-Content -LiteralPath (Join-Path $target 'new\renamed.txt') -Raw) 'move me' "$direction moved content survives"
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $target 'old'))) "$direction old folder is pruned"
+    $back = Read-Manifest -Path $manifestPath
+    Assert-True (-not $back.ContainsKey('old\a.txt')) "$direction successful move forgets the old baseline"
+    Assert-True ([bool]$back['new\renamed.txt'].LocalFileId -and [bool]$back['new\renamed.txt'].OdFileId) "$direction new baseline retains both identities"
+    Assert-Equal (Get-Action $ctx 'new\renamed.txt') 'InSync' "$direction next pass is in sync"
+}
+
+# Moving a populated directory is a set of file moves, even with equal metadata.
+$ctx = New-MoveTest
+$stamp = (Get-Item -LiteralPath (Join-Path $ctx.Local 'old\a.txt')).LastWriteTimeUtc
+$null = Set-TestFile (Join-Path $ctx.Local 'old\b.txt') 'same sz' $stamp
+$null = Invoke-LinkSync -Link $ctx.Link -StateRoot $ctx.State
+$idA = Get-FileIdentity (Join-Path $ctx.Remote 'old\a.txt')
+$idB = Get-FileIdentity (Join-Path $ctx.Remote 'old\b.txt')
+Move-Item -LiteralPath (Join-Path $ctx.Local 'old') -Destination (Join-Path $ctx.Local 'renamed')
+$res = Invoke-LinkSync -Link $ctx.Link -StateRoot $ctx.State
+Assert-Equal $res.Moved 2 'Populated folder rename moves all unchanged files'
+Assert-Equal (Get-FileIdentity (Join-Path $ctx.Remote 'renamed\a.txt')) $idA 'Equal metadata does not confuse first file identity'
+Assert-Equal (Get-FileIdentity (Join-Path $ctx.Remote 'renamed\b.txt')) $idB 'Equal metadata does not confuse second file identity'
+
+# Ordinary delete + unrelated new file must not be mistaken for a move.
+$ctx = New-MoveTest
+$stamp = (Get-Item -LiteralPath (Join-Path $ctx.Local 'old\a.txt')).LastWriteTimeUtc
+Remove-Item -LiteralPath (Join-Path $ctx.Local 'old\a.txt')
+$null = Set-TestFile (Join-Path $ctx.Local 'new.txt') 'new one' $stamp
+$items = Compare-LinkState -Link $ctx.Link -StateRoot $ctx.State
+Assert-Equal @($items | Where-Object Action -like 'Move*').Count 0 'Equal size/time alone never proves a move'
+$res = Invoke-LinkSync -Link $ctx.Link -StateRoot $ctx.State
+Assert-True $res.Aborted 'Unproven move retains the ordinary delete cap'
+
+# Replan safety: neither a changed counterpart nor a new destination is moved.
+foreach ($change in @('edit', 'replace', 'collision', 'parent', 'origin', 'restore')) {
+    $ctx = New-MoveTest
+    New-Item -ItemType Directory -Path (Join-Path $ctx.Remote 'new') | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $ctx.Local 'new') | Out-Null
+    Move-Item -LiteralPath (Join-Path $ctx.Local 'old\a.txt') -Destination (Join-Path $ctx.Local 'new\a.txt')
+    $item = (Compare-LinkState -Link $ctx.Link -StateRoot $ctx.State)[0]
+    $oldTarget = Join-Path $ctx.Remote 'old\a.txt'
+    $newTarget = Join-Path $ctx.Remote 'new\a.txt'
+    switch ($change) {
+        'edit' { $null = Set-TestFile $oldTarget 'edited counterpart' }
+        'replace' {
+            Move-Item -LiteralPath $oldTarget -Destination (Join-Path $ctx.Remote 'saved.txt')
+            $null = Set-TestFile $oldTarget 'move me' $item.MoveSource.WriteUtc
+        }
+        'collision' { $null = Set-TestFile $newTarget 'independent destination' }
+        'parent' { Remove-Item -LiteralPath (Join-Path $ctx.Remote 'new') }
+        'origin' { $null = Set-TestFile (Join-Path $ctx.Local 'new\a.txt') 'edited moved file' }
+        'restore' { $null = Set-TestFile (Join-Path $ctx.Local 'old\a.txt') 'restored file' }
+    }
+    Assert-True (-not (Invoke-FileMove -Item $item -Link $ctx.Link)) "Queued move defers after $change"
+    Assert-True (Test-Path -LiteralPath $oldTarget) "Queued $change keeps counterpart at the old path"
+    if ($change -eq 'collision') {
+        Assert-Equal (Get-Content -LiteralPath $newTarget -Raw) 'independent destination' 'Move never overwrites a colliding file'
+    }
+    if ($change -eq 'parent') {
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $ctx.Remote 'new'))) 'Move does not recreate a deleted planned parent'
+    }
+}
+
+$ctx = New-MoveTest
+Move-Item -LiteralPath (Join-Path $ctx.Local 'old\a.txt') -Destination (Join-Path $ctx.Local 'new.txt')
+$item = (Compare-LinkState -Link $ctx.Link -StateRoot $ctx.State)[0]
+$locked = [IO.File]::Open($item.MoveSource.FullPath, 'Open', 'Read', 'None')
+try {
+    Assert-True (-not (Test-ActionReady -Item $item -SettleMinutes 0).Ready) 'Locked counterpart defers a move'
+    $res = Invoke-LinkSync -Link $ctx.Link -StateRoot $ctx.State
+    Assert-Equal $res.Moved 0 'Locked move is not applied'
+    Assert-True (Test-Path -LiteralPath $item.MoveSource.FullPath) 'Locked move preserves the counterpart'
+} finally { $locked.Dispose() }
+
+# Old manifests need one successful ordinary pass to populate IDs.
+$ctx = New-MoveTest
+$manifestPath = Get-ManifestPath -LinkId $ctx.Link.Id -StateRoot $ctx.State
+$legacy = @(ConvertFrom-Json -InputObject (Get-Content -LiteralPath $manifestPath -Raw) | Select-Object RelPath,LocalLength,LocalWriteUtc,OdLength,OdWriteUtc)
+ConvertTo-Json -InputObject $legacy | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+Move-Item -LiteralPath (Join-Path $ctx.Local 'old\a.txt') -Destination (Join-Path $ctx.Local 'new.txt')
+Assert-Equal (Get-Action $ctx 'new.txt') 'CopyToRemote' 'Legacy baseline without IDs falls back to normal copying'
+
+$ctx = New-MoveTest
+Move-Item -LiteralPath (Join-Path $ctx.Local 'old\a.txt') -Destination (Join-Path $ctx.Local 'new.txt')
+$null = Set-TestFile (Join-Path $ctx.Remote 'old\a.txt') 'remote edit'
+Assert-Equal (Get-Action $ctx 'old\a.txt') 'DeletionConflict' 'Move versus counterpart edit preserves the survivor for review'
+Assert-Equal (Get-Action $ctx 'new.txt') 'CopyToRemote' 'Move versus edit is not optimized into a destructive move'
+
+$ctx = New-MoveTest
+Move-Item -LiteralPath (Join-Path $ctx.Local 'old\a.txt') -Destination (Join-Path $ctx.Local 'new.txt')
+$null = Set-TestFile (Join-Path $ctx.Local 'new.txt') 'edited after moving'
+Assert-Equal (Get-Action $ctx 'new.txt') 'CopyToRemote' 'Moving and editing falls back to copying the new content'
+
+$ctx = New-MoveTest
+Move-Item -LiteralPath (Join-Path $ctx.Local 'old\a.txt') -Destination (Join-Path $ctx.Local 'new.txt')
+$ctx.Link.SettleMinutes = 60
+$res = Invoke-LinkSync -Link $ctx.Link -StateRoot $ctx.State
+Assert-Equal $res.Deferred 1 'Unsettled move is deferred as one operation'
+$back = Read-Manifest -Path (Get-ManifestPath -LinkId $ctx.Link.Id -StateRoot $ctx.State)
+Assert-True ($back.ContainsKey('old\a.txt') -and -not $back.ContainsKey('new.txt')) 'Deferred move retains the old baseline and does not adopt the new path'
+$ctx.Link.SettleMinutes = 0
+$res = Invoke-LinkSync -Link $ctx.Link -StateRoot $ctx.State
+Assert-Equal $res.Moved 1 'Deferred move succeeds on a later eligible pass'
+
+# A hard link has multiple names for one identity: never infer which name moved.
+$ctx = New-MoveTest
+try {
+    $null = New-Item -ItemType HardLink -Path (Join-Path $ctx.Local 'alias.txt') -Target (Join-Path $ctx.Local 'old\a.txt')
+    $canTestHardLink = $true
+} catch {
+    $canTestHardLink = $false
+    Write-Host '  [SKIP] This environment does not permit creating hard links' -ForegroundColor DarkYellow
+}
+if ($canTestHardLink) {
+    Move-Item -LiteralPath (Join-Path $ctx.Local 'old\a.txt') -Destination (Join-Path $ctx.Local 'new.txt')
+    Assert-True (-not (Get-FileIdentity (Join-Path $ctx.Local 'new.txt'))) 'Hard-linked file does not supply an ambiguous move identity'
+    Assert-Equal (Get-Action $ctx 'new.txt') 'CopyToRemote' 'Hard-linked move falls back to ordinary classification'
+}
+
+# The native rename itself refuses overwrites, even after planning checks.
+$source = Join-Path $ctx.Remote 'old\a.txt'
+$destination = Join-Path $ctx.Remote 'occupied.txt'
+$null = Set-TestFile $destination 'keep this'
+$rejected = $false
+try { [DriveRelay.FileIdentity]::Move($source, $destination) } catch { $rejected = $true }
+Assert-True $rejected 'Native move rejects an existing destination'
+Assert-Equal (Get-Content -LiteralPath $destination -Raw) 'keep this' 'Native collision preserves destination content'
+Assert-True (Test-Path -LiteralPath $source) 'Native collision preserves source content'
+
+$ctx = New-MoveTest
+$manifestPath = Get-ManifestPath -LinkId $ctx.Link.Id -StateRoot $ctx.State
+$back = Read-Manifest -Path $manifestPath
+$duplicateId = $back['old\a.txt'].PSObject.Copy()
+$duplicateId.RelPath = 'other.txt'
+Write-TestManifest -Ctx $ctx -Entries @($back['old\a.txt'], $duplicateId)
+Move-Item -LiteralPath (Join-Path $ctx.Local 'old\a.txt') -Destination (Join-Path $ctx.Local 'new.txt')
+Assert-Equal (Get-Action $ctx 'new.txt') 'CopyToRemote' 'Ambiguous identity in history is never optimized into a move'
+
+# ------------------------------------------- 9c. Audit 2026-11-05 safeguards ---
+Write-Host "9c. Testing incomplete listings, delete re-checks and manifest commits" -ForegroundColor Yellow
+
+# --- an enumeration error must not read as deletions ---
+$ctx = New-TestLink
+$when = [datetime]::UtcNow.AddHours(-1)
+$lf = Set-TestFile (Join-Path $ctx.Local 'a.txt') 'kept' $when
+$rf = Set-TestFile (Join-Path $ctx.Remote 'a.txt') 'kept' $when
+Write-TestManifest $ctx @([pscustomobject]@{
+    RelPath = 'a.txt'
+    LocalLength = $lf.Length; LocalWriteUtc = $lf.LastWriteTimeUtc
+    OdLength    = $rf.Length; OdWriteUtc    = $rf.LastWriteTimeUtc
+})
+$script:FailListingUnder = $ctx.Remote
+function Get-ChildItem {
+    # Simulates a folder that cannot be listed (access denied, provider error):
+    # a non-terminating error and no files from the failing side.
+    [CmdletBinding()]
+    param([string] $LiteralPath, [switch] $Recurse, [switch] $File, [switch] $Force)
+    if ($LiteralPath -eq $script:FailListingUnder) {
+        Write-Error -Message 'simulated: access denied' -TargetObject (Join-Path $LiteralPath 'locked')
+        return
+    }
+    Microsoft.PowerShell.Management\Get-ChildItem -LiteralPath $LiteralPath -Recurse:$Recurse -File:$File -Force:$Force
+}
+try {
+    $threw = $false
+    try { $null = Get-SideSnapshot -Root $ctx.Remote -ExcludePatterns @() } catch { $threw = $true }
+    Assert-True $threw "A listing error makes the snapshot throw instead of returning a partial map"
+    $partial = Get-SideSnapshot -Root $ctx.Remote -ExcludePatterns @() -AllowPartial
+    Assert-Equal $partial.Count 0 "-AllowPartial returns what could be listed"
+    $threw = $false
+    try { $null = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State } catch { $threw = $true }
+    Assert-True $threw "A pass over an incompletely listed side stops before acting"
+} finally { Remove-Item Function:\Get-ChildItem; $script:FailListingUnder = $null }
+Assert-True (Test-Path -LiteralPath $lf.FullName) "The tracked local file is not deleted when the remote listing failed"
+
+# --- a delete is re-checked just before it is applied ---
+$ctx = New-TestLink
+$rf = Set-TestFile (Join-Path $ctx.Remote 'gone.txt') 'kept' $when
+$planned = (Get-SideSnapshot -Root $ctx.Remote -ExcludePatterns @())['gone.txt']
+$counterpart = Join-Path $ctx.Local 'gone.txt'
+Assert-True (Test-DeleteStillValid -Target $planned -CounterpartPath $counterpart) "An unchanged delete is still valid"
+$null = Set-TestFile $counterpart 'restored' $when
+Assert-True (-not (Test-DeleteStillValid -Target $planned -CounterpartPath $counterpart)) "A restored counterpart cancels the planned delete"
+Remove-Item -LiteralPath $counterpart -Force
+$null = Set-TestFile $rf.FullName 'edited since planning' ([datetime]::UtcNow)
+Assert-True (-not (Test-DeleteStillValid -Target $planned -CounterpartPath $counterpart)) "An edit since planning cancels the planned delete"
+
+# --- the manifest records what was reconciled, not later edits ---
+$t0 = [datetime]::UtcNow.AddHours(-2)
+$t1 = [datetime]::UtcNow.AddHours(-1)
+$plannedLocal  = [pscustomobject]@{ RelPath = 'a.txt'; Length = 4; WriteUtc = $t0; FileId = 'L1' }
+$plannedRemote = [pscustomobject]@{ RelPath = 'a.txt'; Length = 4; WriteUtc = $t0; FileId = 'R1' }
+$editedLocal   = [pscustomobject]@{ RelPath = 'a.txt'; Length = 9; WriteUtc = $t1; FileId = 'L1' }
+$copiedRemote  = [pscustomobject]@{ RelPath = 'a.txt'; Length = 4; WriteUtc = $t0; FileId = 'R2' }
+
+$e = Get-CommittedEntry -Item ([pscustomobject]@{ Action = 'InSync'; Local = $plannedLocal; Remote = $plannedRemote }) `
+                        -LocalNow $editedLocal -RemoteNow $plannedRemote
+Assert-Equal $e.LocalLength 4 "An InSync file edited during the pass keeps the reconciled local baseline"
+
+$e = Get-CommittedEntry -Item ([pscustomobject]@{ Action = 'CopyToRemote'; Local = $plannedLocal; Remote = $null }) `
+                        -LocalNow $editedLocal -RemoteNow $copiedRemote
+Assert-Equal $e.LocalLength 4 "A source edited after its copy is recorded as the version that was copied"
+Assert-Equal $e.OdFileId 'R2' "The copied destination is recorded as it is now"
+
+$e = Get-CommittedEntry -Item ([pscustomobject]@{ Action = 'CopyToRemote'; Local = $plannedLocal; Remote = $null }) `
+                        -LocalNow $plannedLocal -RemoteNow $editedLocal
+Assert-True ($null -eq $e) "A destination that no longer holds the copied version is not vouched for"
+
+# End to end: the edit made during the pass is relayed on the next one.
+$ctx = New-TestLink
+$lf = Set-TestFile (Join-Path $ctx.Local 'a.txt') 'one' $t0
+$script:EditDuringPass = $lf.FullName
+$script:RealCopyToRemote = ${function:Invoke-CopyToRemote}
+function Invoke-CopyToRemote {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([object] $Item, [object] $Link, [bool] $Dehydrate = $true)
+    $ok = & $script:RealCopyToRemote -Item $Item -Link $Link -Dehydrate $Dehydrate
+    Set-Content -LiteralPath $script:EditDuringPass -Value 'two, edited mid-pass' -Encoding utf8 -NoNewline
+    (Get-Item -LiteralPath $script:EditDuringPass).LastWriteTimeUtc = $t1
+    return $ok
+}
+try { $null = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State }
+finally { Set-Item -Path Function:\Invoke-CopyToRemote -Value $script:RealCopyToRemote; $script:EditDuringPass = $null }
+Assert-Equal (Get-Action $ctx 'a.txt') 'CopyToRemote' "A local edit made during the pass is still pending, not absorbed into the baseline"
+
+# --- a file stamped in the future is not deferred forever ---
+$future = Set-TestFile (Join-Path $engineRoot 'future.txt') 'from a fast clock' ([datetime]::UtcNow.AddDays(2))
+Assert-True (Test-FileSettled -Path $future.FullName -SettleMinutes 3) "A future last-write time counts as settled (the lock check still applies)"
+$recent = Set-TestFile (Join-Path $engineRoot 'recent.txt') 'just saved' ([datetime]::UtcNow)
+Assert-True (-not (Test-FileSettled -Path $recent.FullName -SettleMinutes 3)) "A file saved just now is still settling"
+
+# --- a reader holding the manifest does not block the pass replacing it ---
+$ctx = New-TestLink
+$mfShared = Get-ManifestPath -LinkId $ctx.Link.Id -StateRoot $ctx.State
+$heldReader = New-Object System.IO.FileStream -ArgumentList $mfShared, ([IO.FileMode]::Open), ([IO.FileAccess]::Read), ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+try {
+    $replaced = $true
+    try {
+        Write-Manifest -Path $mfShared -Entries @([pscustomobject]@{
+            RelPath = 'held.txt'; LocalLength = 1; LocalWriteUtc = $t0; OdLength = 1; OdWriteUtc = $t0 })
+    } catch { $replaced = $false }
+} finally { $heldReader.Dispose() }
+Assert-True $replaced "Write-Manifest succeeds while a shared reader holds the manifest"
+Assert-True ($null -ne (Read-Manifest -Path $mfShared)['held.txt']) "The replaced manifest is the new version"
+
+# --- seeding keeps the version it replaces ---
+$ctx = New-TestLink
+$ctx.Link.Seeded = $false
+$null = Set-TestFile (Join-Path $ctx.Local 'doc.txt') 'local version' $t1
+$null = Set-TestFile (Join-Path $ctx.Remote 'doc.txt') 'remote version, different' $t0
+$null = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+$kept = @(Get-ChildItem -LiteralPath $ctx.Remote -File | Where-Object { $_.Name -like 'doc (conflict from *' })
+Assert-Equal $kept.Count 1 "Seeding over a differing file keeps the replaced version as a conflict copy"
+if ($kept.Count -eq 1) {
+    Assert-Equal (Get-Content -LiteralPath $kept[0].FullName -Raw) 'remote version, different' "The conflict copy holds the replaced content"
+}
+Assert-Equal (Get-Content -LiteralPath (Join-Path $ctx.Remote 'doc.txt') -Raw) 'local version' "The seed side's version is current"
+
+# --- no Recycle Bin: deletes go to the holding folder, never vanish ---
+$ctx = New-TestLink
+$doomed = Set-TestFile (Join-Path $ctx.Remote 'sub\old.txt') 'recover me' $t0
+$script:RealRecycleTest = ${function:Test-RecycleBinVolume}
+function Test-RecycleBinVolume { param([string] $Path) return $false }
+try { $okDelete = Remove-FileSafely -Path $doomed.FullName -Root $ctx.Remote -RelPath 'sub\old.txt' -Confirm:$false }
+finally { Set-Item -Path Function:\Test-RecycleBinVolume -Value $script:RealRecycleTest }
+Assert-True $okDelete "A delete on a volume without a Recycle Bin succeeds"
+$held = @(Get-ChildItem -LiteralPath (Join-Path $ctx.Remote '.driverelay-deleted') -Recurse -File -Force -ErrorAction SilentlyContinue)
+Assert-Equal $held.Count 1 "The deleted file is kept under .driverelay-deleted"
+Assert-True ($held.Count -eq 1 -and $held[0].FullName -like '*\sub\old.txt') "The holding folder keeps the file's relative path"
+Assert-Equal (Get-SideSnapshot -Root $ctx.Remote -ExcludePatterns @()).Count 0 "The holding folder is never part of a snapshot"
+Assert-True (-not (Test-RecycleBinVolume -Path '\\server\share\x.txt')) "A UNC path is not treated as having a Recycle Bin"
+
+# --- junctions are not followed, and what lies under them is left alone ---
+$ctx = New-TestLink
+$outside = Join-Path $engineRoot 'outside'
+$null = Set-TestFile (Join-Path $outside 'secret.txt') 'not part of the link' $t0
+$junction = Join-Path $ctx.Local 'linked'
+$madeJunction = $false
+try { $null = New-Item -ItemType Junction -Path $junction -Target $outside -ErrorAction Stop; $madeJunction = $true } catch { }
+if ($madeJunction) {
+    $rf = Set-TestFile (Join-Path $ctx.Remote 'linked\secret.txt') 'not part of the link' $t0
+    Write-TestManifest $ctx @([pscustomobject]@{
+        RelPath = 'linked\secret.txt'
+        LocalLength = $rf.Length; LocalWriteUtc = $rf.LastWriteTimeUtc
+        OdLength    = $rf.Length; OdWriteUtc    = $rf.LastWriteTimeUtc
+    })
+    $skipped = New-Object 'System.Collections.Generic.List[string]'
+    $snap = Get-SideSnapshot -Root $ctx.Local -ExcludePatterns @() -SkippedLinks $skipped
+    Assert-Equal $snap.Count 0 "Files behind a junction are not listed"
+    Assert-Equal ($skipped -join ',') 'linked\' "The skipped junction is reported"
+    Assert-Equal (Get-Action $ctx 'linked\secret.txt') '<absent>' "A tracked path under a junction gets no action, not a delete"
+    $null = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+    Assert-True (Test-Path -LiteralPath $rf.FullName) "The remote counterpart of a junctioned file is not deleted"
+
+    # Seeding must not write through a junction on the destination side
+    # either: the remote has an ordinary folder where the local has a link.
+    $ctx.Link.Seeded = $false
+    $ctx.Link.Seed = 'Remote'
+    $null = Set-TestFile $rf.FullName 'remote version that must not escape' $t1
+    $null = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+    Assert-Equal (Get-Content -LiteralPath (Join-Path $outside 'secret.txt') -Raw) 'not part of the link' "Seeding does not overwrite a file behind a destination junction"
+    cmd.exe /c rmdir "$junction" | Out-Null
+} else {
+    Write-Host "  [SKIP] junction creation unavailable; junction checks not run" -ForegroundColor DarkYellow
+}
+
+# --- a seeded link with no usable history stops, or recovers from .bak ---
+$ctx = New-TestLink
+$lf = Set-TestFile (Join-Path $ctx.Local 'a.txt') 'kept' $t0
+$rf = Set-TestFile (Join-Path $ctx.Remote 'a.txt') 'kept' $t0
+$mf = Get-ManifestPath -LinkId $ctx.Link.Id -StateRoot $ctx.State
+Remove-Item -LiteralPath $mf -Force
+Remove-Item -LiteralPath "$mf.bak" -Force -ErrorAction SilentlyContinue
+$res = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+Assert-True $res.Aborted "A seeded link whose manifest is missing stops"
+Set-Content -LiteralPath $mf -Value '' -Encoding utf8
+$res = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+Assert-True $res.Aborted "A seeded link whose manifest is empty stops"
+Write-Manifest -Path $mf -Entries @([pscustomobject]@{
+    RelPath = 'a.txt'
+    LocalLength = $lf.Length; LocalWriteUtc = $lf.LastWriteTimeUtc
+    OdLength    = $rf.Length; OdWriteUtc    = $rf.LastWriteTimeUtc
+})
+Write-Manifest -Path $mf -Entries @()          # the earlier version is now .bak
+Assert-True (Test-Path -LiteralPath "$mf.bak") "Writing a manifest keeps the previous version as .bak"
+Set-Content -LiteralPath $mf -Value '' -Encoding utf8
+$res = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+Assert-True (-not $res.Aborted) "An unusable manifest is restored from .bak and the pass runs"
+Assert-True ($null -ne (Read-Manifest -Path $mf)['a.txt']) "The restored history is the intact .bak"
+
+# ------------------------------------------------------- 10. Availability ---
+# An unmounted drive, a deleted folder and a stopped cloud client all look like
+# "path missing" to Test-Path, but need different things done about them.
+Write-Host "10. Testing availability reporting (lib/Availability.ps1)" -ForegroundColor Yellow
+
+# Pick a drive letter that definitely is not mounted.
+# 90..82 is 'Z' down to 'R'. A string range ('Z'..'R') is an integer range in
+# PowerShell and throws on the cast.
+$freeLetter = $null
+foreach ($code in 90..82) {
+    $c = [char]$code
+    if (-not (Test-Path -LiteralPath ("{0}:\" -f $c))) { $freeLetter = $c; break }
+}
+
+$ctx = New-TestLink
+Assert-Equal (Get-LinkAvailability -Link $ctx.Link).State 'Ready' "Both folders present reports Ready"
+Assert-True (Get-LinkAvailability -Link $ctx.Link).Ok "Ready link is Ok to sync"
+
+if ($freeLetter) {
+    $offline = $ctx.Link.PSObject.Copy()
+    $offline.RemotePath = "{0}:\SomeFolder" -f $freeLetter
+    $a = Get-LinkAvailability -Link $offline
+    Assert-Equal $a.State 'DriveOffline' "Unmounted drive reports DriveOffline, not FolderMissing"
+    Assert-True $a.Blocking "DriveOffline blocks the pass"
+    Assert-True ($a.Summary -match [regex]::Escape("$freeLetter" + ':')) "DriveOffline summary names the drive"
+}
+else {
+    Write-Host "  [SKIP] no unmounted drive letter available to test DriveOffline" -ForegroundColor DarkYellow
+}
+
+# Drive mounted, folder gone -- a different diagnosis from the same Test-Path result.
+$gone = $ctx.Link.PSObject.Copy()
+$gone.RemotePath = Join-Path $ctx.Remote 'no-such-subfolder'
+$a2 = Get-LinkAvailability -Link $gone
+Assert-Equal $a2.State 'FolderMissing' "Missing folder on a mounted drive reports FolderMissing"
+Assert-True $a2.Blocking "FolderMissing blocks the pass"
+
+# No remote configured at all.
+$noRemote = $ctx.Link.PSObject.Copy()
+$noRemote.RemotePath = $null
+Assert-Equal (Get-LinkAvailability -Link $noRemote).State 'NoRemote' "Link with no remote path reports NoRemote"
+
+# A blocked link must abort cleanly rather than throwing, and touch nothing.
+$null = Set-TestFile (Join-Path $ctx.Local 'keepme.txt') 'data'
+$blockedRes = Invoke-LinkSync -Link $gone -ExcludePatterns @() -StateRoot $ctx.State
+Assert-True $blockedRes.Aborted "Unavailable link aborts the pass"
+Assert-Equal $blockedRes.State 'FolderMissing' "Abort result carries the availability state"
+Assert-Equal $blockedRes.Deleted 0 "Unavailable link deletes nothing"
+Assert-True (Test-Path -LiteralPath (Join-Path $ctx.Local 'keepme.txt')) "Local file untouched when the link is unavailable"
+
+# Drive detection itself.
+Assert-True (Test-DriveMounted -Path $ctx.Local) "Test-DriveMounted true for a real path"
+if ($freeLetter) {
+    Assert-True (-not (Test-DriveMounted -Path ("{0}:\anything" -f $freeLetter))) "Test-DriveMounted false for an unmounted letter"
+}
+
+# "I cannot tell" must not be reported as "not running".
+Assert-True ($null -eq (Test-CloudClientRunning -ProviderLabel 'Folder')) "Unknown provider returns null, not false"
+$odState = Test-CloudClientRunning -ProviderLabel 'OneDrive'
+Assert-True (($odState -eq $true) -or ($odState -eq $false)) "Known provider returns a definite true/false"
+
+if (Test-Path $engineRoot) { Remove-Item -LiteralPath $engineRoot -Recurse -Force -ErrorAction SilentlyContinue }
+
+# ------------------------------------------------- 11. Log level + rotation ---
+Write-Host ''
+Write-Host "11. Testing log level and rotation (lib/Logging.ps1)" -ForegroundColor Yellow
+
+# A scratch log of its own: this section counts lines, and the sections above
+# have been writing to $script:TestLog throughout.
+$logDir  = Join-Path $testDir 'logscratch'
+if (Test-Path $logDir) { Remove-Item -LiteralPath $logDir -Recurse -Force -ErrorAction SilentlyContinue }
+New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+$levelLog = Join-Path $logDir 'level.log'
+Set-LogPath $levelLog
+
+function Get-LogLines { param($Path) if (Test-Path -LiteralPath $Path) { @(Get-Content -LiteralPath $Path) } else { @() } }
+
+Set-LogLevel 'INFO'
+Assert-Equal (Get-LogLevel) 'INFO' "Set-LogLevel accepts INFO"
+
+Write-Log 'debug line' 'DEBUG'
+Assert-Equal (Get-LogLines $levelLog).Count 0 "DEBUG is dropped at INFO threshold"
+
+Write-Log 'info line'
+Write-Log 'warn line' 'WARN'
+Write-Log 'error line' 'ERROR'
+Assert-Equal (Get-LogLines $levelLog).Count 3 "INFO, WARN and ERROR all pass the INFO threshold"
+
+Set-LogLevel 'DEBUG'
+Write-Log 'debug line' 'DEBUG'
+Assert-Equal (Get-LogLines $levelLog).Count 4 "DEBUG is written once the threshold is lowered"
+
+Set-LogLevel 'ERROR'
+Write-Log 'info line'
+Write-Log 'warn line' 'WARN'
+Assert-Equal (Get-LogLines $levelLog).Count 4 "INFO and WARN are dropped at ERROR threshold"
+Write-Log 'error line' 'ERROR'
+Assert-Equal (Get-LogLines $levelLog).Count 5 "ERROR still passes at ERROR threshold"
+
+# A typo in settings.json must not silently switch the log off.
+Set-LogLevel 'NONSENSE'
+Assert-Equal (Get-LogLevel) 'ERROR' "An unrecognised level leaves the threshold alone"
+
+# Rotation moves history aside rather than truncating it away.
+Set-LogLevel 'INFO'
+$rotLog = Join-Path $logDir 'rot.log'
+Set-LogPath $rotLog
+Set-LogRotation -MaxSizeMB 0.001 -Keep 2   # ~1 KB
+
+for ($i = 1; $i -le 400; $i++) { Write-Log ("filler line {0}" -f $i) }
+
+Assert-True (Test-Path -LiteralPath (Join-Path $logDir 'rot.1.log')) "Rotation created generation 1"
+Assert-True (Test-Path -LiteralPath (Join-Path $logDir 'rot.2.log')) "Rotation created generation 2"
+Assert-True (-not (Test-Path -LiteralPath (Join-Path $logDir 'rot.3.log'))) "Rotation keeps no more than Keep generations"
+Assert-True ((Get-Item -LiteralPath $rotLog).Length -le 2KB) "Active log stays near the size cap"
+
+# The oldest surviving generation must hold older lines than the active log:
+# rotation shifts history down, it does not overwrite generation 1 in place.
+$gen1First   = (Get-Content -LiteralPath (Join-Path $logDir 'rot.1.log') -TotalCount 1)
+$activeFirst = (Get-Content -LiteralPath $rotLog -TotalCount 1)
+$gen1Num     = [int]([regex]::Match($gen1First,   'filler line (\d+)').Groups[1].Value)
+$activeNum   = [int]([regex]::Match($activeFirst, 'filler line (\d+)').Groups[1].Value)
+Assert-True ($gen1Num -lt $activeNum) "Generation 1 holds older lines than the active log"
+
+Set-LogRotation -MaxSizeMB 1 -Keep 3
+
+# Age cap: a rotated generation is deleted once it is older than MaxAgeDays,
+# independent of how many Keep allows for -- this is what catches a link too
+# quiet to ever hit the size cap.
+$ageLog = Join-Path $logDir 'age.log'
+Set-LogPath $ageLog
+Set-LogRotation -MaxSizeMB 1 -Keep 3 -MaxAgeDays 30
+
+$oldGen   = Join-Path $logDir 'age.1.log'
+$freshGen = Join-Path $logDir 'age.2.log'
+Set-Content -LiteralPath $ageLog   -Value 'active log'      -Encoding utf8
+Set-Content -LiteralPath $oldGen   -Value 'old generation'   -Encoding utf8
+Set-Content -LiteralPath $freshGen -Value 'fresh generation' -Encoding utf8
+(Get-Item -LiteralPath $ageLog).LastWriteTime   = (Get-Date).AddDays(-90)
+(Get-Item -LiteralPath $oldGen).LastWriteTime   = (Get-Date).AddDays(-45)
+(Get-Item -LiteralPath $freshGen).LastWriteTime = (Get-Date).AddDays(-10)
+
+Invoke-LogAgePurge -Force
+Assert-True (-not (Test-Path -LiteralPath $oldGen)) "A generation older than MaxAgeDays is purged"
+Assert-True (Test-Path -LiteralPath $freshGen) "A generation younger than MaxAgeDays survives"
+Assert-True (Test-Path -LiteralPath $ageLog) "The active log is never touched by the age purge, however old"
+
+# MaxAgeDays = 0 disables the age cap -- Keep is then the only limit.
+Set-Content -LiteralPath $oldGen -Value 'old generation again' -Encoding utf8
+(Get-Item -LiteralPath $oldGen).LastWriteTime = (Get-Date).AddDays(-90)
+Set-LogRotation -MaxSizeMB 1 -Keep 3 -MaxAgeDays 0
+Invoke-LogAgePurge -Force
+Assert-True (Test-Path -LiteralPath $oldGen) "MaxAgeDays 0 disables the age cap"
+
+# Lowering Keep must not strand the higher-numbered generations forever.
+$orphan = Join-Path $logDir 'age.7.log'
+Set-Content -LiteralPath $orphan -Value 'from when Keep was larger' -Encoding utf8
+Invoke-LogAgePurge -Force
+Assert-True (-not (Test-Path -LiteralPath $orphan)) "A generation numbered above LogKeepFiles is removed"
+Assert-True (Test-Path -LiteralPath $freshGen) "Generations within LogKeepFiles are kept"
+
+# Two processes writing at once must not lose lines (07-audit item 7: before
+# the write lock, about two in three were lost).
+$sharedLog = Join-Path $logDir 'shared.log'
+$writer = Join-Path $logDir 'writer.ps1'
+Set-Content -LiteralPath $writer -Encoding utf8 -Value @'
+param($Root, $Log, $Name)
+. (Join-Path $Root 'lib\Logging.ps1')
+Set-LogPath $Log
+Set-LogRotation -MaxSizeMB 50 -Keep 3 -MaxAgeDays 0
+for ($i = 1; $i -le 300; $i++) { Write-Log ("{0} line {1}" -f $Name, $i) }
+'@
+$writers = @('A', 'B') | ForEach-Object {
+    Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -PassThru -ArgumentList @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$writer`"", "`"$root`"", "`"$sharedLog`"", $_)
+}
+$writers | ForEach-Object { $null = $_.WaitForExit(120000) }
+$sharedLines = @(Get-Content -LiteralPath $sharedLog)
+Assert-Equal $sharedLines.Count 600 'Two processes writing 300 lines each at once lose no lines'
+Assert-Equal @($sharedLines | Where-Object { $_ -notmatch '^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \[INFO\] [AB] line \d+$' }).Count 0 'No log line is torn or mixed'
+
+Set-LogRotation -MaxSizeMB 1 -Keep 3 -MaxAgeDays 60
+Set-LogPath $script:TestLog
+if (Test-Path $logDir) { Remove-Item -LiteralPath $logDir -Recurse -Force -ErrorAction SilentlyContinue }
+
+# ------------------------------------------- 12. Idle-pass heartbeat state ---
+Write-Host ''
+Write-Host "12. Testing idle-pass bookkeeping (lib/Pass.ps1)" -ForegroundColor Yellow
+
+. (Join-Path $root 'lib\Pass.ps1')
+
+$passStateRoot = Join-Path $testDir 'passstate'
+if (Test-Path $passStateRoot) { Remove-Item -LiteralPath $passStateRoot -Recurse -Force -ErrorAction SilentlyContinue }
+
+$idleOutcome = [pscustomobject]@{
+    Ran = $true; Skipped = $false; Reason = ''
+    Results = @([pscustomobject]@{
+        LinkId = 'X'; Applied = 0; Deferred = 2; Failed = 0
+        Conflicts = 0; Deleted = 0; CloudOnlyDeletes = 0
+        Aborted = $false; Message = 'quiet'; State = 'Ready'; Detail = ''
+    })
+}
+
+Write-PassSummary -Outcome $idleOutcome -StateRoot $passStateRoot `
+                  -IdleCount 4 -IdleSince '2026-08-12 09:00:00' -LastHeartbeat '2026-08-12 09:00:00'
+$readBack = Read-PassSummary -StateRoot $passStateRoot
+Assert-Equal $readBack.IdleCount 4 "Idle streak count round-trips through lastpass.json"
+Assert-Equal $readBack.IdleSince '2026-08-12 09:00:00' "Idle streak start round-trips"
+Assert-Equal $readBack.LastHeartbeat '2026-08-12 09:00:00' "Heartbeat timestamp round-trips"
+Assert-Equal $readBack.Deferred 2 "Deferred count still reported while the pass counts as idle"
+Assert-Equal @($readBack.PerLink).Count @($idleOutcome.Results).Count "The summary keeps one per-link entry per result, for single-link merges"
+Assert-Equal ([string]@($readBack.PerLink)[0].LinkId) ([string]@($idleOutcome.Results)[0].LinkId) "Per-link entries carry their link id"
+
+# Pre-existing summaries were written before these fields existed and must read
+# as a fresh streak rather than throwing.
+$legacy = '{"When":"2026-08-12 08:00:00","Links":1,"Applied":0,"Deferred":0,"Conflicts":0,"Deleted":0,"Failed":0,"Aborted":[],"Unavailable":[]}'
+Set-Content -LiteralPath (Get-PassSummaryPath -StateRoot $passStateRoot) -Value $legacy -Encoding utf8
+$legacyRead = Read-PassSummary -StateRoot $passStateRoot
+Assert-True ($null -ne $legacyRead) "A summary written before idle tracking still parses"
+Assert-True (-not $legacyRead.PSObject.Properties['IdleCount']) "Legacy summary simply has no idle fields"
+
+if (Test-Path $passStateRoot) { Remove-Item -LiteralPath $passStateRoot -Recurse -Force -ErrorAction SilentlyContinue }
+
+# Existing conflict duplicate inventory.
+Write-Host 'Testing conflict duplicate reporting' -ForegroundColor Yellow
+. (Join-Path $root 'lib\Conflicts.ps1')
+$duplicateTestRoot = Join-Path $testDir 'conflict-report-fixture'
+$duplicateLocal = Join-Path $duplicateTestRoot 'local'
+$duplicateRemote = Join-Path $duplicateTestRoot 'remote'
+$null = New-Item -ItemType Directory -Path $duplicateLocal,$duplicateRemote -Force
+$duplicateLink = [pscustomobject]@{ Id = 'Duplicates'; LocalPath = $duplicateLocal; RemotePath = $duplicateRemote; Enabled = $false }
+try {
+    $copyName = 'Book.v2 (conflict from OneDrive 2026-10-07 123456).xlsx'
+    $remoteOnly = 'notes (conflict from Google Drive 2026-10-07 123457)'
+    Set-Content -LiteralPath (Join-Path $duplicateLocal $copyName) -Value 'saved remote version'
+    Set-Content -LiteralPath (Join-Path $duplicateRemote $copyName) -Value 'saved remote version'
+    Set-Content -LiteralPath (Join-Path $duplicateLocal 'Book.v2.xlsx') -Value 'current local version'
+    Set-Content -LiteralPath (Join-Path $duplicateRemote $remoteOnly) -Value 'remote-only copy'
+    Set-Content -LiteralPath (Join-Path $duplicateLocal 'some conflict notes.txt') -Value 'ordinary file'
+    $copies = @(Get-LinkConflictCopies -Link $duplicateLink)
+    Assert-Equal $copies.Count 2 'Conflict copies on both sides are grouped, even for paused links'
+    $bookCopy = $copies | Where-Object CopyRelPath -eq $copyName
+    Assert-Equal $bookCopy.OriginalRelPath 'Book.v2.xlsx' 'Duplicate is paired with original dotted filename'
+    Assert-Equal $bookCopy.CopyLocalPath (Join-Path $duplicateLocal $copyName) 'Duplicate includes actual local path'
+    Assert-Equal $bookCopy.CopyRemotePath (Join-Path $duplicateRemote $copyName) 'Duplicate includes actual remote path'
+    Assert-Equal $bookCopy.OriginalLocalPath (Join-Path $duplicateLocal 'Book.v2.xlsx') 'Original working path is included'
+    Assert-Equal ($copies | Where-Object CopyRelPath -eq $remoteOnly).OriginalRelPath 'notes' 'Extensionless remote-only copy is paired correctly'
+    Assert-Equal ($copies | Where-Object CopyRelPath -eq $remoteOnly).CopyLocalPath '' 'Absent local duplicate is not claimed to exist'
+    Assert-True ((Format-ConflictCopies -Copies $copies) -like '*Duplicate local:  (not present)*') 'Formatted list identifies missing copies'
+    $idleOutcome.Results[0] | Add-Member -NotePropertyName ConflictCopies -NotePropertyValue $copies -Force
+    Write-PassSummary -Outcome $idleOutcome -StateRoot $passStateRoot
+    Assert-Equal @((Read-PassSummary -StateRoot $passStateRoot).ConflictCopies).Count 2 'Existing duplicate list survives pass-summary JSON'
+    Remove-Item -LiteralPath (Join-Path $duplicateLocal $copyName),(Join-Path $duplicateRemote $copyName) -Force
+    $copies = @(Get-LinkConflictCopies -Link $duplicateLink)
+    Assert-Equal $copies.Count 1 'Removing copies removes the inventory entry'
+    $idleOutcome.Results[0].ConflictCopies = $copies
+    Write-PassSummary -Outcome $idleOutcome -StateRoot $passStateRoot
+    Assert-Equal @((Read-PassSummary -StateRoot $passStateRoot).ConflictCopies).Count 1 'Single duplicate stays an array in JSON'
+    Remove-Item -LiteralPath (Join-Path $duplicateRemote $remoteOnly) -Force
+    Assert-Equal @(Get-LinkConflictCopies -Link $duplicateLink).Count 0 'Ordinary filenames containing conflict are not duplicates'
+    $idleOutcome.Results[0].ConflictCopies = @()
+    Write-PassSummary -Outcome $idleOutcome -StateRoot $passStateRoot
+    Assert-Equal @((Read-PassSummary -StateRoot $passStateRoot).ConflictCopies).Count 0 'Cleared duplicate list persists an empty array'
+} finally {
+    foreach ($cleanupPath in @($duplicateTestRoot, $passStateRoot)) {
+        $resolvedCleanup = [IO.Path]::GetFullPath($cleanupPath)
+        if (-not $resolvedCleanup.StartsWith(([IO.Path]::GetFullPath($testDir) + '\'), [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe test cleanup path' }
+        if (Test-Path -LiteralPath $resolvedCleanup) { Remove-Item -LiteralPath $resolvedCleanup -Recurse -Force }
+    }
+}
+# Construct the real dashboard card without showing a window or launching sync.
+Write-Host 'Testing deletion-conflict dashboard controls' -ForegroundColor Yellow
+Add-Type -AssemblyName System.Windows.Forms
+$uiTokens = $null; $uiErrors = $null
+$uiAst = [Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'DriveRelayUI.ps1'), [ref]$uiTokens, [ref]$uiErrors)
+foreach ($functionName in @('Get-StatusInfo','New-LinkCard')) {
+    $definition = $uiAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName }, $true)
+    . ([scriptblock]::Create($definition.Extent.Text))
+}
+$ctx = New-TestLink
+$rf = Set-TestFile (Join-Path $ctx.Remote 'deleted.txt') 'survivor' $when.AddSeconds(3)
+Write-TestManifest $ctx @([pscustomobject]@{
+    RelPath='deleted.txt'; LocalLength=$rf.Length; LocalWriteUtc=$when
+    OdLength=$rf.Length; OdWriteUtc=$when
+})
+$null = Set-TestFile (Join-Path $ctx.Local 'guide (conflict from OneDrive 2026-10-08 101634).txt') 'duplicate' $when
+$script:DeletionConflictsByLink = @{ eng = @(Get-LinkDeletionConflicts -Link $ctx.Link -StateRoot $ctx.State) }
+$script:ConflictCopiesByLink = @{ eng = @(Get-LinkConflictCopies -Link $ctx.Link) }
+$script:AvailabilityByLink = @{ eng = Get-LinkAvailability -Link $ctx.Link }
+$script:ScanErrorsByLink = @{}
+$script:ExpandedDuplicateLink = $null
+foreach ($colourName in @('CardColor','CardHover','SepColor','TextPrimary','TextMuted','BtnBg','BtnHover','BgColor','StatusAmber','StatusGray','StatusGreen','StatusRed')) {
+    Set-Variable -Scope Script -Name $colourName -Value ([Drawing.Color]::Gray)
+}
+$uiTestFont = New-Object Drawing.Font('Segoe UI', 9)
+foreach ($fontName in @('FontName','FontStatus','FontCaption','FontPath')) { Set-Variable -Scope Script -Name $fontName -Value $uiTestFont }
+$uiTestCard = New-LinkCard -Link $ctx.Link -Y 0
+try {
+    Assert-Equal @($uiTestCard.Controls | Where-Object Text -eq 'Review').Count 1 'Deletion conflict card has a visible Review button'
+    Assert-Equal @($uiTestCard.Controls | Where-Object Text -eq 'Duplicates').Count 1 'Duplicates remains available alongside deletion Review'
+    Assert-Equal (Get-StatusInfo -Link $ctx.Link -ConflictCopiesChecked).Text '1 deletion conflict(s)' 'Dashboard badge reports deletion conflict'
+    $reviewButton = $uiTestCard.Controls | Where-Object Text -eq 'Review'
+    $duplicateButton = $uiTestCard.Controls | Where-Object Text -eq 'Duplicates'
+    Assert-True (-not $reviewButton.Bounds.IntersectsWith($duplicateButton.Bounds)) 'Review and Duplicates buttons do not overlap'
+} finally { $uiTestCard.Dispose(); $uiTestFont.Dispose() }
+
+# Exercise the real asynchronous inventory against isolated test folders.
+Write-Host 'Testing background dashboard inventory' -ForegroundColor Yellow
+. (Join-Path $root 'lib\DashboardScan.ps1')
+$scan = Start-DashboardScan -Root $root -Links @($ctx.Link) -StateRoot $ctx.State
+try {
+    Assert-True ($scan.Handle.AsyncWaitHandle.WaitOne(15000)) 'Background inventory finishes without the UI pumping messages'
+    $inventory = @($scan.Worker.EndInvoke($scan.Handle))
+    Assert-Equal $inventory.Count 1 'Background inventory returns one result for one link'
+    Assert-Equal $inventory[0].Error '' 'Background inventory loads its dependencies successfully'
+    Assert-Equal @($inventory[0].Copies).Count 1 'Background inventory preserves a single duplicate as an array'
+    Assert-Equal @($inventory[0].Deletions).Count 1 'Background inventory reports live deletion conflicts'
+    Assert-Equal $inventory[0].Availability.State 'Ready' 'Background inventory checks availability'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $ctx.Local 'deleted.txt'))) 'Background inventory leaves the deleted path absent'
+} finally { $scan.Worker.Dispose() }
+
+# The dashboard reuses the last sync's lists for a link synced within 10 minutes.
+Write-Host 'Testing dashboard reuse of the last sync' -ForegroundColor Yellow
+$savedNow = [datetime]'2026-11-05 14:10:00'
+$savedLink = $ctx.Link | Select-Object *
+$savedLink | Add-Member -NotePropertyName Seeded -NotePropertyValue $true -Force
+$savedLink | Add-Member -NotePropertyName LastRun -NotePropertyValue '2026-11-05 14:05:00' -Force
+$savedCopy = [pscustomobject]@{ LinkId = 'eng'; CopyRelPath = 'saved copy.txt' }
+$savedSummary = [pscustomobject]@{
+    When = '2026-11-05 14:05:10'
+    PerLink = @([pscustomobject]@{
+        LinkId = 'eng'; Aborted = $false
+        Message = 'applied 0, deferred 0, conflicts 0, deleted 0, failed 0, moved 0'
+        ConflictCopies = @($savedCopy); DeletionConflicts = @()
+    })
+}
+$saved = Get-SavedPassInventory -Links @($savedLink) -Summary $savedSummary -Now $savedNow
+Assert-True ($saved.ContainsKey('eng')) 'Sync 5 minutes old is reused'
+Assert-Equal @($saved['eng'].Copies).Count 1 'Reused sync keeps a single duplicate as a list'
+Assert-Equal (Get-SavedPassInventory -Links @($savedLink) -Summary $savedSummary -Now $savedNow.AddMinutes(6)).Count 0 'Sync 11 minutes old is not reused'
+$beforeRun = $savedSummary | Select-Object *; $beforeRun.When = '2026-11-05 14:04:59'
+Assert-Equal (Get-SavedPassInventory -Links @($savedLink) -Summary $beforeRun -Now $savedNow).Count 0 'Summary written before the link last ran is not reused'
+$abortedSummary = $savedSummary | Select-Object *
+$abortedSummary.PerLink = @([pscustomobject]@{ LinkId = 'eng'; Aborted = $true; Message = '5 deletions exceeds MaxDelete of 1; nothing applied'; ConflictCopies = @(); DeletionConflicts = @() })
+Assert-Equal (Get-SavedPassInventory -Links @($savedLink) -Summary $abortedSummary -Now $savedNow).Count 0 'Aborted sync is not reused'
+$unavailableSummary = $savedSummary | Select-Object *
+$unavailableSummary.PerLink = @([pscustomobject]@{ LinkId = 'eng'; Aborted = $false; Message = 'Drive D: is not connected'; ConflictCopies = @(); DeletionConflicts = @() })
+Assert-Equal (Get-SavedPassInventory -Links @($savedLink) -Summary $unavailableSummary -Now $savedNow).Count 0 'Sync that could not compare the folders is not reused'
+Assert-Equal (Get-SavedPassInventory -Links @($savedLink) -Summary $null -Now $savedNow).Count 0 'No summary means a live scan'
+$scan = Start-DashboardScan -Root $root -Links @($ctx.Link) -StateRoot $ctx.State -Saved $saved
+try {
+    Assert-True ($scan.Handle.AsyncWaitHandle.WaitOne(15000)) 'Dashboard inventory with reused lists finishes'
+    $inventory = @($scan.Worker.EndInvoke($scan.Handle))
+    Assert-Equal $inventory[0].Error '' 'Dashboard inventory with reused lists has no error'
+    Assert-Equal $inventory[0].SavedFrom '2026-11-05 14:05:00' 'Dashboard inventory says which sync it reused'
+    Assert-Equal @($inventory[0].Copies)[0].CopyRelPath 'saved copy.txt' 'Dashboard shows the saved duplicate list instead of re-walking folders'
+    Assert-Equal @($inventory[0].Deletions).Count 0 'Dashboard shows the saved deletion list instead of re-walking folders'
+    Assert-Equal $inventory[0].Availability.State 'Ready' 'Availability is still checked live when lists are reused'
+} finally { $scan.Worker.Dispose() }
+$script:AvailabilityByLink = @{}
+Assert-Equal (Get-StatusInfo -Link $ctx.Link -ConflictCopiesChecked).Text 'Checking folders...' 'Dashboard does not claim healthy before inventory completes'
+$script:ScanErrorsByLink = @{ eng = 'test scan failure' }
+Assert-Equal (Get-StatusInfo -Link $ctx.Link -ConflictCopiesChecked).Text 'Status check failed' 'Dashboard reports scan failure instead of healthy status'
+
+# Summary
+Write-Host ''
+Write-Host "=========================================" -ForegroundColor Cyan
+Write-Host "Test Results: $script:Passed Passed, $script:Failed Failed" -ForegroundColor $(if ($script:Failed -eq 0) { 'Green' } else { 'Red' })
+Write-Host "=========================================" -ForegroundColor Cyan
+
+if ($script:Failed -gt 0) { exit 1 } else { exit 0 }

@@ -1,0 +1,345 @@
+<#
+    Pass.ps1  --  one run over every enabled link.
+
+    This is the single place a sync pass is driven from. The CLI calls it, the
+    scheduled task calls it, and the tray agent will call it too. Keeping one
+    implementation means unattended runs behave exactly like the ones you watch.
+
+    Passes must never stack. A run triggered while another is still working --
+    a slow hydration, a large upload, a machine waking from sleep with several
+    triggers queued -- would have two processes copying the same files in
+    opposite directions. A named mutex makes the second one step aside.
+#>
+
+$script:PassMutexName = 'Global\DriveRelayPass'
+. (Join-Path $PSScriptRoot 'Conflicts.ps1')
+$script:DefaultStateRoot = if ($PSScriptRoot) { Join-Path (Split-Path -Parent $PSScriptRoot) 'state' } else { 'state' }
+
+# How long a run of idle passes may go unmentioned before one heartbeat line is
+# written. Idle passes are the overwhelming majority -- at a ten minute interval
+# they are six lines an hour that say nothing happened -- but writing none at all
+# would make an unattended run that is working indistinguishable from one that
+# stopped firing. One line an hour keeps the proof without the volume.
+$script:IdleHeartbeatMinutes = 60
+
+function Get-PassSummaryPath {
+    param([string] $StateRoot = $script:DefaultStateRoot)
+    return (Join-Path $StateRoot 'lastpass.json')
+}
+
+function Write-PassSummary {
+    <#
+        A small file the tray reads after each pass.
+
+        The tray needs to know what happened without parsing the log, and
+        without loading the whole engine into a long-running process.
+    #>
+    param(
+        [Parameter(Mandatory)][object] $Outcome,
+        [string] $StateRoot = $script:DefaultStateRoot,
+
+        # Idle-run bookkeeping, carried here rather than in a file of its own so
+        # the streak survives across the separate processes a pass can run in.
+        [int]    $IdleCount = 0,
+        [string] $IdleSince = '',
+        [string] $LastHeartbeat = ''
+    )
+
+    try {
+        $r = @($Outcome.Results)
+        $summary = [pscustomobject]@{
+            When       = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+            Links      = $r.Count
+            IdleCount     = $IdleCount
+            IdleSince     = $IdleSince
+            LastHeartbeat = $LastHeartbeat
+            Applied    = [int](($r | Measure-Object -Property Applied   -Sum).Sum)
+            Moved      = [int](($r | Where-Object { $_.PSObject.Properties['Moved'] } | Measure-Object -Property Moved -Sum).Sum)
+            Deferred   = [int](($r | Measure-Object -Property Deferred  -Sum).Sum)
+            Conflicts  = [int](($r | Measure-Object -Property Conflicts -Sum).Sum)
+            Deleted    = [int](($r | Measure-Object -Property Deleted   -Sum).Sum)
+            Failed     = [int](($r | Measure-Object -Property Failed    -Sum).Sum)
+            Aborted    = @($r | Where-Object { $_.Aborted } | ForEach-Object { "$($_.LinkId): $($_.Message)" })
+            ConflictCopies = @($r | Where-Object { $_.PSObject.Properties['ConflictCopies'] } |
+                ForEach-Object { $_.ConflictCopies })
+            DeletionConflicts = @($r | Where-Object { $_.PSObject.Properties['DeletionConflicts'] } |
+                ForEach-Object { $_.DeletionConflicts })
+
+            # Per-link results, so a single-link `sync <id>` can replace its own
+            # link's entry and keep everyone else's (see Invoke-SyncPass).
+            PerLink = @($r | ForEach-Object {
+                [pscustomobject]@{
+                    LinkId = $_.LinkId; Applied = [int]$_.Applied; Deferred = [int]$_.Deferred
+                    Moved = $(if ($_.PSObject.Properties['Moved']) { [int]$_.Moved } else { 0 })
+                    Conflicts = [int]$_.Conflicts; Deleted = [int]$_.Deleted; Failed = [int]$_.Failed
+                    Aborted = [bool]$_.Aborted; Message = [string]$_.Message
+                    State = $(if ($_.PSObject.Properties['State']) { [string]$_.State } else { 'Ready' })
+                    Detail = $(if ($_.PSObject.Properties['Detail']) { [string]$_.Detail } else { '' })
+                    ConflictCopies = @($(if ($_.PSObject.Properties['ConflictCopies']) { $_.ConflictCopies }))
+                    DeletionConflicts = @($(if ($_.PSObject.Properties['DeletionConflicts']) { $_.DeletionConflicts }))
+                }
+            })
+
+            # Availability is reported separately from failure. A drive that is
+            # not plugged in is not a sync error, and calling it one trains
+            # people to ignore the warning that matters.
+            Unavailable = @($r |
+                Where-Object { $_.PSObject.Properties['State'] -and $_.State -and $_.State -ne 'Ready' } |
+                ForEach-Object {
+                    [pscustomobject]@{
+                        LinkId = $_.LinkId; State = $_.State
+                        Summary = $_.Message; Detail = $_.Detail
+                    }
+                })
+        }
+
+        if (-not (Test-Path $StateRoot)) { New-Item -ItemType Directory -Path $StateRoot -Force | Out-Null }
+        $path = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath((Get-PassSummaryPath -StateRoot $StateRoot))
+        $tmp  = "{0}.{1}.tmp" -f $path, [guid]::NewGuid().ToString('N')
+        $json = ConvertTo-Json -InputObject $summary -Depth 6
+        [IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding -ArgumentList $true))
+        # Atomic replace, retried briefly: the tray reads this file after every
+        # pass, and Move-Item -Force deleted it before renaming, so a read in
+        # that gap saw no summary at all.
+        for ($attempt = 1; $attempt -le 10; $attempt++) {
+            try {
+                # [NullString]::Value, not $null: see Save-AppSettings in Settings.ps1.
+                if ([IO.File]::Exists($path)) { [IO.File]::Replace($tmp, $path, [NullString]::Value) }
+                else                          { [IO.File]::Move($tmp, $path) }
+                break
+            }
+            catch {
+                if ($attempt -eq 10) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; throw }
+                Start-Sleep -Milliseconds 200
+            }
+        }
+    }
+    catch {
+        # The tray losing a status update must never fail a sync.
+        Write-Log ("could not write pass summary: {0}" -f $_.Exception.Message) 'WARN'
+    }
+}
+
+function Read-PassSummary {
+    param([string] $StateRoot = $script:DefaultStateRoot)
+
+    $path = Get-PassSummaryPath -StateRoot $StateRoot
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    # Shared read (Manifest.ps1): never blocks a pass replacing the file.
+    try   { return (ConvertFrom-Json -InputObject (Read-SharedTextFile -Path $path)) }
+    catch { return $null }
+}
+
+function Invoke-SyncPass {
+    <#
+        Returns a result object per link, plus whether the pass actually ran.
+        Skipped is not a failure: it means another pass still holds the lock.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [string]   $LinkId,
+        [string[]] $ExcludePatterns,
+        [string]   $StateRoot = $script:DefaultStateRoot,
+        [int]      $WaitForLockSeconds = 0,
+        [switch]   $Quiet
+    )
+
+    $outcome = [pscustomobject]@{
+        Ran     = $false
+        Skipped = $false
+        Reason  = ''
+        Results = @()
+    }
+
+    $mutex   = $null
+    $held    = $false
+
+    try {
+        $mutex = New-Object System.Threading.Mutex($false, $script:PassMutexName)
+    }
+    catch {
+        # Without a mutex we cannot guarantee exclusivity, so do not proceed.
+        $outcome.Skipped = $true
+        $outcome.Reason  = "could not create pass lock: $($_.Exception.Message)"
+        Write-Log $outcome.Reason 'ERROR'
+        return $outcome
+    }
+
+    try {
+        try   { $held = $mutex.WaitOne([TimeSpan]::FromSeconds([Math]::Max(0, $WaitForLockSeconds))) }
+        catch [System.Threading.AbandonedMutexException] {
+            # A previous pass died without releasing. We now hold it.
+            $held = $true
+            Write-Log 'previous pass ended without releasing the lock; continuing' 'WARN'
+        }
+
+        if (-not $held) {
+            $outcome.Skipped = $true
+            $outcome.Reason  = 'another pass is already running'
+            if (-not $Quiet) { Write-Log $outcome.Reason }
+            return $outcome
+        }
+
+        $allLinks = @(Get-LinkRegistry)
+
+        # History retention (Registry.ps1): a removed link's history, and
+        # history set aside more than 30 days ago, go to the Recycle Bin. Done
+        # here because the pass lock is held, so no manifest is being written.
+        if ($PSCmdlet.ShouldProcess('sync history', 'send unusable history to the Recycle Bin')) {
+            try { $null = Clear-StaleLinkState -StateRoot $StateRoot -Links $allLinks }
+            catch { Write-Log ("could not check for old sync history: {0}" -f $_.Exception.Message) 'WARN' }
+        }
+
+        $links = @($allLinks | Where-Object { $_.Enabled })
+        if ($LinkId) { $links = @($links | Where-Object { $_.Id -eq $LinkId }) }
+
+        if ($links.Count -eq 0) {
+            $outcome.Ran    = $true
+            # Say which: "no enabled links" for a link that exists but is
+            # paused sent people looking for a missing link.
+            $outcome.Reason = if (-not $LinkId) { 'no enabled links' }
+                              elseif (@($allLinks | Where-Object { $_.Id -eq $LinkId }).Count -gt 0) { "link '$LinkId' is paused; resume it first" }
+                              else { "no link named '$LinkId'" }
+            # Logged deliberately: an unattended run that writes nothing is
+            # indistinguishable from one that never fired.
+            Write-Log 'pass ran with no enabled links'
+            return $outcome
+        }
+
+        # DEBUG: on a healthy system this line is followed within seconds by a
+        # "pass finished: applied 0 ..." that says nothing happened. The pair is
+        # only worth keeping when a pass hangs, which is when DEBUG is on.
+        Write-Log ("pass starting over {0} link(s)" -f $links.Count) 'DEBUG'
+        $results = New-Object System.Collections.ArrayList
+
+        foreach ($link in $links) {
+            $wasSeeded = $link.Seeded
+            try {
+                $r = Invoke-LinkSync -Link $link -ExcludePatterns $ExcludePatterns -StateRoot $StateRoot
+                $copies = @()
+                try { $copies = @(Get-LinkConflictCopies -Link $link) }
+                catch {
+                    Write-Log ("could not list conflict copies for {0}: {1}" -f $link.Id, $_.Exception.Message) 'WARN'
+                }
+                $r | Add-Member -NotePropertyName ConflictCopies -NotePropertyValue $copies -Force
+
+                if ($PSCmdlet.ShouldProcess($link.Id, 'record link state')) {
+                    $msg = if ($r.Aborted) { "aborted: $($r.Message)" } else { $r.Message }
+                    if (-not $wasSeeded -and -not $r.Aborted) {
+                        Update-LinkState -Id $link.Id -Result $msg -MarkSeeded
+                    }
+                    else {
+                        Update-LinkState -Id $link.Id -Result $msg
+                    }
+                }
+
+                $null = $results.Add($r)
+            }
+            catch {
+                # One bad link must not take the rest of the pass down.
+                Write-Log ("link {0} threw: {1}" -f $link.Id, $_.Exception.Message) 'ERROR'
+                $null = $results.Add([pscustomobject]@{
+                    LinkId = $link.Id; Applied = 0; Deferred = 0; Failed = 1
+                    Conflicts = 0; Deleted = 0; CloudOnlyDeletes = 0
+                    Aborted = $true; Message = $_.Exception.Message
+                    State = 'Ready'; Detail = ''
+                })
+            }
+        }
+
+        $outcome.Ran     = $true
+        $outcome.Results = @($results)
+
+        $applied   = [int](($results | Measure-Object -Property Applied   -Sum).Sum)
+        $conflicts = [int](($results | Measure-Object -Property Conflicts -Sum).Sum)
+        $deleted   = [int](($results | Measure-Object -Property Deleted   -Sum).Sum)
+        $failed    = [int](($results | Measure-Object -Property Failed    -Sum).Sum)
+
+        # A pass is idle when it changed nothing and nothing went wrong.
+        # Deferrals do not count as news: a file held open by Tally or Excel is
+        # deferred on every pass for as long as it stays open, and reporting
+        # that hourly is the same information as reporting it six times an hour.
+        $degraded = @($results | Where-Object {
+            $_.Aborted -or
+            ($_.PSObject.Properties['State'] -and $_.State -and $_.State -ne 'Ready')
+        }).Count
+        $idle = ($applied -eq 0 -and $conflicts -eq 0 -and $deleted -eq 0 -and
+                 $failed -eq 0 -and $degraded -eq 0)
+
+        $now       = Get-Date
+        $prev      = Read-PassSummary -StateRoot $StateRoot
+        $idleCount = 0
+        $idleSince = ''
+        $heartbeat = ''
+        if ($prev) {
+            if ($prev.PSObject.Properties['IdleCount'])     { $idleCount = [int]$prev.IdleCount }
+            if ($prev.PSObject.Properties['IdleSince'])     { $idleSince = [string]$prev.IdleSince }
+            if ($prev.PSObject.Properties['LastHeartbeat']) { $heartbeat = [string]$prev.LastHeartbeat }
+        }
+
+        $line = "pass finished: applied {0}, conflicts {1}, deleted {2}" -f $applied, $conflicts, $deleted
+
+        # A single-link `sync <id>` says nothing about the other links, and is
+        # not one of the unattended passes the idle streak counts. Merge its
+        # result over the previous summary's entry for that link, keep the rest,
+        # and leave the streak as it was.
+        $summaryResults = @($results)
+        if ($LinkId) {
+            if ($prev -and $prev.PSObject.Properties['PerLink']) {
+                $enabledIds = @($links | ForEach-Object { $_.Id })
+                try { $enabledIds = @(Get-LinkRegistry | Where-Object { $_.Enabled } | ForEach-Object { $_.Id }) } catch { }
+                $others = @($prev.PerLink | Where-Object { $_.LinkId -ne $LinkId -and $enabledIds -contains $_.LinkId })
+                $summaryResults = @($others) + @($results)
+            }
+            if (-not $idle) { Write-Log $line }
+            Write-PassSummary -Outcome ([pscustomobject]@{ Results = $summaryResults }) -StateRoot $StateRoot `
+                              -IdleCount $idleCount -IdleSince $idleSince -LastHeartbeat $heartbeat
+            return $outcome
+        }
+
+        if (-not $idle) {
+            # Something happened. Report it, and close out any idle run that
+            # preceded it so the quiet stretch is still accounted for.
+            if ($idleCount -gt 0) {
+                $line += " (after {0} idle pass(es) since {1})" -f $idleCount, $idleSince
+            }
+            Write-Log $line
+            $idleCount = 0
+            $idleSince = ''
+            $heartbeat = $now.ToString('yyyy-MM-dd HH:mm:ss')
+        }
+        else {
+            $idleCount++
+            if (-not $idleSince) { $idleSince = $now.ToString('yyyy-MM-dd HH:mm:ss') }
+
+            $due = $true
+            if ($heartbeat) {
+                try   { $due = ($now - [datetime]::Parse($heartbeat)).TotalMinutes -ge $script:IdleHeartbeatMinutes }
+                catch { $due = $true }
+            }
+
+            if ($due) {
+                # Deferrals do not break the idle streak (see above), so this is
+                # where a file that keeps waiting -- held open, still settling --
+                # becomes visible at INFO, once an hour instead of every pass.
+                $deferred = [int](($results | Measure-Object -Property Deferred -Sum).Sum)
+                $waiting  = if ($deferred -gt 0) { "; {0} file(s) waiting (held open or settling) -- see 'status'" -f $deferred } else { '' }
+                Write-Log ("idle: {0} pass(es) since {1}, nothing to relay{2}" -f $idleCount, $idleSince, $waiting)
+                $heartbeat = $now.ToString('yyyy-MM-dd HH:mm:ss')
+            }
+            else {
+                Write-Log $line 'DEBUG'
+            }
+        }
+
+        Write-PassSummary -Outcome $outcome -StateRoot $StateRoot `
+                          -IdleCount $idleCount -IdleSince $idleSince -LastHeartbeat $heartbeat
+        return $outcome
+    }
+    finally {
+        if ($held -and $mutex) {
+            try { $mutex.ReleaseMutex() } catch { }
+        }
+        if ($mutex) { $mutex.Dispose() }
+    }
+}

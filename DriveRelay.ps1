@@ -1,0 +1,634 @@
+<#
+    DriveRelay.ps1  --  Drive Relay
+
+    Keeps a local working folder and a cloud drive folder in step, so you
+    can work on plain NTFS at full speed while the cloud client still holds
+    a copy.
+
+    Both sides are ordinary paths. This script never talks to a network:
+    it copies between folders, and the cloud client uploads from its side
+    as it normally would.
+
+    `check` reports what would happen and writes nothing. `sync` applies it.
+    Run sync with -WhatIf first on anything you care about.
+
+    Deletes go to the Recycle Bin (or a .driverelay-deleted folder where the
+    volume has none). Conflicts keep both versions. A pass that would delete
+    more than the link's MaxDelete aborts without applying anything.
+
+    Usage (from the DriveRelay folder):
+      .\DriveRelay.ps1 add    <local> <remote> [-Seed Local|Remote]
+      .\DriveRelay.ps1 list
+      .\DriveRelay.ps1 rm     <id>
+      .\DriveRelay.ps1 pause  <id>
+      .\DriveRelay.ps1 resume <id>
+      .\DriveRelay.ps1 check  [<id>] [-Detailed]
+      .\DriveRelay.ps1 sync   [<id>] [-WhatIf]
+      .\DriveRelay.ps1 run
+      .\DriveRelay.ps1 status [<id>]
+      .\DriveRelay.ps1 start  [-IntervalMinutes 10]
+      .\DriveRelay.ps1 stop
+      .\DriveRelay.ps1 config [-LogLevel DEBUG] [-IntervalMinutes 10] ...
+#>
+
+[CmdletBinding(SupportsShouldProcess)]
+param(
+    [Parameter(Position = 0)]
+    [ValidateSet('add','list','rm','pause','resume','check','sync','run','status','start','stop','config','settings','help')]
+    [string] $Command = 'help',
+
+    # Positional target: link id for most commands, local path for 'add'.
+    [Parameter(Position = 1)]
+    [string] $Target,
+
+    # Second positional: remote path (only used by 'add').
+    [Parameter(Position = 2)]
+    [string] $Target2,
+
+    # Legacy named parameters (still accepted for backward compatibility).
+    [string] $Id,
+    [string] $Local,
+    [Alias('OneDrive')]
+    [string] $Remote,
+
+    [ValidateSet('Local','Remote','OneDrive')]
+    [string] $Seed = 'Local',
+
+    [ValidateSet('Auto','CloudFiles','Plain')]
+    [string] $Provider = 'Auto',
+
+    [int]    $SettleMinutes,
+    [int]    $MaxDelete,
+    [switch] $Off,
+    [switch] $Detailed,
+    [switch] $NoDehydrate,
+    [switch] $HydrateBeforeDelete,
+    # Used by the dashboard's explicit retry. It waits for a pass already in
+    # progress instead of silently giving up at the mutex.
+    [switch] $WaitForPass,
+    [int]    $IntervalMinutes,
+
+    [ValidateSet('DEBUG','INFO','WARN','ERROR')]
+    [string] $LogLevel,
+    [double] $LogMaxSizeMB,
+    [int]    $LogKeepFiles,
+    [int]    $LogMaxAgeDays
+)
+
+$ErrorActionPreference = 'Stop'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# Which switches the caller actually typed, captured here because the command
+# functions below cannot see it themselves.
+#
+# Inside a function, $PSBoundParameters is that function's own -- and these take
+# no parameters, so it is always empty. Every "did the caller override this?"
+# test read as no, which silently ignored -SettleMinutes and -MaxDelete on add,
+# -IntervalMinutes on start, and every override on config: the command printed
+# the unchanged settings and reported nothing wrong.
+$script:Typed = $PSBoundParameters
+
+. (Join-Path $root 'lib\Logging.ps1')
+. (Join-Path $root 'lib\Settings.ps1')
+. (Join-Path $root 'lib\Provider.ps1')
+. (Join-Path $root 'lib\Availability.ps1')
+. (Join-Path $root 'lib\Hydration.ps1')
+. (Join-Path $root 'lib\Conflicts.ps1')
+. (Join-Path $root 'lib\Settle.ps1')
+. (Join-Path $root 'lib\Registry.ps1')
+. (Join-Path $root 'lib\Manifest.ps1')
+. (Join-Path $root 'lib\Actions.ps1')
+. (Join-Path $root 'lib\Pass.ps1')
+
+Set-LogPath      (Join-Path $root 'driverelay.log')
+Set-RegistryPath (Join-Path $root 'config\links.json')
+Set-SettingsPath (Join-Path $root 'config\settings.json')
+Initialize-LoggingFromSettings
+$script:StateRoot    = Join-Path $root 'state'
+$script:ExcludesFile = Join-Path $root 'config\excludes.txt'
+
+function Get-ExcludePatterns {
+    if (-not (Test-Path $script:ExcludesFile)) { return @() }
+    return @(Get-Content $script:ExcludesFile |
+             Where-Object { $_ -and $_ -notmatch '^\s*#' } |
+             ForEach-Object { $_.Trim() } |
+             Where-Object { $_ })
+}
+
+# ------------------------------------------------------------------- help ---
+
+function Show-Help {
+@'
+DriveRelay -- relay files between a local folder and a cloud drive.
+
+  add <local> <remote>   Register a new link pair.
+                         [-Seed Local|Remote] [-Provider Auto|CloudFiles|Plain]
+                         [-SettleMinutes 3] [-MaxDelete 50] [-HydrateBeforeDelete]
+
+                         <remote> can be any folder: OneDrive, Google Drive,
+                         Dropbox, a network share, another disk.
+
+  list                   Show all registered links.
+
+  rm <id>                Unregister a link. No files are touched.
+
+  pause <id>             Disable a link (skip it during passes).
+  resume <id>            Re-enable a paused link.
+
+  check [<id>]           Report what a sync would do. Writes nothing.
+                         [-Detailed]
+
+  sync [<id>]            Apply it. Conflicts keep both versions, and a pass
+                         exceeding MaxDelete aborts without touching anything.
+                         [-WhatIf]
+
+  status [<id>]          Per-link state: last run, outstanding work.
+
+  start                  Install a scheduled task to run passes automatically.
+                         [-IntervalMinutes 10]
+
+  stop                   Remove the scheduled task.
+
+  config                 Show global settings, or change them.
+                         [-IntervalMinutes 10] [-SettleMinutes 3] [-MaxDelete 50]
+                         [-HydrateBeforeDelete]
+                         [-LogLevel DEBUG|INFO|WARN|ERROR]
+                         [-LogMaxSizeMB 1] [-LogKeepFiles 3] [-LogMaxAgeDays 60]
+
+                         At INFO the log records what changed. DEBUG adds the
+                         per-file and per-pass detail for diagnosing a problem;
+                         it is verbose, so turn it back down afterwards. The log
+                         rotates to driverelay.1.log .. driverelay.<Keep>.log at
+                         the size cap, and any of those generations older than
+                         LogMaxAgeDays is deleted regardless of Keep (0 disables
+                         the age cap).
+
+Seed decides which side is authoritative the first time a link runs.
+After that the pair is two-way.
+'@
+}
+
+# -------------------------------------------------------------------- add ---
+
+function Invoke-AddCommand {
+    # Resolve positional or named arguments.
+    $localPath  = if ($Target)  { $Target }  elseif ($Local)  { $Local }  else { $null }
+    $remotePath = if ($Target2) { $Target2 } elseif ($Remote) { $Remote } else { $null }
+
+    if (-not $localPath -or -not $remotePath) { throw 'add needs <local> and <remote> paths.' }
+    if (-not (Test-Path -LiteralPath $localPath)) {
+        throw ("Local path does not exist: {0}" -f $localPath)
+    }
+    if (-not (Test-Path -LiteralPath $remotePath)) {
+        throw ("Remote path does not exist: {0}" -f $remotePath)
+    }
+
+    $seedSide = if ($Seed -eq 'OneDrive') { 'Remote' } else { $Seed }
+
+    $globalSettings = Get-AppSettings
+    $actualSettle = if ($script:Typed.ContainsKey('SettleMinutes')) { $SettleMinutes } else { $globalSettings.SettleMinutes }
+    $actualMaxDel = if ($script:Typed.ContainsKey('MaxDelete')) { $MaxDelete } else { $globalSettings.MaxDelete }
+    $actualHydrate = if ($script:Typed.ContainsKey('HydrateBeforeDelete')) { [bool]$HydrateBeforeDelete } else { [bool]$globalSettings.HydrateBeforeDelete }
+
+    $l = Add-Link -Local $localPath -Remote $remotePath -Seed $seedSide -Provider $Provider `
+                  -SettleMinutes $actualSettle -MaxDelete $actualMaxDel `
+                  -Dehydrate (-not $NoDehydrate) `
+                  -HydrateBeforeDelete $actualHydrate -StateRoot $script:StateRoot
+    Write-Log ("link added: {0}  {1} <-> {2}  seed={3}" -f $l.Id, $l.LocalPath, $l.RemotePath, $l.Seed)
+    "Registered '{0}'" -f $l.Id
+    "  local     {0}" -f $l.LocalPath
+    "  remote    {0}   ({1})" -f $l.RemotePath, (Get-ProviderLabel -Path $l.RemotePath)
+    "  storage   {0}" -f (Resolve-LinkProvider -Link $l)
+    "  seed      {0}   settle {1}m   maxdelete {2}" -f $l.Seed, $l.SettleMinutes, $l.MaxDelete
+    ''
+    "Nothing has been copied. Run 'check {0}' to see what a sync would do." -f $l.Id
+}
+
+# ------------------------------------------------------------------- list ---
+
+function Invoke-ListCommand {
+    $links = @(Get-LinkRegistry)
+    if ($links.Count -eq 0) { 'No links registered.'; return }
+    $links | ForEach-Object {
+        [pscustomobject]@{
+            Id      = $_.Id
+            Local   = $_.LocalPath
+            Remote  = (Get-RemotePath -Link $_)
+            Drive   = (Get-ProviderLabel -Path (Get-RemotePath -Link $_))
+            Seed    = $_.Seed
+            Seeded  = $_.Seeded
+            Enabled = $_.Enabled
+            Settle  = "$($_.SettleMinutes)m"
+            LastRun = $_.LastRun
+        }
+    } | Format-Table -AutoSize
+}
+
+# --------------------------------------------------------------------- rm ---
+
+function Invoke-RemoveCommand {
+    $linkId = if ($Target) { $Target } elseif ($Id) { $Id } else { $null }
+    if (-not $linkId) { throw 'rm needs a link id.' }
+    Remove-Link -Id $linkId -StateRoot $script:StateRoot
+    Write-Log ("link removed: {0}" -f $linkId)
+    "Unregistered '{0}'. No files were touched on either side; its sync history goes to the Recycle Bin." -f $linkId
+}
+
+# -------------------------------------------------------------- pause/resume --
+
+function Invoke-PauseCommand {
+    $linkId = if ($Target) { $Target } elseif ($Id) { $Id } else { $null }
+    if (-not $linkId) { throw 'pause needs a link id.' }
+    Set-LinkEnabled -Id $linkId -Enabled $false
+    "Link '{0}' is now paused." -f $linkId
+}
+
+function Invoke-ResumeCommand {
+    $linkId = if ($Target) { $Target } elseif ($Id) { $Id } else { $null }
+    if (-not $linkId) { throw 'resume needs a link id.' }
+    Set-LinkEnabled -Id $linkId -Enabled $true
+    "Link '{0}' is now active." -f $linkId
+}
+
+# ------------------------------------------------------------------ check ---
+
+function Invoke-CheckCommand {
+    $linkId = if ($Target) { $Target } elseif ($Id) { $Id } else { $null }
+
+    $links = @(Get-LinkRegistry)
+    if ($linkId) { $links = @($links | Where-Object { $_.Id -eq $linkId }) }
+    if ($links.Count -eq 0) { 'No matching links.'; return }
+
+    $patterns = Get-ExcludePatterns
+
+    foreach ($link in $links) {
+        ''
+        "=== {0}   {1}  <->  {2}" -f $link.Id, $link.LocalPath, (Get-RemotePath -Link $link)
+        if (-not $link.Seeded) {
+            "    not yet seeded -- first run would seed from: {0}" -f $link.Seed
+        }
+
+        $avail = Get-LinkAvailability -Link $link
+        if ($avail.Blocking) {
+            "    SKIPPED -- {0}" -f $avail.Summary
+            "    {0}" -f $avail.Detail
+            continue
+        }
+        if ($avail.State -ne 'Ready') {
+            "    WARNING -- {0}" -f $avail.Summary
+            "    {0}" -f $avail.Detail
+            ''
+        }
+
+        $problem = Get-ManifestProblem -Link $link -StateRoot $script:StateRoot
+        if ($problem) {
+            "    STOPPED -- {0}." -f $problem
+            "    A sync restores it from the .tmp or .bak copy if one is intact; otherwise the link stays stopped."
+            continue
+        }
+
+        $skippedLinks = New-Object 'System.Collections.Generic.List[string]'
+        try { $items = Compare-LinkState -Link $link -ExcludePatterns $patterns -StateRoot $script:StateRoot -SkippedLinks $skippedLinks }
+        catch {
+            "    SKIPPED -- {0}" -f $_.Exception.Message
+            continue
+        }
+        foreach ($s in ($skippedLinks | Sort-Object -Unique)) {
+            "    not followed (junction or symbolic link; left untouched): {0}" -f $s.TrimEnd('\')
+        }
+
+        $actionable = @($items | Where-Object { $_.Action -ne 'InSync' -and $_.Action -ne 'Forget' })
+        $summary = $items | Group-Object Action | Sort-Object Name
+
+        foreach ($g in $summary) { "    {0,-16} {1}" -f $g.Name, $g.Count }
+
+        if (-not $link.Seeded) {
+            # The classification below assumes an ordinary pass. A first run
+            # seeds instead: for files present on both sides that differ, the
+            # seed side's version becomes current and the other is kept
+            # beside it under a conflict name.
+            $differing = @($items | Where-Object { $_.Action -eq 'Conflict' }).Count
+            if ($differing -gt 0) {
+                $other = if ($link.Seed -eq 'Local') { 'remote' } else { 'local' }
+                ''
+                "    !! {0} file(s) differ on both sides. Seeding from {1} makes that version" -f $differing, $link.Seed
+                "       current; each {0} version is kept beside it as a conflict copy." -f $other
+            }
+        }
+
+        $deletes = @($items | Where-Object { $_.Action -like 'Delete*' }).Count
+        if ($deletes -gt $link.MaxDelete) {
+            ''
+            "    !! {0} deletions exceeds MaxDelete of {1}." -f $deletes, $link.MaxDelete
+            "       A real run would abort rather than proceed."
+        }
+
+        if ($actionable.Count -gt 0) {
+            ''
+            foreach ($i in $actionable) {
+                $ready = Test-ActionReady -Item $i -SettleMinutes $link.SettleMinutes
+                $mark  = if ($ready.Ready) { ' ' } else { '~' }
+                $displayPath = if ($i.Action -in @('MoveLocal', 'MoveRemote')) { "$($i.OldRelPath) -> $($i.RelPath)" } else { $i.RelPath }
+                "    {0} {1,-16} {2}" -f $mark, $i.Action, $displayPath
+                if ($Detailed -or -not $ready.Ready) {
+                    "        {0}{1}" -f $i.Reason, $(if (-not $ready.Ready) { " | not yet: $($ready.Reason)" } else { '' })
+                }
+            }
+            ''
+            "    '~' marks files a real run would defer to a later pass."
+        }
+
+        if ($actionable.Count -eq 0) { '    nothing to do' }
+    }
+
+    ''
+    'Report only. Nothing was copied, deleted or modified.'
+}
+
+# ------------------------------------------------------------------- sync ---
+
+function Invoke-SyncCommand {
+    param([switch] $Silent)
+
+    $linkId = if ($Target) { $Target } elseif ($Id) { $Id } else { $null }
+
+    # An unattended pass honours the global pause; an explicit `sync` typed by a
+    # person does not. Pausing means "stop doing this on your own", not "refuse
+    # when I ask". Checked here so the pause holds whichever scheduler is
+    # driving -- the tray, the scheduled task, or neither.
+    if ($Silent) {
+        $paused = $false
+        try { $paused = [bool](Get-AppSettings).Paused } catch { }
+        if ($paused) {
+            Write-Log 'pass skipped: syncing is paused'
+            return
+        }
+    }
+
+    $patterns = Get-ExcludePatterns
+    $outcome  = Invoke-SyncPass -LinkId $linkId -ExcludePatterns $patterns -StateRoot $script:StateRoot -Quiet:$Silent `
+        -WaitForLockSeconds $(if ($WaitForPass) { 900 } else { 0 })
+
+    if ($Silent) { return }
+
+    if ($outcome.Skipped) { "Skipped: {0}" -f $outcome.Reason; return }
+    if ($outcome.Results.Count -eq 0) { $outcome.Reason; return }
+
+    foreach ($r in $outcome.Results) {
+        $link = Get-LinkRegistry | Where-Object { $_.Id -eq $r.LinkId }
+        ''
+        "=== {0}   {1}  <->  {2}" -f $r.LinkId, $link.LocalPath, (Get-RemotePath -Link $link)
+
+        if ($r.Aborted) {
+            "    SKIPPED: {0}" -f $r.Message
+            if ($r.PSObject.Properties['Detail'] -and $r.Detail) { "    {0}" -f $r.Detail }
+            continue
+        }
+        if ($r.PSObject.Properties['State'] -and $r.State -and $r.State -ne 'Ready') {
+            "    WARNING: {0}" -f $r.Detail
+        }
+
+        "    applied {0}, deferred {1}, conflicts {2}, deleted {3}, failed {4}" -f `
+            $r.Applied, $r.Deferred, $r.Conflicts, $r.Deleted, $r.Failed
+
+        if ($r.Conflicts -gt 0) {
+            $deletionCount = @($r.DeletionConflicts).Count
+            $forkCount = $r.Conflicts - $deletionCount
+            if ($forkCount -gt 0) { "    {0} conflict(s): both versions kept, the remote one renamed alongside the local file." -f $forkCount }
+            if ($deletionCount -gt 0) { Format-DeletionConflicts -Conflicts $r.DeletionConflicts }
+        }
+        if ($r.Deleted -gt 0) {
+            $recycled = $r.Deleted - $r.CloudOnlyDeletes
+            if ($recycled -gt 0) { "    {0} file(s) sent to the Recycle Bin." -f $recycled }
+            if ($r.CloudOnlyDeletes -gt 0) {
+                "    {0} cloud-only file(s) deleted -- these were placeholders with no local" -f $r.CloudOnlyDeletes
+                "      content, so recover them from the cloud service's online recycle bin."
+                "      Use -HydrateBeforeDelete on the link to keep local copies instead."
+            }
+        }
+        if ($r.Deferred -gt 0) {
+            "    {0} file(s) left for a later pass (not ready, or changed during the pass)." -f $r.Deferred
+        }
+    }
+
+    ''
+    if ($WhatIfPreference) { 'WhatIf: nothing was changed.' }
+}
+
+# --------------------------------------------------------------- scheduling ---
+
+$script:TaskName = 'DriveRelay'
+
+function Invoke-StartCommand {
+    $globalSettings = Get-AppSettings
+    $minutes = if ($script:Typed.ContainsKey('IntervalMinutes') -and $IntervalMinutes -gt 0) { $IntervalMinutes }
+               elseif ($globalSettings.IntervalMinutes -gt 0) { $globalSettings.IntervalMinutes }
+               else { 10 }
+    $script  = Join-Path $root 'DriveRelay.ps1'
+
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+                -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" run' -f $script)
+
+    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) `
+                -RepetitionInterval (New-TimeSpan -Minutes $minutes)
+
+    $settings = New-ScheduledTaskSettingsSet `
+                -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                -StartWhenAvailable -MultipleInstances IgnoreNew `
+                -ExecutionTimeLimit (New-TimeSpan -Hours 4)
+
+    $principal = New-ScheduledTaskPrincipal -UserId ("{0}\{1}" -f $env:USERDOMAIN, $env:USERNAME) `
+                  -LogonType Interactive -RunLevel Limited
+
+    Register-ScheduledTask -TaskName $script:TaskName -Action $action -Trigger $trigger `
+                           -Settings $settings -Principal $principal -Force | Out-Null
+
+    Write-Log ("scheduled task installed, every {0} minutes" -f $minutes)
+    "Installed scheduled task '{0}', running every {1} minutes while you are logged in." -f $script:TaskName, $minutes
+    "Passes that overlap are skipped, so a slow run cannot pile up."
+
+    # Setup installs the tray agent, which already runs passes on its own timer;
+    # the scheduled task is meant for machines without it. Both together are
+    # safe (the pass lock) but redundant -- say so rather than double up quietly.
+    $trayShortcut = Join-Path ([Environment]::GetFolderPath('Startup')) 'DriveRelay.lnk'
+    if (Test-Path -LiteralPath $trayShortcut) {
+        ''
+        "Note: the DriveRelay tray agent is also set to start with Windows and runs its own passes."
+        "      The two never overlap, but one is enough. Run 'DriveRelay stop' to remove this task,"
+        "      or turn off 'Start with Windows' in the dashboard to rely on the task alone."
+    }
+}
+
+function Invoke-StopCommand {
+    # Also check for old task name for migration.
+    foreach ($name in @($script:TaskName, 'SyncOrchestrator')) {
+        $existing = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+        if ($existing) {
+            Unregister-ScheduledTask -TaskName $name -Confirm:$false
+            Write-Log ("scheduled task removed: {0}" -f $name)
+            "Removed scheduled task '{0}'." -f $name
+        }
+    }
+}
+
+function Invoke-SettingsCommand {
+    $current = Get-AppSettings
+    $changed = $false
+    # Collected here, applied below under the settings lock (Update-AppSettings).
+
+    if ($script:Typed.ContainsKey('IntervalMinutes')) {
+        $current.IntervalMinutes = [int]$IntervalMinutes
+        $changed = $true
+    }
+    if ($script:Typed.ContainsKey('SettleMinutes')) {
+        $current.SettleMinutes = [int]$SettleMinutes
+        $changed = $true
+    }
+    if ($script:Typed.ContainsKey('MaxDelete')) {
+        $current.MaxDelete = [int]$MaxDelete
+        $changed = $true
+    }
+    if ($script:Typed.ContainsKey('HydrateBeforeDelete')) {
+        $current.HydrateBeforeDelete = [bool]$HydrateBeforeDelete
+        $changed = $true
+    }
+    if ($script:Typed.ContainsKey('LogLevel')) {
+        $current.LogLevel = $LogLevel.ToUpperInvariant()
+        $changed = $true
+    }
+    if ($script:Typed.ContainsKey('LogMaxSizeMB')) {
+        $current.LogMaxSizeMB = [double]$LogMaxSizeMB
+        $changed = $true
+    }
+    if ($script:Typed.ContainsKey('LogKeepFiles')) {
+        $current.LogKeepFiles = [int]$LogKeepFiles
+        $changed = $true
+    }
+    if ($script:Typed.ContainsKey('LogMaxAgeDays')) {
+        $current.LogMaxAgeDays = [int]$LogMaxAgeDays
+        $changed = $true
+    }
+
+    if ($changed) {
+        $edited = $current
+        $current = Update-AppSettings -Change {
+            param($st)
+            foreach ($name in @('IntervalMinutes','SettleMinutes','MaxDelete','HydrateBeforeDelete',
+                                'LogLevel','LogMaxSizeMB','LogKeepFiles','LogMaxAgeDays')) {
+                if ($script:Typed.ContainsKey($name)) { $st.$name = $edited.$name }
+            }
+        }
+        Write-Log ("settings updated via CLI: Interval={0}m Settle={1}m MaxDelete={2}" -f $current.IntervalMinutes, $current.SettleMinutes, $current.MaxDelete)
+        "Updated global settings."
+        ''
+    }
+
+    "DriveRelay Configuration:"
+    "  IntervalMinutes     : {0}" -f $current.IntervalMinutes
+    "  SettleMinutes       : {0}" -f $current.SettleMinutes
+    "  MaxDelete           : {0}" -f $current.MaxDelete
+    "  HydrateBeforeDelete : {0}" -f $current.HydrateBeforeDelete
+    "  StartWithWindows    : {0}" -f $current.StartWithWindows
+    "  StartDelaySeconds   : {0}" -f $current.StartDelaySeconds
+    "  LogLevel            : {0}" -f $current.LogLevel
+    "  LogMaxSizeMB        : {0}" -f $current.LogMaxSizeMB
+    "  LogKeepFiles        : {0}" -f $current.LogKeepFiles
+    "  LogMaxAgeDays       : {0}" -f $current.LogMaxAgeDays
+    "  Paused              : {0}" -f $current.Paused
+    if ($current.Paused) {
+        ''
+        "Syncing is paused: unattended passes are skipped. 'sync' still works when"
+        "you run it yourself. Resume from the tray menu."
+    }
+}
+
+# ----------------------------------------------------------------- status ---
+
+function Invoke-StatusCommand {
+    $linkId = if ($Target) { $Target } elseif ($Id) { $Id } else { $null }
+
+    $links = @(Get-LinkRegistry)
+    if ($linkId) { $links = @($links | Where-Object { $_.Id -eq $linkId }) }
+    if ($links.Count -eq 0) { 'No matching links.'; return }
+
+    $patterns = Get-ExcludePatterns
+
+    foreach ($link in $links) {
+        ''
+        "=== {0}{1}" -f $link.Id, $(if (-not $link.Enabled) { '   [paused]' } else { '' })
+        "    local     {0}" -f $link.LocalPath
+        "    remote    {0}   ({1}, {2})" -f (Get-RemotePath -Link $link),
+                                            (Get-ProviderLabel -Path (Get-RemotePath -Link $link)),
+                                            (Resolve-LinkProvider -Link $link)
+        "    seeded    {0}    settle {1}m    maxdelete {2}" -f $link.Seeded, $link.SettleMinutes, $link.MaxDelete
+        "    last run  {0}" -f $(if ($link.LastRun) { "$($link.LastRun)  --  $($link.LastResult)" } else { 'never' })
+
+        $avail = Get-LinkAvailability -Link $link
+        if ($avail.State -ne 'Ready') {
+            "    {0}: {1}" -f $(if ($avail.Blocking) { 'UNAVAILABLE' } else { 'WARNING' }), $avail.Summary
+            "    {0}" -f $avail.Detail
+            if ($avail.Blocking) { continue }
+        }
+
+        $problem = Get-ManifestProblem -Link $link -StateRoot $script:StateRoot
+        if ($problem) { "    STOPPED: {0}" -f $problem; continue }
+
+        $skippedLinks = New-Object 'System.Collections.Generic.List[string]'
+        try { $items = Compare-LinkState -Link $link -ExcludePatterns $patterns -StateRoot $script:StateRoot -SkippedLinks $skippedLinks }
+        catch {
+            "    UNAVAILABLE: {0}" -f $_.Exception.Message
+            continue
+        }
+        foreach ($s in ($skippedLinks | Sort-Object -Unique)) {
+            "    not followed (junction or symbolic link): {0}" -f $s.TrimEnd('\')
+        }
+        $pending = @($items | Where-Object { $_.Action -ne 'InSync' -and $_.Action -ne 'Forget' })
+
+        try {
+            $copies = @(Get-LinkConflictCopies -Link $link)
+            if ($copies.Count -gt 0) {
+                "    {0} conflict duplicate(s) to review:" -f $copies.Count
+                Format-ConflictCopies -Copies $copies
+            }
+        } catch {
+            "    Could not list all conflict copies: {0}" -f $_.Exception.Message
+        }
+        if ($pending.Count -eq 0) { '    up to date'; continue }
+
+        "    {0} pending:" -f $pending.Count
+        foreach ($i in $pending) {
+            $rd = Test-ActionReady -Item $i -SettleMinutes $link.SettleMinutes
+            $displayPath = if ($i.Action -in @('MoveLocal', 'MoveRemote')) { "$($i.OldRelPath) -> $($i.RelPath)" } else { $i.RelPath }
+            if ($rd.Ready) { "      {0,-16} {1}" -f $i.Action, $displayPath }
+            else           { "      {0,-16} {1}   [waiting: {2}]" -f $i.Action, $displayPath, $rd.Reason }
+        }
+        $deletionConflicts = @($pending | Where-Object Action -eq 'DeletionConflict' | ForEach-Object { New-DeletionConflict -Item $_ -Link $link })
+        if ($deletionConflicts.Count -gt 0) { Format-DeletionConflicts -Conflicts $deletionConflicts }
+    }
+}
+
+# ----------------------------------------------------------- command router ---
+
+# An error nothing else handled is logged before the process exits non-zero,
+# so a pass the tray started in the background is never a silent failure.
+try {
+switch ($Command) {
+    'add'                 { Invoke-AddCommand }
+    'list'                { Invoke-ListCommand }
+    'rm'                  { Invoke-RemoveCommand }
+    'pause'               { Invoke-PauseCommand }
+    'resume'              { Invoke-ResumeCommand }
+    'check'               { Invoke-CheckCommand }
+    'sync'                { Invoke-SyncCommand }
+    'run'                 { Invoke-SyncCommand -Silent }
+    'status'              { Invoke-StatusCommand }
+    'start'               { Invoke-StartCommand }
+    'stop'                { Invoke-StopCommand }
+    { $_ -in 'config','settings' } { Invoke-SettingsCommand }
+    default               { Show-Help }
+}
+}
+catch {
+    try { Write-Log ("command '{0}' failed: {1}" -f $Command, $_.Exception.Message) 'ERROR' } catch { }
+    throw
+}

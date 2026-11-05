@@ -1,0 +1,20 @@
+# Transient artefacts that are never synced.
+# One wildcard pattern per line, matched against the file name.
+# Lines starting with # are comments; blank lines are ignored.
+
+# Office lock and recovery files
+~$*
+*.tmp
+*.laccdb
+*.~vsd*
+.~lock.*
+
+# Generic lock files (Tally, KDK and others)
+*.lck
+*.lock
+
+# Windows and shell noise
+Thumbs.db
+desktop.ini
+*.crdownload
+*.partial

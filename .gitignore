@@ -1,0 +1,39 @@
+# --- personal data -----------------------------------------------------------
+# These are generated at runtime and describe the owner's actual folders and
+# files. They must never be published. Everything here is recreated
+# automatically on first run; see config/*.example.json for the shapes.
+
+config/links.json
+config/settings.json
+state/
+
+# Logs record real filenames from every linked folder.
+*.log
+
+# --- runtime artefacts -------------------------------------------------------
+
+# Built by Install.ps1 from tools/DriveRelayLauncher.cs.
+/DriveRelay.exe
+/build/
+/dist/
+/release/
+
+*.tmp
+*.superseded-*
+*.driverelay.tmp
+
+# Scratch files written by the test harness.
+tests/test-settings.json
+tests/test-links.json
+tests/test-overlap.json
+tests/test-manifest.json
+tests/test-run.log
+tests/scratch_local/
+tests/scratch_remote/
+tests/scratch_overlap/
+tests/scratch_engine/
+
+# --- Windows -----------------------------------------------------------------
+
+Thumbs.db
+desktop.ini

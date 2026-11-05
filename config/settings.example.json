@@ -1,0 +1,13 @@
+{
+    "IntervalMinutes":  10,
+    "SettleMinutes":  3,
+    "MaxDelete":  50,
+    "HydrateBeforeDelete":  true,
+    "StartWithWindows":  true,
+    "StartDelaySeconds":  90,
+    "LogLevel":  "INFO",
+    "LogMaxSizeMB":  1,
+    "LogKeepFiles":  3,
+    "LogMaxAgeDays":  60,
+    "Paused":  false
+}
