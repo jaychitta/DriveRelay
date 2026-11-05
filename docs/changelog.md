@@ -2,6 +2,17 @@
 
 All notable changes to DriveRelay (formerly SyncOrchestrator) will be documented in this file.
 
+## [Review] - 2026-11-05 — seeding and junctions (Codex review on PR 1)
+
+- `Invoke-LinkSeed` now collects the junctions/symbolic links skipped on both
+  sides and skips every path under them, as `Compare-LinkState` does. Before,
+  a destination-side junction hid its files from the seed's snapshot but not
+  from its writes, so seeding could overwrite files outside the link root
+  through the junction without keeping a conflict copy.
+- Test: seeding from Remote with a local junction leaves the file behind it
+  unchanged (skips without junction permission). Not run (no PowerShell in
+  the sandbox).
+
 ## [Audit] - 2026-11-05 — R3: readers no longer block state-file replaces
 
 - `Read-SharedTextFile` (in `Manifest.ps1` and `Settings.ps1`) opens with

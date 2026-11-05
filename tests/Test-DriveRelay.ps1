@@ -995,6 +995,14 @@ if ($madeJunction) {
     Assert-Equal (Get-Action $ctx 'linked\secret.txt') '<absent>' "A tracked path under a junction gets no action, not a delete"
     $null = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
     Assert-True (Test-Path -LiteralPath $rf.FullName) "The remote counterpart of a junctioned file is not deleted"
+
+    # Seeding must not write through a junction on the destination side
+    # either: the remote has an ordinary folder where the local has a link.
+    $ctx.Link.Seeded = $false
+    $ctx.Link.Seed = 'Remote'
+    $null = Set-TestFile $rf.FullName 'remote version that must not escape' $t1
+    $null = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+    Assert-Equal (Get-Content -LiteralPath (Join-Path $outside 'secret.txt') -Raw) 'not part of the link' "Seeding does not overwrite a file behind a destination junction"
     cmd.exe /c rmdir "$junction" | Out-Null
 } else {
     Write-Host "  [SKIP] junction creation unavailable; junction checks not run" -ForegroundColor DarkYellow

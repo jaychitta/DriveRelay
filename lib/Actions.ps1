@@ -569,11 +569,18 @@ function Invoke-LinkSeed {
 
     Write-Log ("seeding link {0} from {1}: {2} -> {3}" -f $Link.Id, $Link.Seed, $fromRoot, $toRoot)
 
-    $from = Get-SideSnapshot -Root $fromRoot -ExcludePatterns $ExcludePatterns
-    $to   = Get-SideSnapshot -Root $toRoot   -ExcludePatterns $ExcludePatterns
+    # A junction or symbolic link on either side hides what lies behind it from
+    # that side's snapshot -- it does not stop a write going through it. Skip
+    # every path under a link found on either side, exactly as
+    # Compare-LinkState does, or a seed would copy through a destination
+    # junction and overwrite files outside the link root without a conflict copy.
+    $skippedLinks = New-Object 'System.Collections.Generic.List[string]'
+    $from = Get-SideSnapshot -Root $fromRoot -ExcludePatterns $ExcludePatterns -SkippedLinks $skippedLinks
+    $to   = Get-SideSnapshot -Root $toRoot   -ExcludePatterns $ExcludePatterns -SkippedLinks $skippedLinks
 
     $copied = 0; $skipped = 0
     foreach ($k in $from.Keys) {
+        if (Test-UnderSkippedLink -Key $k -Prefixes $skippedLinks) { continue }
         $s = $from[$k]
         $d = $to[$k]
 

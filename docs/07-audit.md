@@ -112,8 +112,9 @@ Windows PowerShell 5.1 recursion follows junctions, so a junction inside a link 
 and could delete through — a folder outside it. *Fix:* snapshots walk folder by folder and skip
 junctions, mount points and directory symbolic links (cloud placeholder folders are reparse
 points but not links); every path under a skipped link, on either side, gets no action and
-keeps its manifest entry, so stopping following one cannot read as deletions. `check` and
-`status` list them. *Needs Windows:* confirm `LinkType` reads `$null` on OneDrive placeholder
+keeps its manifest entry, so stopping following one cannot read as deletions. Seeding applies
+the same rule (a gap found in the pull request review: a destination-side junction hid its files
+from the seed's snapshot but not from its writes). `check` and `status` list them. *Needs Windows:* confirm `LinkType` reads `$null` on OneDrive placeholder
 folders, and measure the per-folder walk on a large tree.
 
 **E7. A missing or empty manifest erased history — medium — fixed.**
