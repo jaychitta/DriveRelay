@@ -2,6 +2,17 @@
 
 All notable changes to DriveRelay (formerly SyncOrchestrator) will be documented in this file.
 
+## [Audit] - 2026-11-05 — R3: readers no longer block state-file replaces
+
+- `Read-SharedTextFile` (in `Manifest.ps1` and `Settings.ps1`) opens with
+  read/write/delete sharing, so `File.Replace` succeeds while the dashboard,
+  tray or engine is reading. Used for manifests, `settings.json` and
+  `lastpass.json` (engine, tray, dashboard). `lastpass.json` is now written
+  with an atomic replace and a per-writer temp name instead of
+  `Move-Item -Force`. All 31 audit findings are now marked fixed.
+- Test: a manifest held open by a shared reader is still replaced. Not run
+  (no PowerShell in the sandbox).
+
 ## [Audit] - 2026-11-05 — low findings (R4, R5, R8, R9, R11, S3, S9, U7, D1)
 
 - R4: a last-write time more than a minute in the future counts as settled

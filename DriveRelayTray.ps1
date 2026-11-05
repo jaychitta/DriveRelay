@@ -96,7 +96,8 @@ function Set-TrayState {
 function Read-Summary {
     $p = Join-Path $script:StateRoot 'lastpass.json'
     if (-not (Test-Path -LiteralPath $p)) { return $null }
-    try   { return ConvertFrom-Json -InputObject (Get-Content -LiteralPath $p -Raw -Encoding UTF8) }
+    # Shared read (Settings.ps1): never blocks a pass replacing the file.
+    try   { return ConvertFrom-Json -InputObject (Read-SharedTextFile -Path $p) }
     catch { return $null }
 }
 

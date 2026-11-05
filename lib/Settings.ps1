@@ -83,6 +83,29 @@ function ConvertTo-SettingBool {
     return $Default
 }
 
+function Read-SharedTextFile {
+    <#
+        Read a whole UTF-8 file while letting its writer replace it.
+
+        Writers swap state files in with File.Replace, which renames the old
+        file away; Windows refuses that while any reader holds the file
+        without FILE_SHARE_DELETE -- which Get-Content and File.ReadAllText do
+        not grant. The dashboard reads every manifest every few seconds, so a
+        pass could fail to save its manifest after it had already copied files.
+        Opening with ReadWrite and Delete sharing lets the replace go ahead;
+        this reader simply finishes reading the old version.
+    #>
+    param([Parameter(Mandatory)][string] $Path)
+    $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+    $stream = New-Object System.IO.FileStream -ArgumentList $full, ([IO.FileMode]::Open), ([IO.FileAccess]::Read), $share
+    try {
+        $reader = New-Object System.IO.StreamReader -ArgumentList $stream, ([Text.Encoding]::UTF8), $true
+        return $reader.ReadToEnd()
+    }
+    finally { $stream.Dispose() }
+}
+
 function Read-AppSettingsFile {
     <#
         Read without writing. Returns the validated settings and whether the
@@ -99,10 +122,7 @@ function Read-AppSettingsFile {
     # than read "not there" -- which would mean "not paused".
     $raw = $null
     for ($attempt = 1; $attempt -le 10; $attempt++) {
-        try {
-            $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($script:SettingsPath)
-            $raw = [IO.File]::ReadAllText($full, [Text.Encoding]::UTF8); break
-        }
+        try { $raw = Read-SharedTextFile -Path $script:SettingsPath; break }
         catch {
             if ($attempt -eq 10) { throw ("Could not read settings file {0}: {1}" -f $script:SettingsPath, $_.Exception.Message) }
             Start-Sleep -Milliseconds 200

@@ -46,6 +46,29 @@ function Test-UnderSkippedLink {
 }
 $script:DefaultStateRoot = if ($PSScriptRoot) { Join-Path (Split-Path -Parent $PSScriptRoot) 'state' } else { 'state' }
 
+function Read-SharedTextFile {
+    <#
+        Read a whole UTF-8 file while letting its writer replace it.
+
+        Writers swap state files in with File.Replace, which renames the old
+        file away; Windows refuses that while any reader holds the file
+        without FILE_SHARE_DELETE -- which Get-Content and File.ReadAllText do
+        not grant. The dashboard reads every manifest every few seconds, so a
+        pass could fail to save its manifest after it had already copied files.
+        Opening with ReadWrite and Delete sharing lets the replace go ahead;
+        this reader simply finishes reading the old version.
+    #>
+    param([Parameter(Mandatory)][string] $Path)
+    $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+    $stream = New-Object System.IO.FileStream -ArgumentList $full, ([IO.FileMode]::Open), ([IO.FileAccess]::Read), $share
+    try {
+        $reader = New-Object System.IO.StreamReader -ArgumentList $stream, ([Text.Encoding]::UTF8), $true
+        return $reader.ReadToEnd()
+    }
+    finally { $stream.Dispose() }
+}
+
 function Get-SideSnapshot {
     <#
         Enumerate one side. Metadata only -- never opens a file.
@@ -157,7 +180,7 @@ function Read-Manifest {
     $map = @{}
     if (-not (Test-Path -LiteralPath $Path)) { return $map }
 
-    $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+    $raw = Read-SharedTextFile -Path $Path
     if ([string]::IsNullOrWhiteSpace($raw)) { return $map }
 
     # -InputObject, not the pipeline: piping a JSON array through @() can leave
@@ -269,7 +292,7 @@ function Test-ManifestFile {
     param([Parameter(Mandatory)][string] $Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
     try {
-        $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+        $raw = Read-SharedTextFile -Path $Path
         if ([string]::IsNullOrWhiteSpace($raw)) { return $false }
         $null = ConvertFrom-Json -InputObject $raw
         return $true

@@ -933,6 +933,20 @@ Assert-True (Test-FileSettled -Path $future.FullName -SettleMinutes 3) "A future
 $recent = Set-TestFile (Join-Path $engineRoot 'recent.txt') 'just saved' ([datetime]::UtcNow)
 Assert-True (-not (Test-FileSettled -Path $recent.FullName -SettleMinutes 3)) "A file saved just now is still settling"
 
+# --- a reader holding the manifest does not block the pass replacing it ---
+$ctx = New-TestLink
+$mfShared = Get-ManifestPath -LinkId $ctx.Link.Id -StateRoot $ctx.State
+$heldReader = New-Object System.IO.FileStream -ArgumentList $mfShared, ([IO.FileMode]::Open), ([IO.FileAccess]::Read), ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+try {
+    $replaced = $true
+    try {
+        Write-Manifest -Path $mfShared -Entries @([pscustomobject]@{
+            RelPath = 'held.txt'; LocalLength = 1; LocalWriteUtc = $t0; OdLength = 1; OdWriteUtc = $t0 })
+    } catch { $replaced = $false }
+} finally { $heldReader.Dispose() }
+Assert-True $replaced "Write-Manifest succeeds while a shared reader holds the manifest"
+Assert-True ($null -ne (Read-Manifest -Path $mfShared)['held.txt']) "The replaced manifest is the new version"
+
 # --- seeding keeps the version it replaces ---
 $ctx = New-TestLink
 $ctx.Link.Seeded = $false

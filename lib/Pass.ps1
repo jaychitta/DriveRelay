@@ -94,10 +94,24 @@ function Write-PassSummary {
         }
 
         if (-not (Test-Path $StateRoot)) { New-Item -ItemType Directory -Path $StateRoot -Force | Out-Null }
-        $path = Get-PassSummaryPath -StateRoot $StateRoot
-        $tmp  = "$path.tmp"
-        ConvertTo-Json -InputObject $summary -Depth 6 | Set-Content -LiteralPath $tmp -Encoding utf8
-        Move-Item -LiteralPath $tmp -Destination $path -Force
+        $path = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath((Get-PassSummaryPath -StateRoot $StateRoot))
+        $tmp  = "{0}.{1}.tmp" -f $path, [guid]::NewGuid().ToString('N')
+        $json = ConvertTo-Json -InputObject $summary -Depth 6
+        [IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding -ArgumentList $true))
+        # Atomic replace, retried briefly: the tray reads this file after every
+        # pass, and Move-Item -Force deleted it before renaming, so a read in
+        # that gap saw no summary at all.
+        for ($attempt = 1; $attempt -le 10; $attempt++) {
+            try {
+                if ([IO.File]::Exists($path)) { [IO.File]::Replace($tmp, $path, $null) }
+                else                          { [IO.File]::Move($tmp, $path) }
+                break
+            }
+            catch {
+                if ($attempt -eq 10) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; throw }
+                Start-Sleep -Milliseconds 200
+            }
+        }
     }
     catch {
         # The tray losing a status update must never fail a sync.
@@ -110,7 +124,8 @@ function Read-PassSummary {
 
     $path = Get-PassSummaryPath -StateRoot $StateRoot
     if (-not (Test-Path -LiteralPath $path)) { return $null }
-    try   { return (ConvertFrom-Json -InputObject (Get-Content -LiteralPath $path -Raw -Encoding UTF8)) }
+    # Shared read (Manifest.ps1): never blocks a pass replacing the file.
+    try   { return (ConvertFrom-Json -InputObject (Read-SharedTextFile -Path $path)) }
     catch { return $null }
 }
 

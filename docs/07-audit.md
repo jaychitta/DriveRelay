@@ -146,8 +146,14 @@ writes and retries a briefly locked file instead of reading "not paused"; change
 `Update-AppSettings` under a `Global\DriveRelaySettings` mutex; writes use a per-writer temp
 file and an atomic `File.Replace`; an unparseable file is copied aside before being replaced.
 
-**R3. Manifest write collides with the dashboard's reads — medium — partly fixed.** The
-replace now retries; a reader could still hold the file through all retries.
+**R3. Manifest write collides with the dashboard's reads — medium — fixed.** The dashboard
+reads every manifest every few seconds, and `Get-Content` opens without delete sharing, which
+makes the pass's replace fail after its files were already copied — the next pass then sees
+false conflicts. *Fix:* every reader of a replaced state file (manifests, `settings.json`,
+`lastpass.json`, in the engine, tray and dashboard) uses `Read-SharedTextFile`, which opens
+with read/write/delete sharing, so the atomic replace proceeds while a read is in flight; the
+replace still retries briefly. `lastpass.json` is now written with an atomic replace too
+instead of `Move-Item -Force`, which deleted it before renaming.
 
 **R4. A deferred-forever file is invisible at INFO — low — fixed.** A future last-write time
 never settled, deferrals did not break the idle streak, and per-link `SettleMinutes` and
@@ -252,8 +258,8 @@ usage header; Uninstall's header; `settings.example.json` (`Paused`); `links.exa
 
 | Severity | Found | Fixed here | Partly fixed | Open |
 | --- | --- | --- | --- | --- |
-| High | 5 | 5 (E1–E5) | 0 | 0 |
-| Medium | 11 | 10 (E6, E7, E8, R2, U1, U2, U5, U6, U8, S2) | 1 (R3) | 0 |
+| High | 5 | 5 | 0 | 0 |
+| Medium | 11 | 11 | 0 | 0 |
 | Low | 15 | 15 | 0 | 0 |
 
 The five high findings share one theme: each was a way for the engine to act on a picture of
