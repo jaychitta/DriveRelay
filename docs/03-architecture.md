@@ -165,16 +165,40 @@ Observed working on live data: with TallyPrime running, a pass deferred `TSTATE.
   copy and leaves its baseline intact. Conflict forks use the same checks.
 - **Recoverable deletes.** Recycle Bin where there is content to store; otherwise the cloud
   service's online recycle bin, and the log says which applies. `HydrateBeforeDelete` downloads
-  first so the Recycle Bin keeps a real copy.
+  first so the Recycle Bin keeps a real copy. Only fixed local volumes count as having a Recycle
+  Bin (`Test-RecycleBinVolume`): on UNC paths, mapped network drives and removable media the
+  file is renamed into `<side root>\.driverelay-deleted\<timestamp>\<relative path>`, which
+  snapshots never list. A rename that cannot happen there defers the delete; nothing falls back
+  to a permanent delete. A file held open is deferred rather than handed to the shell, which
+  would otherwise show a blocking "file in use" dialog.
+- **Complete listings only.** `Get-SideSnapshot` walks one folder at a time and throws on any
+  enumeration error, so a folder that cannot be listed cannot make its files look deleted. Only
+  the post-pass manifest refresh accepts a partial listing (`-AllowPartial`).
+- **Links are not followed.** Junctions, mount points and directory symbolic links are skipped
+  (cloud placeholder folders are reparse points too, but not links, and are walked).
+  `Compare-LinkState` drops every path under a skipped link on either side, so no action is
+  planned and the manifest entry is kept.
+- **Deletes re-checked at apply time.** Every delete runs after every copy, so the target must
+  still match its planned metadata and its counterpart must still be absent, or it is deferred.
+- **Seeding keeps the replaced version.** A differing file on the non-seed side is renamed to a
+  conflict copy before the seed side's version is copied in.
 - **Delete cap.** A pass proposing more deletions than `MaxDelete` aborts entirely rather than
   applying half of them.
 - **Honest manifest commits.** Only paths whose action actually succeeded are recorded. A
   deferred or failed file keeps its previous entry, so the next pass compares against the same
-  baseline instead of mistaking the divergence for a fresh conflict.
+  baseline instead of mistaking the divergence for a fresh conflict. What is recorded is the
+  version that was reconciled (`Get-CommittedEntry`): the source as planned, and the other side
+  only if it still holds that version. An edit made during the pass therefore stays pending.
+- **History is required.** Manifests are written to a flushed `.tmp` and swapped in with
+  `File.Replace`, keeping the previous version as `.bak`. A seeded link whose manifest is
+  missing, empty or unreadable is restored from an intact `.tmp`, then `.bak`
+  (`Repair-LinkManifest`); with neither, the link stops. An older baseline is safe: paths it
+  does not know read as new, never as deleted.
 - **One pass at a time.** A named mutex plus the scheduler's own guard. Two passes copying the
   same file in opposite directions is the failure this prevents.
 - **Stale baselines set aside.** Re-registering a link whose id already has a manifest moves
-  that manifest aside — a baseline for different folders becomes wrong deletions.
+  that manifest, and its `.bak`/`.tmp` copies, aside — a baseline for different folders
+  becomes wrong deletions.
 
 ## Components
 

@@ -81,8 +81,21 @@ settle window exists to avoid — do not test its limits with live accounts.
 drive.google.com. Not this PC's. Enable `HydrateBeforeDelete` on that link so it does not happen
 again.
 
-**Wrong version won.** It did not — conflicts keep both. Look for
+**Deleted by mistake on a network share or removable drive.** Those have no Recycle Bin. Look
+in the hidden `.driverelay-deleted\<timestamp>\` folder at that link's root, which keeps the
+file's relative path. Move it back to restore it; delete that folder to reclaim the space.
+
+**Wrong version won.** It did not — conflicts keep both, and so does a first-run seed. Look for
 `<name> (conflict from <drive> <timestamp>)<ext>` beside the file.
+
+**A link says its sync history is missing or unreadable.** `check` shows `STOPPED`. The next
+sync restores `state\<id>\manifest.json` from an intact `manifest.json.tmp` or
+`manifest.json.bak` if there is one. If neither exists, restore the manifest from a backup, or
+remove and re-add the link to rebuild it; with no history, files deleted since the last sync
+may reappear, and files that differ are kept as conflict copies.
+
+**A folder is listed as "not followed".** It is a junction or symbolic link. DriveRelay leaves
+whatever is behind it alone on both sides. Link the target folder directly if it should sync.
 
 **A deletion conflicts with a possible edit.** The dashboard shows **Review**
 with the surviving copy and deleted path. DriveRelay leaves the deletion intact

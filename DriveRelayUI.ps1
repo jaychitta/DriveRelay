@@ -382,9 +382,7 @@ function Show-AddDialog {
             $seed = if ($rbLocal.Checked) { 'Local' } else { 'Remote' }
             $link = Add-Link -Local $local -Remote $remote -Seed $seed -SettleMinutes $settings.SettleMinutes -MaxDelete $settings.MaxDelete -HydrateBeforeDelete ([bool]$cbSafe.Checked)
             $mf = Join-Path (Join-Path $script:StateRoot $link.Id) 'manifest.json'
-            if (Test-Path -LiteralPath $mf) {
-                Move-Item -LiteralPath $mf -Destination ("$mf.superseded-{0}" -f (Get-Date -Format 'yyyyMMdd-HHmmss')) -Force
-            }
+            $null = Move-ManifestAside -Path $mf
             Write-Log ("link added via UI: {0}  {1} <-> {2}" -f $link.Id, $link.LocalPath, $link.RemotePath)
             $f.DialogResult = [System.Windows.Forms.DialogResult]::OK
             $f.Close()

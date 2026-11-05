@@ -195,11 +195,8 @@ function Invoke-AddCommand {
     Write-Log ("link added: {0}  {1} <-> {2}  seed={3}" -f $l.Id, $l.LocalPath, $l.RemotePath, $l.Seed)
 
     $mf = Get-ManifestPath -LinkId $l.Id -StateRoot $script:StateRoot
-    if (Test-Path -LiteralPath $mf) {
-        $aside = "$mf.superseded-{0}" -f (Get-Date -Format 'yyyyMMdd-HHmmss')
-        Move-Item -LiteralPath $mf -Destination $aside -Force
-        Write-Log ("set aside stale manifest for {0}: {1}" -f $l.Id, $aside) 'WARN'
-    }
+    $aside = Move-ManifestAside -Path $mf
+    if ($aside) { Write-Log ("set aside stale manifest for {0}: {1}" -f $l.Id, $aside) 'WARN' }
     "Registered '{0}'" -f $l.Id
     "  local     {0}" -f $l.LocalPath
     "  remote    {0}   ({1})" -f $l.RemotePath, (Get-ProviderLabel -Path $l.RemotePath)
@@ -285,10 +282,21 @@ function Invoke-CheckCommand {
             ''
         }
 
-        try { $items = Compare-LinkState -Link $link -ExcludePatterns $patterns -StateRoot $script:StateRoot }
+        $problem = Get-ManifestProblem -Link $link -StateRoot $script:StateRoot
+        if ($problem) {
+            "    STOPPED -- {0}." -f $problem
+            "    A sync restores it from the .tmp or .bak copy if one is intact; otherwise the link stays stopped."
+            continue
+        }
+
+        $skippedLinks = New-Object 'System.Collections.Generic.List[string]'
+        try { $items = Compare-LinkState -Link $link -ExcludePatterns $patterns -StateRoot $script:StateRoot -SkippedLinks $skippedLinks }
         catch {
             "    SKIPPED -- {0}" -f $_.Exception.Message
             continue
+        }
+        foreach ($s in ($skippedLinks | Sort-Object -Unique)) {
+            "    not followed (junction or symbolic link; left untouched): {0}" -f $s.TrimEnd('\')
         }
 
         $actionable = @($items | Where-Object { $_.Action -ne 'InSync' -and $_.Action -ne 'Forget' })
@@ -298,14 +306,15 @@ function Invoke-CheckCommand {
 
         if (-not $link.Seeded) {
             # The classification below assumes an ordinary pass. A first run
-            # seeds instead: files present on both sides that differ are not
-            # forked, they are overwritten from the seed side.
+            # seeds instead: for files present on both sides that differ, the
+            # seed side's version becomes current and the other is kept
+            # beside it under a conflict name.
             $differing = @($items | Where-Object { $_.Action -eq 'Conflict' }).Count
             if ($differing -gt 0) {
                 $other = if ($link.Seed -eq 'Local') { 'remote' } else { 'local' }
                 ''
-                "    !! {0} file(s) differ on both sides. Seeding from {1} will overwrite the" -f $differing, $link.Seed
-                "       {0} copy of each rather than keeping both. Review them before syncing." -f $other
+                "    !! {0} file(s) differ on both sides. Seeding from {1} makes that version" -f $differing, $link.Seed
+                "       current; each {0} version is kept beside it as a conflict copy." -f $other
             }
         }
 
@@ -544,10 +553,17 @@ function Invoke-StatusCommand {
             if ($avail.Blocking) { continue }
         }
 
-        try { $items = Compare-LinkState -Link $link -ExcludePatterns $patterns -StateRoot $script:StateRoot }
+        $problem = Get-ManifestProblem -Link $link -StateRoot $script:StateRoot
+        if ($problem) { "    STOPPED: {0}" -f $problem; continue }
+
+        $skippedLinks = New-Object 'System.Collections.Generic.List[string]'
+        try { $items = Compare-LinkState -Link $link -ExcludePatterns $patterns -StateRoot $script:StateRoot -SkippedLinks $skippedLinks }
         catch {
             "    UNAVAILABLE: {0}" -f $_.Exception.Message
             continue
+        }
+        foreach ($s in ($skippedLinks | Sort-Object -Unique)) {
+            "    not followed (junction or symbolic link): {0}" -f $s.TrimEnd('\')
         }
         $pending = @($items | Where-Object { $_.Action -ne 'InSync' -and $_.Action -ne 'Forget' })
 

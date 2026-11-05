@@ -22,7 +22,28 @@
 # Filesystem timestamps are not exact across copies; treat writes within this
 # many seconds of each other as the same moment.
 $script:TimeToleranceSeconds = 2
+
+# Where a delete goes on a volume with no Recycle Bin (see Remove-FileSafely).
+# It sits at each link root and is never part of a snapshot.
+$script:DeletedFolderName = '.driverelay-deleted'
 . (Join-Path $PSScriptRoot 'FileIdentity.ps1')
+
+function Test-LinkDirectory {
+    # A junction, mount point or directory symbolic link. LinkType is $null
+    # for other reparse points such as cloud placeholder folders. If it cannot
+    # be read, the folder is walked as before.
+    param([Parameter(Mandatory)][object] $Item)
+    try { return (@('Junction', 'SymbolicLink') -contains [string] $Item.LinkType) }
+    catch { return $false }
+}
+
+function Test-UnderSkippedLink {
+    param([Parameter(Mandatory)][string] $Key,
+          [System.Collections.Generic.List[string]] $Prefixes)
+    if ($null -eq $Prefixes) { return $false }
+    foreach ($p in $Prefixes) { if ($Key.StartsWith($p, [StringComparison]::Ordinal)) { return $true } }
+    return $false
+}
 $script:DefaultStateRoot = if ($PSScriptRoot) { Join-Path (Split-Path -Parent $PSScriptRoot) 'state' } else { 'state' }
 
 function Get-SideSnapshot {
@@ -41,7 +62,11 @@ function Get-SideSnapshot {
     param(
         [Parameter(Mandatory)][string] $Root,
         [string[]] $ExcludePatterns,
-        [switch] $AllowPartial
+        [switch] $AllowPartial,
+
+        # Receives the relative path (lower-cased, trailing '\') of every
+        # junction or directory symbolic link that was not followed.
+        [System.Collections.Generic.List[string]] $SkippedLinks
     )
 
     $map  = @{}
@@ -49,30 +74,55 @@ function Get-SideSnapshot {
     if (-not (Test-Path -LiteralPath $root)) { return $map }
 
     $prefix = $root.Length + 1
-    $listErrors = $null
+    $listErrors = New-Object System.Collections.ArrayList
+    $deletedFolder = Join-Path $root $script:DeletedFolderName
 
-    Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue -ErrorVariable listErrors |
-        ForEach-Object {
-            $name = $_.Name
-            if (Test-FileExcluded -Name $name -Patterns $ExcludePatterns) { return }
+    # Walked one folder at a time rather than with -Recurse: Windows
+    # PowerShell 5.1 follows junctions and directory symbolic links when
+    # recursing, which would sync -- and delete through -- folders that live
+    # outside the link root, or loop on a link back into it. Cloud placeholder
+    # folders are reparse points too, but not links, and are walked normally.
+    $pending = New-Object 'System.Collections.Generic.Stack[string]'
+    $pending.Push($root)
+    while ($pending.Count -gt 0) {
+        $dir = $pending.Pop()
+        $dirErrors = $null
+        $children = @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue -ErrorVariable dirErrors)
+        foreach ($e in @($dirErrors)) { if ($e) { $null = $listErrors.Add($e) } }
 
-            $rel = $_.FullName.Substring($prefix)
+        foreach ($c in $children) {
+            if ($c.PSIsContainer) {
+                if ($c.FullName -eq $deletedFolder) { continue }
+                if ((([int] $c.Attributes) -band 0x400) -and (Test-LinkDirectory -Item $c)) {
+                    if ($null -ne $SkippedLinks) {
+                        $SkippedLinks.Add($c.FullName.Substring($prefix).ToLowerInvariant() + '\')
+                    }
+                    continue
+                }
+                $pending.Push($c.FullName)
+                continue
+            }
+
+            if (Test-FileExcluded -Name $c.Name -Patterns $ExcludePatterns) { continue }
+
+            $rel = $c.FullName.Substring($prefix)
             $map[$rel.ToLowerInvariant()] = [pscustomobject]@{
                 RelPath   = $rel
-                FullPath  = $_.FullName
-                Length    = $_.Length
-                WriteUtc  = $_.LastWriteTimeUtc
-                IsOffline = [bool](([int] $_.Attributes) -band 0x1000)
-                FileId    = Get-FileIdentity -Path $_.FullName
+                FullPath  = $c.FullName
+                Length    = $c.Length
+                WriteUtc  = $c.LastWriteTimeUtc
+                IsOffline = [bool](([int] $c.Attributes) -band 0x1000)
+                FileId    = Get-FileIdentity -Path $c.FullName
             }
         }
+    }
 
-    if (-not $AllowPartial -and $listErrors -and @($listErrors).Count -gt 0) {
-        $first = @($listErrors)[0]
+    if (-not $AllowPartial -and $listErrors.Count -gt 0) {
+        $first = $listErrors[0]
         $where = if ($first.TargetObject) { [string] $first.TargetObject } else { $root }
         throw (("could not list every file under {0} ({1} error(s); first at {2}: {3}). " +
                 "Nothing was copied or deleted -- an incomplete listing is never read as deletions.") -f
-               $root, @($listErrors).Count, $where, $first.Exception.Message)
+               $root, $listErrors.Count, $where, $first.Exception.Message)
     }
 
     return $map
@@ -180,11 +230,126 @@ function Write-Manifest {
         if (-not $json.TrimStart().StartsWith('[')) { $json = "[$json]" }
     }
 
-    # Temp-then-move: a half-written manifest would make the next pass
-    # misread deletions as new files.
-    $tmp = "$Path.tmp"
-    Set-Content -LiteralPath $tmp -Value $json -Encoding utf8
-    Move-Item -LiteralPath $tmp -Destination $Path -Force
+    # Temp, flushed to disk, then an atomic replace that keeps the previous
+    # version as .bak. Move-Item -Force deletes the destination before it
+    # renames, so a crash in between left no manifest at all, and an
+    # unflushed write could leave an empty one after a power cut -- both of
+    # which read as "no history". See Repair-LinkManifest for the recovery.
+    $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    $tmp  = "$full.tmp"
+    $bytes = (New-Object System.Text.UTF8Encoding -ArgumentList $true).GetBytes($json)
+    $stream = [IO.File]::Open($tmp, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+        $preamble = (New-Object System.Text.UTF8Encoding -ArgumentList $true).GetPreamble()
+        $stream.Write($preamble, 0, $preamble.Length)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    }
+    finally { $stream.Dispose() }
+
+    # A reader (the dashboard's background scan) can briefly hold the file;
+    # retry a short while rather than failing a pass that has already acted.
+    $attempt = 0
+    while ($true) {
+        try {
+            if ([IO.File]::Exists($full)) { [IO.File]::Replace($tmp, $full, "$full.bak") }
+            else                          { [IO.File]::Move($tmp, $full) }
+            break
+        }
+        catch {
+            $attempt++
+            if ($attempt -ge 10) { throw }
+            Start-Sleep -Milliseconds 300
+        }
+    }
+}
+
+function Move-ManifestAside {
+    <#
+        A re-added link reuses its old id and so its old state folder. Its
+        history -- the manifest and the .bak/.tmp copies that Repair-LinkManifest
+        would restore from -- belongs to the previous registration and must
+        not be read as this one's. Returns the set-aside manifest path, or $null.
+    #>
+    param([Parameter(Mandatory)][string] $Path)
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $aside = $null
+    foreach ($suffix in @('', '.bak', '.tmp')) {
+        $p = "$Path$suffix"
+        if (Test-Path -LiteralPath $p) {
+            $dest = "$Path.superseded-$stamp$suffix"
+            Move-Item -LiteralPath $p -Destination $dest -Force
+            if (-not $suffix) { $aside = $dest }
+        }
+    }
+    return $aside
+}
+
+function Test-ManifestFile {
+    # True when the file exists, is not empty, and parses as JSON.
+    param([Parameter(Mandatory)][string] $Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    try {
+        $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $false }
+        $null = ConvertFrom-Json -InputObject $raw
+        return $true
+    }
+    catch { return $false }
+}
+
+function Get-ManifestProblem {
+    <#
+        For a link that has already been seeded, the manifest is the only proof
+        of what existed at the last pass. Missing, empty or unreadable, every
+        file would look new: deletions would be undone and every difference
+        would become a conflict. Returns a description, or $null when fine.
+        An unseeded link has no manifest yet, which is correct.
+    #>
+    param([Parameter(Mandatory)][object] $Link,
+          [string] $StateRoot = $script:DefaultStateRoot)
+    if (-not $Link.Seeded) { return $null }
+    $path = Get-ManifestPath -LinkId $Link.Id -StateRoot $StateRoot
+    if (Test-ManifestFile -Path $path) { return $null }
+    $state = if (Test-Path -LiteralPath $path) { 'empty or unreadable' } else { 'missing' }
+    return ("the sync history for '{0}' is {1} ({2})" -f $Link.Id, $state, $path)
+}
+
+function Repair-LinkManifest {
+    <#
+        Before a pass: if a seeded link's manifest is unusable, restore it from
+        the newest intact copy -- the .tmp a crashed write completed, else the
+        .bak of the previous pass. An older baseline is safe: anything it does
+        not know about reads as new (copied or kept as a conflict), never as
+        deleted. With no intact copy the link stops rather than guessing.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param([Parameter(Mandatory)][object] $Link,
+          [string] $StateRoot = $script:DefaultStateRoot)
+
+    $problem = Get-ManifestProblem -Link $Link -StateRoot $StateRoot
+    if (-not $problem) { return [pscustomobject]@{ Ok = $true; Message = '' } }
+
+    $path = Get-ManifestPath -LinkId $Link.Id -StateRoot $StateRoot
+    foreach ($candidate in @("$path.tmp", "$path.bak")) {
+        if (-not (Test-ManifestFile -Path $candidate)) { continue }
+        if (-not $PSCmdlet.ShouldProcess($path, "restore sync history from $candidate")) { break }
+        if (Test-Path -LiteralPath $path) {
+            Move-Item -LiteralPath $path -Destination ("{0}.unreadable-{1}" -f $path, (Get-Date -Format 'yyyyMMdd-HHmmss')) -Force
+        }
+        Copy-Item -LiteralPath $candidate -Destination $path -Force
+        return [pscustomobject]@{
+            Ok = $true
+            Message = ("{0}; restored from {1}" -f $problem, (Split-Path -Leaf $candidate))
+        }
+    }
+
+    return [pscustomobject]@{
+        Ok = $false
+        Message = (("{0}, and no intact copy was found. Nothing was copied or deleted: without it, " +
+                    "deleted files would come back. Restore the file from a backup, or remove and " +
+                    "re-add the link to rebuild it (files deleted since the last sync may reappear).") -f $problem)
+    }
 }
 
 function Test-SameFileState {
@@ -222,17 +387,26 @@ function Compare-LinkState {
     param(
         [Parameter(Mandatory)][object] $Link,
         [string[]] $ExcludePatterns,
-        [string] $StateRoot = $script:DefaultStateRoot
+        [string] $StateRoot = $script:DefaultStateRoot,
+
+        # Optional: receives the junctions/symbolic links that were not
+        # followed on either side, so callers can report them.
+        [System.Collections.Generic.List[string]] $SkippedLinks
     )
 
-    $local    = Get-SideSnapshot -Root $Link.LocalPath              -ExcludePatterns $ExcludePatterns
-    $od       = Get-SideSnapshot -Root (Get-RemotePath -Link $Link) -ExcludePatterns $ExcludePatterns
+    if ($null -eq $SkippedLinks) { $SkippedLinks = New-Object 'System.Collections.Generic.List[string]' }
+    $local    = Get-SideSnapshot -Root $Link.LocalPath              -ExcludePatterns $ExcludePatterns -SkippedLinks $SkippedLinks
+    $od       = Get-SideSnapshot -Root (Get-RemotePath -Link $Link) -ExcludePatterns $ExcludePatterns -SkippedLinks $SkippedLinks
     $manifest = Read-Manifest -Path (Get-ManifestPath -LinkId $Link.Id -StateRoot $StateRoot)
 
+    # Anything under a link that was not followed -- on either side -- is left
+    # out entirely: no copy, no delete, and its manifest entry is kept. Files
+    # synced through a junction by earlier versions must not now read as
+    # deleted just because the junction is no longer walked.
     $keys = New-Object 'System.Collections.Generic.HashSet[string]'
-    foreach ($k in $local.Keys)    { $null = $keys.Add($k) }
-    foreach ($k in $od.Keys)       { $null = $keys.Add($k) }
-    foreach ($k in $manifest.Keys) { $null = $keys.Add($k) }
+    foreach ($k in $local.Keys)    { if (-not (Test-UnderSkippedLink -Key $k -Prefixes $SkippedLinks)) { $null = $keys.Add($k) } }
+    foreach ($k in $od.Keys)       { if (-not (Test-UnderSkippedLink -Key $k -Prefixes $SkippedLinks)) { $null = $keys.Add($k) } }
+    foreach ($k in $manifest.Keys) { if (-not (Test-UnderSkippedLink -Key $k -Prefixes $SkippedLinks)) { $null = $keys.Add($k) } }
 
     $results = New-Object System.Collections.ArrayList
 

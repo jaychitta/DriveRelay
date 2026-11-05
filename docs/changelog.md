@@ -2,6 +2,29 @@
 
 All notable changes to DriveRelay (formerly SyncOrchestrator) will be documented in this file.
 
+## [Audit] - 2026-11-05 — audit report and items 1-4
+
+- Wrote [07-audit.md](07-audit.md): method, prior-resolution status, findings
+  with severity and status, and the verification still owed.
+- Seeding renames a differing file on the non-seed side to a conflict copy
+  before replacing it (same-volume rename, no hydration); `check` says so.
+- Deletes on volumes without a Recycle Bin (UNC, mapped network, removable)
+  are renamed into `<side root>\.driverelay-deleted\<timestamp>\` instead of
+  being deleted permanently, or deferred. Held-open files are deferred before
+  the shell is called, avoiding a blocking "file in use" dialog.
+- Snapshots walk folder by folder and do not follow junctions, mount points or
+  directory symbolic links; paths under one get no action on either side and
+  keep their manifest entry. `check`/`status` list them.
+- Manifests are flushed and swapped with `File.Replace`, keeping `.bak`. A
+  seeded link with a missing, empty or unreadable manifest is restored from an
+  intact `.tmp`/`.bak` or stopped. Re-adding a link sets its `.bak`/`.tmp`
+  aside with the manifest. Test fixtures now start with an empty manifest.
+- Docs: README safety model and seeding, architecture safety rules, runbook
+  recovery, CLAUDE.md module notes and doc map.
+- Verification: not run (no PowerShell in the sandbox). Section 9c gained
+  seed, holding-folder, junction and manifest-recovery tests; junction checks
+  skip without junction permission. Run the suite under Windows PowerShell 5.1.
+
 ## [Audit] - 2026-11-05 — second code audit, first fixes
 
 - Audited every script at 2b42a7e across engine, state/concurrency, UI/tray,
@@ -35,7 +58,8 @@ All notable changes to DriveRelay (formerly SyncOrchestrator) will be documented
   with no PowerShell, so no parse check, regression run or PSScriptAnalyzer.
   Run `tests/Test-DriveRelay.ps1` under Windows PowerShell 5.1 before relying
   on these changes. No live sync or installation performed.
-- Pending owner decisions: seeding overwrites without keeping the replaced
+- Pending owner decisions (the first four were resolved in the entry above):
+  seeding overwrites without keeping the replaced
   copy; Recycle Bin deletion on network/removable volumes (permanent) and
   error dialogs in unattended passes; Windows PowerShell 5.1 recursion into
   junctions; missing/empty manifest for a seeded link; manifest set-aside after

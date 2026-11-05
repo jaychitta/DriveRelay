@@ -21,7 +21,7 @@ DriveRelay relays files between a high-speed local NTFS working folder and a clo
 - `lib/`: Modular PowerShell helper scripts:
   - `DashboardScan.ps1`: Read-only availability and conflict inventories in a background PowerShell runspace. Dashboard rendering reads completed results, rejects inventories for changed registries, and never waits for folder scans.
   - `Conflicts.ps1`: Lists timestamped conflict copies and live deletion conflicts, with paths and review guidance. Used by CLI, dashboard Duplicates/Review controls and tray warnings. Live deletion classification depends on `Manifest.ps1` and `Availability.ps1`.
-  - `Actions.ps1`: Sync action execution, guarded atomic copying, deletion with safety thresholds, and removal of folders a pass empties. Depends on `Availability.ps1`, `Manifest.ps1` and `Conflicts.ps1`. Deletion conflicts preserve the survivor without undoing the deletion and retain their old manifest entry.
+  - `Actions.ps1`: Sync action execution, guarded atomic copying, deletion with safety thresholds, and removal of folders a pass empties. Depends on `Availability.ps1`, `Manifest.ps1` and `Conflicts.ps1`. Deletion conflicts preserve the survivor without undoing the deletion and retain their old manifest entry. Deletes are re-checked at apply time (`Test-DeleteStillValid`); volumes without a Recycle Bin get a `.driverelay-deleted` holding folder at the side root; seeding renames a replaced version to a conflict copy; manifest commits record the reconciled version (`Get-CommittedEntry`); a seeded link with unusable history is repaired from `.tmp`/`.bak` or stopped.
   - `Availability.ps1`: Distinguishes an unmounted drive from a deleted folder from a stopped cloud client, and reports what to do about each. Must be dot-sourced before `Actions.ps1`.
   - `Hydration.ps1`: OneDrive file hydration and cloud dehydration handlers.
   - `Icons.ps1`: GDI+ programmatic icon drawing for tray and fallback icon generation.
@@ -31,7 +31,7 @@ DriveRelay relays files between a high-speed local NTFS working folder and a clo
     for. Dot-sourced into the entry scripts, so its state variables are deliberately named to
     avoid colliding with their parameters (`$script:LogThreshold`, not `$script:LogLevel`).
   - `LogViewer.ps1`: Read-only log viewer used by the tray and dashboard.
-  - `Manifest.ps1`: Metadata-only snapshots and change tracking. Loads `FileIdentity.ps1`; records optional per-side NTFS IDs and pairs unchanged tracked moves into `MoveLocal`/`MoveRemote`. Produces `DeletionConflict` for a tracked deletion versus changed survivor, and records destination parents for queued-copy/move checks. Never hashes cloud content.
+  - `Manifest.ps1`: Metadata-only snapshots and change tracking. Loads `FileIdentity.ps1`; records optional per-side NTFS IDs and pairs unchanged tracked moves into `MoveLocal`/`MoveRemote`. Produces `DeletionConflict` for a tracked deletion versus changed survivor, and records destination parents for queued-copy/move checks. Never hashes cloud content. Snapshots walk folder by folder, throw on any listing error (except `-AllowPartial`), skip junctions/symbolic links and `.driverelay-deleted`; paths under a skipped link get no action. Writes are flushed and swapped with `File.Replace`, keeping `.bak`; `Repair-LinkManifest`/`Move-ManifestAside` handle recovery and re-registration.
   - `FileIdentity.ps1`: Zero-access Windows metadata handles for NTFS file IDs (volume, file index, creation time), excluding hard links and unsupported filesystems. Native same-volume rename refuses overwrites and copying across volumes. Loaded by `Manifest.ps1` in every engine/inventory host.
   - `Pass.ps1`: Sync pass orchestration logic. Collapses runs of no-op passes into one
     hourly heartbeat line, tracking the streak in `state/lastpass.json`.
@@ -61,6 +61,7 @@ DriveRelay relays files between a high-speed local NTFS working folder and a clo
   - [04-operations.md](docs/04-operations.md): Current commands, settings and installation guidance.
   - [05-runbook.md](docs/05-runbook.md): Migration, recovery and troubleshooting procedures.
   - [06-audit.md](docs/06-audit.md): Historical code audit, with all 12 findings resolved in its Summary and Resolutions sections.
+  - [07-audit.md](docs/07-audit.md): Second code audit (2026-11-05): findings, what was fixed, and what awaits the owner's decision.
   - [changelog.md](docs/changelog.md): Changes, verification limits and pending work; read the latest entries before resuming.
 
 ## What to read

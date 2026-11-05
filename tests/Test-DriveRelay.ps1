@@ -232,6 +232,9 @@ function New-TestLink {
     $R = Join-Path $engineRoot 'remote'
     $S = Join-Path $engineRoot 'state'
     New-Item -ItemType Directory -Path $L, $R, $S -Force | Out-Null
+    # Seeded links must have a manifest (Repair-LinkManifest stops one without
+    # it); an empty one is the honest "no history yet" for these fixtures.
+    Write-Manifest -Path (Get-ManifestPath -LinkId $Id -StateRoot $S) -Entries @()
 
     return [pscustomobject]@{
         Link = [pscustomobject]@{
@@ -576,6 +579,7 @@ Write-Host "9. Testing manifest serialisation (lib/Manifest.ps1)" -ForegroundCol
 
 $mfPath = Join-Path $testDir 'test-manifest.json'
 if (Test-Path $mfPath) { Remove-Item -LiteralPath $mfPath -Force }
+if (Test-Path "$mfPath.bak") { Remove-Item -LiteralPath "$mfPath.bak" -Force }
 
 # Empty must serialise as [] and read back as nothing -- not as null, and not as
 # a file the next pass reads as "everything is new".
@@ -604,6 +608,7 @@ Assert-Equal $back2.Count 2 "Two-entry manifest reads back as two entries"
 Assert-True ($null -ne $back2['sub\two.txt']) "Manifest keys are lower-cased for lookup"
 
 if (Test-Path $mfPath) { Remove-Item -LiteralPath $mfPath -Force }
+if (Test-Path "$mfPath.bak") { Remove-Item -LiteralPath "$mfPath.bak" -Force }
 
 # ---------------------------------------------------------- 9b. Moves ---
 Write-Host '9b. Testing moves and renames without copying' -ForegroundColor Yellow
@@ -863,6 +868,83 @@ function Invoke-CopyToRemote {
 try { $null = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State }
 finally { Set-Item -Path Function:\Invoke-CopyToRemote -Value $script:RealCopyToRemote; $script:EditDuringPass = $null }
 Assert-Equal (Get-Action $ctx 'a.txt') 'CopyToRemote' "A local edit made during the pass is still pending, not absorbed into the baseline"
+
+# --- seeding keeps the version it replaces ---
+$ctx = New-TestLink
+$ctx.Link.Seeded = $false
+$null = Set-TestFile (Join-Path $ctx.Local 'doc.txt') 'local version' $t1
+$null = Set-TestFile (Join-Path $ctx.Remote 'doc.txt') 'remote version, different' $t0
+$null = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+$kept = @(Get-ChildItem -LiteralPath $ctx.Remote -File | Where-Object { $_.Name -like 'doc (conflict from *' })
+Assert-Equal $kept.Count 1 "Seeding over a differing file keeps the replaced version as a conflict copy"
+if ($kept.Count -eq 1) {
+    Assert-Equal (Get-Content -LiteralPath $kept[0].FullName -Raw) 'remote version, different' "The conflict copy holds the replaced content"
+}
+Assert-Equal (Get-Content -LiteralPath (Join-Path $ctx.Remote 'doc.txt') -Raw) 'local version' "The seed side's version is current"
+
+# --- no Recycle Bin: deletes go to the holding folder, never vanish ---
+$ctx = New-TestLink
+$doomed = Set-TestFile (Join-Path $ctx.Remote 'sub\old.txt') 'recover me' $t0
+$script:RealRecycleTest = ${function:Test-RecycleBinVolume}
+function Test-RecycleBinVolume { param([string] $Path) return $false }
+try { $okDelete = Remove-FileSafely -Path $doomed.FullName -Root $ctx.Remote -RelPath 'sub\old.txt' -Confirm:$false }
+finally { Set-Item -Path Function:\Test-RecycleBinVolume -Value $script:RealRecycleTest }
+Assert-True $okDelete "A delete on a volume without a Recycle Bin succeeds"
+$held = @(Get-ChildItem -LiteralPath (Join-Path $ctx.Remote '.driverelay-deleted') -Recurse -File -Force -ErrorAction SilentlyContinue)
+Assert-Equal $held.Count 1 "The deleted file is kept under .driverelay-deleted"
+Assert-True ($held.Count -eq 1 -and $held[0].FullName -like '*\sub\old.txt') "The holding folder keeps the file's relative path"
+Assert-Equal (Get-SideSnapshot -Root $ctx.Remote -ExcludePatterns @()).Count 0 "The holding folder is never part of a snapshot"
+Assert-True (-not (Test-RecycleBinVolume -Path '\\server\share\x.txt')) "A UNC path is not treated as having a Recycle Bin"
+
+# --- junctions are not followed, and what lies under them is left alone ---
+$ctx = New-TestLink
+$outside = Join-Path $engineRoot 'outside'
+$null = Set-TestFile (Join-Path $outside 'secret.txt') 'not part of the link' $t0
+$junction = Join-Path $ctx.Local 'linked'
+$madeJunction = $false
+try { $null = New-Item -ItemType Junction -Path $junction -Target $outside -ErrorAction Stop; $madeJunction = $true } catch { }
+if ($madeJunction) {
+    $rf = Set-TestFile (Join-Path $ctx.Remote 'linked\secret.txt') 'not part of the link' $t0
+    Write-TestManifest $ctx @([pscustomobject]@{
+        RelPath = 'linked\secret.txt'
+        LocalLength = $rf.Length; LocalWriteUtc = $rf.LastWriteTimeUtc
+        OdLength    = $rf.Length; OdWriteUtc    = $rf.LastWriteTimeUtc
+    })
+    $skipped = New-Object 'System.Collections.Generic.List[string]'
+    $snap = Get-SideSnapshot -Root $ctx.Local -ExcludePatterns @() -SkippedLinks $skipped
+    Assert-Equal $snap.Count 0 "Files behind a junction are not listed"
+    Assert-Equal ($skipped -join ',') 'linked\' "The skipped junction is reported"
+    Assert-Equal (Get-Action $ctx 'linked\secret.txt') '<absent>' "A tracked path under a junction gets no action, not a delete"
+    $null = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+    Assert-True (Test-Path -LiteralPath $rf.FullName) "The remote counterpart of a junctioned file is not deleted"
+    cmd.exe /c rmdir "$junction" | Out-Null
+} else {
+    Write-Host "  [SKIP] junction creation unavailable; junction checks not run" -ForegroundColor DarkYellow
+}
+
+# --- a seeded link with no usable history stops, or recovers from .bak ---
+$ctx = New-TestLink
+$lf = Set-TestFile (Join-Path $ctx.Local 'a.txt') 'kept' $t0
+$rf = Set-TestFile (Join-Path $ctx.Remote 'a.txt') 'kept' $t0
+$mf = Get-ManifestPath -LinkId $ctx.Link.Id -StateRoot $ctx.State
+Remove-Item -LiteralPath $mf -Force
+Remove-Item -LiteralPath "$mf.bak" -Force -ErrorAction SilentlyContinue
+$res = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+Assert-True $res.Aborted "A seeded link whose manifest is missing stops"
+Set-Content -LiteralPath $mf -Value '' -Encoding utf8
+$res = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+Assert-True $res.Aborted "A seeded link whose manifest is empty stops"
+Write-Manifest -Path $mf -Entries @([pscustomobject]@{
+    RelPath = 'a.txt'
+    LocalLength = $lf.Length; LocalWriteUtc = $lf.LastWriteTimeUtc
+    OdLength    = $rf.Length; OdWriteUtc    = $rf.LastWriteTimeUtc
+})
+Write-Manifest -Path $mf -Entries @()          # the earlier version is now .bak
+Assert-True (Test-Path -LiteralPath "$mf.bak") "Writing a manifest keeps the previous version as .bak"
+Set-Content -LiteralPath $mf -Value '' -Encoding utf8
+$res = Invoke-LinkSync -Link $ctx.Link -ExcludePatterns @() -StateRoot $ctx.State
+Assert-True (-not $res.Aborted) "An unusable manifest is restored from .bak and the pass runs"
+Assert-True ($null -ne (Read-Manifest -Path $mf)['a.txt']) "The restored history is the intact .bak"
 
 # ------------------------------------------------------- 10. Availability ---
 # An unmounted drive, a deleted folder and a stopped cloud client all look like

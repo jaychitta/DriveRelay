@@ -243,14 +243,29 @@ function Remove-FileSafely {
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)][string] $Path,
-        [switch] $HydrateFirst
+        [switch] $HydrateFirst,
+
+        # The link root on this side and the file's path under it. Needed only
+        # on volumes with no Recycle Bin, where the file is moved into
+        # <Root>\.driverelay-deleted\ instead -- see Test-RecycleBinVolume.
+        [string] $Root,
+        [string] $RelPath
     )
 
     $offline = $false
     try { $offline = (Get-CloudState -Path $Path).IsOffline } catch { }
 
-    $target = if ($offline) { 'delete placeholder (recoverable from the cloud service online recycle bin)' }
-              else          { 'delete (to Recycle Bin)' }
+    # A network share or a removable drive has no Recycle Bin: the shell
+    # deletes there permanently, silently. Never let "deleted" mean that.
+    $recycle = $offline -or (Test-RecycleBinVolume -Path $Path)
+    if (-not $recycle -and (-not $Root -or -not $RelPath)) {
+        Write-Log ("no Recycle Bin on this volume and no holding folder given, deferring delete: {0}" -f $Path) 'WARN'
+        return $false
+    }
+
+    $target = if ($offline)     { 'delete placeholder (recoverable from the cloud service online recycle bin)' }
+              elseif ($recycle) { 'delete (to Recycle Bin)' }
+              else              { "move to $script:DeletedFolderName (this volume has no Recycle Bin)" }
 
     if (-not $PSCmdlet.ShouldProcess($Path, $target)) { return $false }
 
@@ -262,6 +277,37 @@ function Remove-FileSafely {
         }
         else {
             Write-Log ("could not hydrate before delete, deferring: {0}" -f $Path) 'WARN'
+            return $false
+        }
+    }
+
+    # A file another program holds open makes the shell show a modal "file in
+    # use" dialog, which would stall an unattended pass until someone answers
+    # it. Defer instead; a placeholder is reported unlocked without opening it.
+    if (Test-FileLocked -Path $Path) {
+        Write-Log ("delete deferred, file is held open: {0}" -f $Path) 'DEBUG'
+        return $false
+    }
+
+    if (-not $recycle) {
+        try {
+            $stamp = Get-Date -Format 'yyyy-MM-dd HHmmss'
+            $holding = Join-Path (Join-Path $Root $script:DeletedFolderName) $stamp
+            $kept = Join-Path $holding $RelPath
+            $keptDir = Split-Path -Parent $kept
+            if (-not (Test-Path -LiteralPath $keptDir)) {
+                New-Item -ItemType Directory -Path $keptDir -Force -ErrorAction Stop | Out-Null
+                $top = Get-Item -LiteralPath (Join-Path $Root $script:DeletedFolderName) -Force
+                $top.Attributes = $top.Attributes -bor [IO.FileAttributes]::Hidden
+            }
+            # Same-volume rename only: it refuses to overwrite and never falls
+            # back to a copy, so a failure leaves the file where it was.
+            [DriveRelay.FileIdentity]::Move($Path, $kept)
+            Write-Log ("deleted {0} -- no Recycle Bin on this volume; kept as {1}" -f $Path, $kept)
+            return $true
+        }
+        catch {
+            Write-Log ("could not move {0} to {1}, deferring delete: {2}" -f $Path, $script:DeletedFolderName, $_.Exception.Message) 'WARN'
             return $false
         }
     }
@@ -284,6 +330,24 @@ function Remove-FileSafely {
         Write-Log ("delete failed for {0}: {1}" -f $Path, $_.Exception.Message) 'WARN'
         return $false
     }
+}
+
+function Test-RecycleBinVolume {
+    <#
+        True only where Windows keeps deleted files: a fixed local volume
+        (including external disks that report as fixed). UNC paths, mapped
+        network drives and removable media have no Recycle Bin, and deleting
+        there through the shell is permanent. When the answer is unknown the
+        safe answer is "no".
+    #>
+    param([Parameter(Mandatory)][string] $Path)
+    if ($Path -match '^\\\\') { return $false }
+    try {
+        $qualifier = Split-Path -Qualifier $Path -ErrorAction Stop
+        $drive = New-Object System.IO.DriveInfo -ArgumentList $qualifier
+        return ($drive.DriveType -eq [IO.DriveType]::Fixed)
+    }
+    catch { return $false }
 }
 
 function Remove-EmptiedDirectory {
@@ -530,6 +594,20 @@ function Invoke-LinkSeed {
 
         $dest = Join-Path $toRoot $s.RelPath
         try {
+            # A differing file on the other side is a version nobody has chosen
+            # to discard. Seeding decides which version is current, not which
+            # one survives: rename the replaced version to a conflict copy
+            # first. A rename on the same volume never reads content, so a
+            # cloud placeholder is not downloaded, and it refuses to overwrite.
+            if ($d) {
+                $tag = if ($seedLocal) { Get-ProviderLabel -Path $toRoot } else { 'local' }
+                $keptRel  = Get-ConflictName -RelPath $d.RelPath -Tag $tag
+                $keptPath = Join-Path $toRoot $keptRel
+                if (-not $PSCmdlet.ShouldProcess($d.FullPath, "keep replaced version as $keptRel")) { $skipped++; continue }
+                if (Test-Path -LiteralPath $keptPath) { $skipped++; continue }
+                [DriveRelay.FileIdentity]::Move($d.FullPath, $keptPath)
+                Write-Log ("seed: kept the replaced {0} version as {1}" -f $tag, $keptRel) 'WARN'
+            }
             # No per-file dehydration during a seed: it can run to tens of
             # thousands of files. The whole tree is dehydrated once at the end
             # of the pass instead.
@@ -619,6 +697,17 @@ function Invoke-LinkSync {
     # Placeholder handling only applies where the remote side actually has
     # placeholders. On a plain folder -- Google Drive in Mirror mode, a network
     # share, another disk -- these steps are skipped entirely.
+    # A seeded link without intact history must not run: every file would read
+    # as new, undoing deletions. Restore from .tmp/.bak where possible.
+    $history = Repair-LinkManifest -Link $Link -StateRoot $StateRoot
+    if (-not $history.Ok) {
+        $result.Aborted = $true
+        $result.Message = $history.Message
+        Write-Log ("link {0} ABORTED: {1}" -f $Link.Id, $history.Message) 'ERROR'
+        return $result
+    }
+    if ($history.Message) { Write-Log ("link {0}: {1}" -f $Link.Id, $history.Message) 'WARN' }
+
     $provider             = Resolve-LinkProvider -Link $Link
     $isCloud              = ($provider -eq 'CloudFiles')
     $dehydrate            = $isCloud -and (Get-LinkDehydrate -Link $Link)
@@ -636,7 +725,12 @@ function Invoke-LinkSync {
         # Fall through: the comparison below records the resulting baseline.
     }
 
-    $items = Compare-LinkState -Link $Link -ExcludePatterns $ExcludePatterns -StateRoot $StateRoot
+    $skippedLinks = New-Object 'System.Collections.Generic.List[string]'
+    $items = Compare-LinkState -Link $Link -ExcludePatterns $ExcludePatterns -StateRoot $StateRoot -SkippedLinks $skippedLinks
+    foreach ($s in ($skippedLinks | Sort-Object -Unique)) {
+        # DEBUG: repeated every pass; `check` and `status` report these too.
+        Write-Log ("link {0}: not following junction/symbolic link {1}" -f $Link.Id, $s.TrimEnd('\')) 'DEBUG'
+    }
 
     # --- delete cap, checked before anything is applied ---
     $deleteItems = @($items | Where-Object { $_.Action -like 'Delete*' })
@@ -716,7 +810,7 @@ function Invoke-LinkSync {
                         Write-Log ("delete deferred; file or counterpart changed since planning: {0}" -f $item.RelPath) 'WARN'
                         $ok = $false
                     }
-                    else { $ok = Remove-FileSafely -Path $item.Local.FullPath }
+                    else { $ok = Remove-FileSafely -Path $item.Local.FullPath -Root $Link.LocalPath -RelPath $item.Local.RelPath }
                     if ($ok) {
                         $result.Deleted++
                         $forgotten[$key] = $true
@@ -728,7 +822,7 @@ function Invoke-LinkSync {
                         Write-Log ("delete deferred; file or counterpart changed since planning: {0}" -f $item.RelPath) 'WARN'
                         $ok = $false
                     }
-                    else { $ok = Remove-FileSafely -Path $item.Remote.FullPath -HydrateFirst:$hydrateBeforeDelete }
+                    else { $ok = Remove-FileSafely -Path $item.Remote.FullPath -HydrateFirst:$hydrateBeforeDelete -Root $remotePath -RelPath $item.Remote.RelPath }
                     if ($ok) {
                         $result.Deleted++
                         $forgotten[$key] = $true

@@ -40,7 +40,17 @@ This tool moves and deletes real files, so the rules are worth stating plainly.
   dehydrated placeholder has no local content to put there, so deleting it
   propagates to the cloud service's own online recycle bin; set
   `HydrateBeforeDelete` on a link to pull content down first at the cost of a
-  download per file.
+  download per file. A network share or removable drive has no Recycle Bin, so
+  there a deleted file is moved into a hidden `.driverelay-deleted\<timestamp>\`
+  folder at that link root instead; empty it yourself when you no longer need it.
+- **An incomplete listing never reads as deletions.** If any folder on either
+  side cannot be listed, that link is skipped for the pass. Deletes are also
+  re-checked just before they run.
+- **Sync history is required once a link has run.** If a link's manifest is
+  missing or unreadable, DriveRelay restores the previous copy (`.bak`) or stops
+  the link, because without it deleted files would come back.
+- **Junctions and symbolic links are not followed.** Whatever lies behind one is
+  left untouched on both sides; `check` and `status` list them.
 - **Conflicts keep both versions.** If both sides changed, the remote version is
   saved alongside the local one under a conflict name and nothing is discarded.
 - **Deletions are not undone by possible edits.** When a previously synced file
@@ -146,7 +156,10 @@ DriveRelay config                     View or update global settings
 ```
 
 A first run seeds: `-Seed Local` or `-Seed Remote` decides which side is
-authoritative that one time. After seeding, the pair is two-way.
+authoritative that one time. After seeding, the pair is two-way. Where a file
+exists on both sides and differs, the seed side's version becomes current and
+the other version is kept beside it as a conflict copy; nothing is overwritten
+without a copy.
 
 ```powershell
 .\DriveRelay.ps1 add "D:\Tally Prime" "D:\OneDrive\Tally Prime" -Seed Local
